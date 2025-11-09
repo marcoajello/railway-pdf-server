@@ -56,8 +56,9 @@ app.post('/generate-pdf', async (req, res) => {
     
     // Generate PDF with proper settings
     const pdfBuffer = await page.pdf({
-      format: 'Letter',
-      landscape: orientation === 'landscape',
+      preferCSSPageSize: true,
+      //format: 'Letter',
+      //landscape: orientation === 'landscape',
       printBackground: true,
       margin: {
         top: '0.4in',
