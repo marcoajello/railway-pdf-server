@@ -1,7 +1,6 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
 const cors = require('cors');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -28,8 +27,9 @@ app.post('/generate-pdf', async (req, res) => {
     if (!html) {
       return res.status(400).json({ error: 'HTML content is required' });
     }
-
+    
     console.log('Launching browser...');
+    console.log('Requested orientation:', orientation);
     
     // Launch Puppeteer with Railway-optimized settings
     browser = await puppeteer.launch({
@@ -43,7 +43,7 @@ app.post('/generate-pdf', async (req, res) => {
         '--disable-extensions'
       ]
     });
-
+    
     console.log('Browser launched, creating page...');
     const page = await browser.newPage();
     
@@ -51,12 +51,10 @@ app.post('/generate-pdf', async (req, res) => {
     await page.setContent(html, {
       waitUntil: ['load', 'networkidle0']
     });
-
-    console.log('Generating PDF...');
+    
+    console.log('Generating PDF with orientation:', orientation);
     
     // Generate PDF with proper settings
-    const { html, orientation } = req.body; // Extract orientation from request
-    
     const pdf = await page.pdf({
       format: 'Letter',
       landscape: orientation === 'landscape',
@@ -69,14 +67,14 @@ app.post('/generate-pdf', async (req, res) => {
       },
       preferCSSPageSize: true
     });
-
+    
     console.log('PDF generated successfully');
-
+    
     // Send PDF
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename="schedule.pdf"');
-    res.send(pdfBuffer);
-
+    res.send(pdf);
+    
   } catch (error) {
     console.error('PDF generation error:', error);
     res.status(500).json({ 
