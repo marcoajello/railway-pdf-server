@@ -55,7 +55,9 @@ app.post('/generate-pdf', async (req, res) => {
     console.log('Generating PDF...');
     
     // Generate PDF with proper settings
-    const pdfBuffer = await page.pdf({
+    const { html, orientation } = req.body; // Extract orientation from request
+    
+    const pdf = await page.pdf({
       format: 'Letter',
       landscape: orientation === 'landscape',
       printBackground: true,
