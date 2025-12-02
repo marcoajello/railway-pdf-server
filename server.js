@@ -124,10 +124,11 @@ app.post('/generate-pdf', async (req, res) => {
 // ============================================
 
 /**
- * Convert PDF pages to images using Puppeteer
+ * Convert PDF to page images using Puppeteer
  */
-async function pdfToImages(pdfBuffer, outputDir) {
+async function pdfToPageImages(pdfBuffer, outputDir) {
   let browser = null;
+  const images = [];
   
   try {
     browser = await puppeteer.launch({
@@ -142,111 +143,151 @@ async function pdfToImages(pdfBuffer, outputDir) {
     
     const page = await browser.newPage();
     
-    // Convert buffer to base64 data URL
+    // Set large viewport for good resolution
+    await page.setViewport({ width: 1600, height: 2200, deviceScaleFactor: 2 });
+    
+    // Create HTML page that renders PDF using PDF.js
     const base64Pdf = pdfBuffer.toString('base64');
-    const dataUrl = `data:application/pdf;base64,${base64Pdf}`;
     
-    // Navigate to PDF
-    await page.goto(dataUrl, { waitUntil: 'networkidle0', timeout: 60000 });
+    const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+      <style>
+        body { margin: 0; background: white; }
+        canvas { display: block; margin: 0 auto; }
+      </style>
+    </head>
+    <body>
+      <canvas id="canvas"></canvas>
+      <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        
+        window.renderPage = async function(pageNum) {
+          const pdfData = atob('${base64Pdf}');
+          const pdfArray = new Uint8Array(pdfData.length);
+          for (let i = 0; i < pdfData.length; i++) {
+            pdfArray[i] = pdfData.charCodeAt(i);
+          }
+          
+          const pdf = await pdfjsLib.getDocument({ data: pdfArray }).promise;
+          window.totalPages = pdf.numPages;
+          
+          if (pageNum > pdf.numPages) return null;
+          
+          const pdfPage = await pdf.getPage(pageNum);
+          const scale = 2.0;
+          const viewport = pdfPage.getViewport({ scale });
+          
+          const canvas = document.getElementById('canvas');
+          const context = canvas.getContext('2d');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          
+          await pdfPage.render({ canvasContext: context, viewport }).promise;
+          return { width: canvas.width, height: canvas.height };
+        };
+        
+        window.getPageCount = async function() {
+          const pdfData = atob('${base64Pdf}');
+          const pdfArray = new Uint8Array(pdfData.length);
+          for (let i = 0; i < pdfData.length; i++) {
+            pdfArray[i] = pdfData.charCodeAt(i);
+          }
+          const pdf = await pdfjsLib.getDocument({ data: pdfArray }).promise;
+          return pdf.numPages;
+        };
+      </script>
+    </body>
+    </html>
+    `;
     
-    // Wait a moment for PDF to render
-    await new Promise(r => setTimeout(r, 2000));
+    await page.setContent(html, { waitUntil: 'networkidle0' });
     
-    // Get page count using PDF.js internals
-    const pageCount = await page.evaluate(() => {
-      // Try to get page count from PDF viewer
-      const viewer = document.querySelector('#viewer');
-      if (viewer) {
-        const pages = viewer.querySelectorAll('.page');
-        return pages.length || 1;
-      }
-      return 1;
-    });
+    // Wait for PDF.js to load
+    await page.waitForFunction('typeof pdfjsLib !== "undefined"', { timeout: 10000 });
     
-    console.log(`[Storyboard] PDF has approximately ${pageCount} pages`);
+    // Get page count
+    const pageCount = await page.evaluate('getPageCount()');
+    console.log(`[Storyboard] PDF has ${pageCount} pages`);
     
-    // Take screenshot of entire page
-    await page.setViewport({ width: 1600, height: 2000 });
-    
-    const images = [];
-    
-    // For single-page approach, just screenshot the whole thing
-    const screenshotPath = path.join(outputDir, 'page-1.jpg');
-    await page.screenshot({
-      path: screenshotPath,
-      fullPage: true,
-      type: 'jpeg',
-      quality: 90
-    });
-    images.push(screenshotPath);
+    // Render each page
+    for (let i = 1; i <= pageCount; i++) {
+      console.log(`[Storyboard] Rendering page ${i}/${pageCount}`);
+      
+      const dimensions = await page.evaluate(`renderPage(${i})`);
+      if (!dimensions) continue;
+      
+      // Wait for render
+      await new Promise(r => setTimeout(r, 500));
+      
+      // Screenshot the canvas
+      const canvas = await page.$('#canvas');
+      const imagePath = path.join(outputDir, `page-${i}.png`);
+      await canvas.screenshot({ path: imagePath, type: 'png' });
+      images.push(imagePath);
+    }
     
     return images;
     
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    if (browser) await browser.close();
   }
 }
 
 /**
- * Alternative: Use pdf-lib to extract pages, render with canvas
- * For now, send full PDF to Claude directly as it supports PDFs
+ * Extract frame data from a page image using Claude
  */
-async function extractWithDirectPdf(pdfBuffer) {
+async function extractPageData(imageBuffer) {
   const client = getAnthropicClient();
-  if (!client) {
-    throw new Error('ANTHROPIC_API_KEY not configured');
-  }
+  if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
   
-  const base64Pdf = pdfBuffer.toString('base64');
+  const base64Image = imageBuffer.toString('base64');
   
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 8192,
+    max_tokens: 4096,
     messages: [
       {
         role: 'user',
         content: [
           {
-            type: 'document',
+            type: 'image',
             source: {
               type: 'base64',
-              media_type: 'application/pdf',
-              data: base64Pdf
+              media_type: 'image/png',
+              data: base64Image
             }
           },
           {
             type: 'text',
-            text: `Analyze this storyboard PDF and extract all frames/shots from all pages.
+            text: `Analyze this storyboard page and extract all frames.
 
-For each frame visible, extract:
-1. Frame number (e.g., "1", "1A", "2B", "4C") - look for labels like "FR 1A", "FRAME 1A", or "Frame 1"
-2. Spot/Scene name if visible at the top of the page
-3. Description - the action/direction text describing what happens
-4. Dialog - any spoken text, VO (voiceover), or copy. Include character names if shown
-5. Original - the complete original text exactly as it appears under the frame
+For each frame, extract:
+1. Frame number (e.g., "1", "1A", "2B") - look for labels like "Frame 1" or "FR 1A"
+2. Spot/Scene name if visible at the top
+3. Description - the action/direction text
+4. Dialog - spoken text, VO, or copy with character names
+5. Original - the complete text as it appears
+6. Bounding box of the ILLUSTRATION/IMAGE area only (not the text) as percentages [x, y, width, height] from top-left corner
 
-Return JSON in this exact format:
+Return JSON:
 {
-  "spots": [
+  "spotName": "Spot name or null",
+  "frames": [
     {
-      "name": "Name of spot/scene, or 'Untitled' if not visible",
-      "frames": [
-        {
-          "frameNumber": "1A",
-          "description": "Martha talks to camera.",
-          "dialog": "MARTHA: I've got big news...",
-          "original": "Martha talks to camera. MARTHA: I've got big news..."
-        }
-      ]
+      "frameNumber": "1A",
+      "description": "Martha talks to camera.",
+      "dialog": "MARTHA: Hello...",
+      "original": "Full original text...",
+      "boundingBox": [5, 10, 28, 35]
     }
   ]
 }
 
-Extract ALL frames from ALL pages. Be thorough.
-If a frame has no dialog, use empty string for dialog.
-If a frame has no description, use empty string for description.`
+Be precise with bounding boxes - they should tightly fit each frame's illustration area.
+If no frames found, return {"spotName": null, "frames": []}`
           }
         ]
       }
@@ -254,28 +295,75 @@ If a frame has no description, use empty string for description.`
   });
   
   const text = response.content[0].text;
-  
   let jsonStr = text;
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1];
-  }
+  if (jsonMatch) jsonStr = jsonMatch[1];
   
   try {
     return JSON.parse(jsonStr.trim());
   } catch (e) {
-    console.error('Failed to parse Claude response:', text);
-    return { spots: [] };
+    console.error('Failed to parse response:', text);
+    return { spotName: null, frames: [] };
   }
+}
+
+/**
+ * Crop frame images based on bounding boxes
+ */
+async function cropFrameImages(pageImagePath, frames) {
+  const imageBuffer = await fs.readFile(pageImagePath);
+  const metadata = await sharp(imageBuffer).metadata();
+  const { width, height } = metadata;
+  
+  const croppedImages = [];
+  
+  for (const frame of frames) {
+    if (!frame.boundingBox || frame.boundingBox.length !== 4) {
+      croppedImages.push(null);
+      continue;
+    }
+    
+    const [xPct, yPct, wPct, hPct] = frame.boundingBox;
+    
+    const left = Math.round((xPct / 100) * width);
+    const top = Math.round((yPct / 100) * height);
+    const cropWidth = Math.round((wPct / 100) * width);
+    const cropHeight = Math.round((hPct / 100) * height);
+    
+    // Ensure bounds are valid
+    const safeLeft = Math.max(0, Math.min(left, width - 1));
+    const safeTop = Math.max(0, Math.min(top, height - 1));
+    const safeWidth = Math.min(cropWidth, width - safeLeft);
+    const safeHeight = Math.min(cropHeight, height - safeTop);
+    
+    if (safeWidth < 10 || safeHeight < 10) {
+      croppedImages.push(null);
+      continue;
+    }
+    
+    try {
+      const cropped = await sharp(imageBuffer)
+        .extract({ left: safeLeft, top: safeTop, width: safeWidth, height: safeHeight })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      
+      croppedImages.push(cropped.toString('base64'));
+    } catch (e) {
+      console.error('Failed to crop frame:', e);
+      croppedImages.push(null);
+    }
+  }
+  
+  return croppedImages;
 }
 
 /**
  * Group frames into shots (1A, 1B, 1C -> Shot 1)
  */
-function groupFramesIntoShots(frames) {
+function groupFramesIntoShots(allFrames) {
   const shotGroups = {};
   
-  for (const frame of frames) {
+  for (const frame of allFrames) {
     const match = frame.frameNumber?.match(/^(\d+)/);
     const shotNum = match ? match[1] : frame.frameNumber || 'unknown';
     
@@ -283,6 +371,7 @@ function groupFramesIntoShots(frames) {
       shotGroups[shotNum] = {
         shotNumber: shotNum,
         frames: [],
+        images: [],
         descriptions: [],
         dialogs: [],
         originals: []
@@ -290,6 +379,7 @@ function groupFramesIntoShots(frames) {
     }
     
     shotGroups[shotNum].frames.push(frame.frameNumber);
+    if (frame.image) shotGroups[shotNum].images.push(frame.image);
     if (frame.description) shotGroups[shotNum].descriptions.push(frame.description);
     if (frame.dialog) shotGroups[shotNum].dialogs.push(frame.dialog);
     if (frame.original) shotGroups[shotNum].originals.push(frame.original);
@@ -298,7 +388,7 @@ function groupFramesIntoShots(frames) {
   return Object.values(shotGroups).map(group => ({
     shotNumber: group.shotNumber,
     frames: group.frames,
-    images: [], // No image cropping for now
+    images: group.images,
     description: group.descriptions.join('\n'),
     dialog: group.dialogs.join('\n'),
     original: group.originals.join('\n')
@@ -309,6 +399,8 @@ function groupFramesIntoShots(frames) {
  * Storyboard extraction endpoint
  */
 app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'storyboard-'));
+  
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No PDF file uploaded' });
@@ -320,15 +412,55 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
     console.log('[Storyboard] Processing PDF:', req.file.originalname, 'Size:', req.file.size);
     
-    // Use Claude's direct PDF support
-    const extracted = await extractWithDirectPdf(req.file.buffer);
+    // Convert PDF to page images
+    const imageDir = path.join(tempDir, 'images');
+    await fs.mkdir(imageDir, { recursive: true });
     
-    console.log(`[Storyboard] Extracted ${extracted.spots?.length || 0} spots`);
+    const pageImages = await pdfToPageImages(req.file.buffer, imageDir);
+    console.log(`[Storyboard] Rendered ${pageImages.length} pages`);
     
-    // Group frames into shots
-    const spots = (extracted.spots || []).map(spot => ({
-      name: spot.name || 'Untitled Spot',
-      shots: groupFramesIntoShots(spot.frames || [])
+    // Extract data from each page
+    const allFrames = [];
+    let currentSpotName = null;
+    
+    for (let i = 0; i < pageImages.length; i++) {
+      console.log(`[Storyboard] Analyzing page ${i + 1}/${pageImages.length}`);
+      
+      const imageBuffer = await fs.readFile(pageImages[i]);
+      const pageData = await extractPageData(imageBuffer);
+      
+      if (pageData.spotName) {
+        currentSpotName = pageData.spotName;
+      }
+      
+      // Crop frame images
+      const croppedImages = await cropFrameImages(pageImages[i], pageData.frames);
+      
+      for (let j = 0; j < pageData.frames.length; j++) {
+        allFrames.push({
+          ...pageData.frames[j],
+          image: croppedImages[j],
+          spotName: currentSpotName
+        });
+      }
+    }
+    
+    console.log(`[Storyboard] Extracted ${allFrames.length} frames`);
+    
+    // Group by spot name
+    const spotGroups = {};
+    for (const frame of allFrames) {
+      const spotName = frame.spotName || 'Untitled Spot';
+      if (!spotGroups[spotName]) {
+        spotGroups[spotName] = [];
+      }
+      spotGroups[spotName].push(frame);
+    }
+    
+    // Build final response
+    const spots = Object.entries(spotGroups).map(([name, frames]) => ({
+      name,
+      shots: groupFramesIntoShots(frames)
     }));
     
     console.log(`[Storyboard] Returning ${spots.length} spots`);
@@ -338,6 +470,13 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   } catch (error) {
     console.error('[Storyboard] Error:', error);
     res.status(500).json({ error: error.message || 'Extraction failed' });
+    
+  } finally {
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    } catch (e) {
+      console.error('Cleanup error:', e);
+    }
   }
 });
 
