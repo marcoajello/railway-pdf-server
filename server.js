@@ -1,4 +1,4 @@
-// Version 1.1.0 - Added storyboard extraction
+// Version 1.2.0 - OpenCV frame detection
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -9,6 +9,7 @@ const sharp = require('sharp');
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,6 +42,41 @@ function getAnthropicClient() {
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+
+/**
+ * Run Python frame detector
+ */
+async function detectFrames(imagePath) {
+  return new Promise((resolve, reject) => {
+    const pythonScript = path.join(__dirname, 'frame_detector.py');
+    const proc = spawn('python3', [pythonScript, imagePath, 'crop']);
+    
+    let stdout = '';
+    let stderr = '';
+    
+    proc.stdout.on('data', (data) => { stdout += data; });
+    proc.stderr.on('data', (data) => { stderr += data; });
+    
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        console.error('[FrameDetector] stderr:', stderr);
+        reject(new Error(`Frame detection failed: ${stderr}`));
+        return;
+      }
+      
+      try {
+        const result = JSON.parse(stdout);
+        resolve(result);
+      } catch (e) {
+        reject(new Error(`Failed to parse frame detector output: ${e.message}`));
+      }
+    });
+    
+    proc.on('error', (err) => {
+      reject(new Error(`Failed to spawn Python: ${err.message}`));
+    });
+  });
+}
 
 // Health check endpoint
 app.get('/', (req, res) => {
@@ -238,20 +274,20 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
 }
 
 /**
- * Extract frame data from a page image using Claude
+ * Extract text data from a page image using Claude (no bounding boxes)
  */
-async function extractPageData(imageBuffer) {
+async function extractPageText(imageBuffer) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
   
-  // Resize image for faster analysis (max 1500px on longest side)
+  // Resize image for faster analysis
   const resized = await sharp(imageBuffer)
-    .resize(1500, 1500, { fit: 'inside', withoutEnlargement: true })
+    .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 80 })
     .toBuffer();
   
   const base64Image = resized.toString('base64');
-  console.log(`[Storyboard] Sending image to Claude: ${Math.round(resized.length / 1024)}KB`);
+  console.log(`[Storyboard] Sending image to Claude for text extraction: ${Math.round(resized.length / 1024)}KB`);
   
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -270,32 +306,31 @@ async function extractPageData(imageBuffer) {
           },
           {
             type: 'text',
-            text: `Analyze this storyboard page and extract all frames.
+            text: `Analyze this storyboard page and extract the TEXT content for each frame.
 
-For each frame, extract:
+For each frame visible on the page, extract:
 1. Frame number (e.g., "1", "1A", "2B") - look for labels like "Frame 1" or "FR 1A"
-2. Spot/Scene name if visible at the top
+2. Spot/Scene name if visible at the top of the page
 3. Description - the action/direction text
 4. Dialog - spoken text, VO, or copy with character names
-5. Original - the complete text as it appears
-6. Bounding box of the ILLUSTRATION/IMAGE area only (not the text) as percentages [x, y, width, height] from top-left corner
+5. Original - the complete text as it appears under the frame
 
-Return JSON:
+Return JSON in order from top-left to bottom-right:
 {
   "spotName": "Spot name or null",
+  "frameCount": 6,
   "frames": [
     {
       "frameNumber": "1A",
       "description": "Martha talks to camera.",
       "dialog": "MARTHA: Hello...",
-      "original": "Full original text...",
-      "boundingBox": [5, 10, 28, 35]
+      "original": "Full original text..."
     }
   ]
 }
 
-Be precise with bounding boxes - they should tightly fit each frame's illustration area.
-If no frames found, return {"spotName": null, "frames": []}`
+Do NOT include bounding boxes - just extract the text content.
+If no frames found, return {"spotName": null, "frameCount": 0, "frames": []}`
           }
         ]
       }
@@ -311,60 +346,36 @@ If no frames found, return {"spotName": null, "frames": []}`
     return JSON.parse(jsonStr.trim());
   } catch (e) {
     console.error('Failed to parse response:', text);
-    return { spotName: null, frames: [] };
+    return { spotName: null, frameCount: 0, frames: [] };
   }
 }
 
 /**
- * Crop frame images based on bounding boxes
+ * Match detected frame images with extracted text data
+ * Assumes both are in reading order (top-to-bottom, left-to-right)
  */
-async function cropFrameImages(pageImagePath, frames) {
-  const imageBuffer = await fs.readFile(pageImagePath);
-  const metadata = await sharp(imageBuffer).metadata();
-  const { width, height } = metadata;
+function matchFramesWithText(detectedFrames, textData) {
+  const frames = textData.frames || [];
+  const images = detectedFrames.images || [];
   
-  const croppedImages = [];
+  const results = [];
+  const maxLen = Math.max(frames.length, images.length);
   
-  for (const frame of frames) {
-    if (!frame.boundingBox || frame.boundingBox.length !== 4) {
-      croppedImages.push(null);
-      continue;
-    }
+  for (let i = 0; i < maxLen; i++) {
+    const textFrame = frames[i] || {};
+    const image = images[i] || null;
     
-    const [xPct, yPct, wPct, hPct] = frame.boundingBox;
-    
-    const left = Math.round((xPct / 100) * width);
-    const top = Math.round((yPct / 100) * height);
-    const cropWidth = Math.round((wPct / 100) * width);
-    const cropHeight = Math.round((hPct / 100) * height);
-    
-    // Ensure bounds are valid
-    const safeLeft = Math.max(0, Math.min(left, width - 1));
-    const safeTop = Math.max(0, Math.min(top, height - 1));
-    const safeWidth = Math.min(cropWidth, width - safeLeft);
-    const safeHeight = Math.min(cropHeight, height - safeTop);
-    
-    if (safeWidth < 10 || safeHeight < 10) {
-      croppedImages.push(null);
-      continue;
-    }
-    
-    try {
-      const cropped = await sharp(imageBuffer)
-        .extract({ left: safeLeft, top: safeTop, width: safeWidth, height: safeHeight })
-        .resize(800, 800, { fit: 'inside', withoutEnlargement: true }) // Limit size
-        .jpeg({ quality: 75 })
-        .toBuffer();
-      
-      console.log(`[Storyboard] Cropped frame ${frame.frameNumber}: ${Math.round(cropped.length / 1024)}KB`);
-      croppedImages.push(cropped.toString('base64'));
-    } catch (e) {
-      console.error('Failed to crop frame:', e);
-      croppedImages.push(null);
-    }
+    results.push({
+      frameNumber: textFrame.frameNumber || `${i + 1}`,
+      description: textFrame.description || '',
+      dialog: textFrame.dialog || '',
+      original: textFrame.original || '',
+      image: image,
+      spotName: textData.spotName
+    });
   }
   
-  return croppedImages;
+  return results;
 }
 
 /**
@@ -444,33 +455,56 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
     console.log(`[Storyboard] Processing ${pageImages.length} page(s)`);
     
-    // Extract data from each page
+    // Process each page
     const allFrames = [];
     let currentSpotName = null;
     
     for (let i = 0; i < pageImages.length; i++) {
-      console.log(`[Storyboard] Analyzing page ${i + 1}/${pageImages.length}`);
+      console.log(`[Storyboard] Page ${i + 1}/${pageImages.length}: Detecting frames with OpenCV...`);
       
-      const imageBuffer = await fs.readFile(pageImages[i]);
-      const pageData = await extractPageData(imageBuffer);
-      
-      if (pageData.spotName) {
-        currentSpotName = pageData.spotName;
+      // Step 1: Use OpenCV to detect and crop frames
+      let detectedFrames;
+      try {
+        detectedFrames = await detectFrames(pageImages[i]);
+        console.log(`[Storyboard] OpenCV detected ${detectedFrames.count} frames`);
+      } catch (cvError) {
+        console.error('[Storyboard] OpenCV failed, falling back to full page:', cvError.message);
+        // Fallback: use full page as single frame
+        const pageBuffer = await fs.readFile(pageImages[i]);
+        const resized = await sharp(pageBuffer)
+          .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 80 })
+          .toBuffer();
+        detectedFrames = {
+          count: 1,
+          frames: [{ x: 0, y: 0, width: 800, height: 600 }],
+          images: [resized.toString('base64')]
+        };
       }
       
-      // Crop frame images
-      const croppedImages = await cropFrameImages(pageImages[i], pageData.frames);
+      // Step 2: Use Claude to extract text data
+      console.log(`[Storyboard] Page ${i + 1}: Extracting text with Claude...`);
+      const imageBuffer = await fs.readFile(pageImages[i]);
+      const textData = await extractPageText(imageBuffer);
       
-      for (let j = 0; j < pageData.frames.length; j++) {
+      if (textData.spotName) {
+        currentSpotName = textData.spotName;
+      }
+      
+      console.log(`[Storyboard] Claude found ${textData.frameCount || textData.frames?.length || 0} frames in text`);
+      
+      // Step 3: Match images with text
+      const matchedFrames = matchFramesWithText(detectedFrames, textData);
+      
+      for (const frame of matchedFrames) {
         allFrames.push({
-          ...pageData.frames[j],
-          image: croppedImages[j],
-          spotName: currentSpotName
+          ...frame,
+          spotName: frame.spotName || currentSpotName
         });
       }
     }
     
-    console.log(`[Storyboard] Extracted ${allFrames.length} frames`);
+    console.log(`[Storyboard] Total extracted: ${allFrames.length} frames`);
     
     // Group by spot name
     const spotGroups = {};
