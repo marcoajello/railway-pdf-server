@@ -65,7 +65,6 @@ def detect_rectangles(image_path):
         })
     
     # Sort: top to bottom, then left to right (reading order)
-    # Group by rows first (within 50px = same row)
     rectangles.sort(key=lambda r: (r['y'] // 80, r['x']))
     
     return rectangles
