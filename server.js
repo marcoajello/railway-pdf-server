@@ -1,4 +1,4 @@
-// Version 2.1.0 - OpenCV rectangle detection
+// Version 2.3.0 - OpenCV via pip (not nix packages)
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '2.1.0', features: ['pdf-generation', 'storyboard-extraction'] });
+  res.json({ status: 'ok', version: '2.3.0', features: ['pdf-generation', 'storyboard-extraction'] });
 });
 
 // PDF generation endpoint
@@ -82,32 +82,50 @@ app.post('/generate-pdf', async (req, res) => {
 async function detectRectangles(imagePath) {
   return new Promise((resolve) => {
     const script = path.join(__dirname, 'frame_detector.py');
-    const proc = spawn('python3', [script, imagePath, 'crop']);
     
-    let stdout = '';
-    let stderr = '';
-    
-    proc.stdout.on('data', d => stdout += d);
-    proc.stderr.on('data', d => stderr += d);
-    
-    proc.on('close', code => {
-      if (code !== 0) {
-        console.error('[Storyboard] Python error:', stderr);
+    // Try python3 first, then python
+    const tryPython = (cmd) => {
+      const proc = spawn(cmd, [script, imagePath, 'crop']);
+      
+      let stdout = '';
+      let stderr = '';
+      
+      proc.stdout.on('data', d => stdout += d);
+      proc.stderr.on('data', d => stderr += d);
+      
+      proc.on('close', code => {
+        if (code !== 0) {
+          console.error(`[Storyboard] ${cmd} error (code ${code}):`, stderr);
+          if (cmd === 'python3') {
+            console.log('[Storyboard] Trying python instead...');
+            tryPython('python');
+            return;
+          }
+          resolve({ count: 0, rectangles: [], images: [] });
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          console.log(`[Storyboard] Found ${result.count} rectangles`);
+          resolve(result);
+        } catch (e) {
+          console.error('[Storyboard] JSON parse error');
+          resolve({ count: 0, rectangles: [], images: [] });
+        }
+      });
+      
+      proc.on('error', err => {
+        console.error(`[Storyboard] ${cmd} spawn error:`, err.message);
+        if (cmd === 'python3') {
+          console.log('[Storyboard] Trying python instead...');
+          tryPython('python');
+          return;
+        }
         resolve({ count: 0, rectangles: [], images: [] });
-        return;
-      }
-      try {
-        resolve(JSON.parse(stdout));
-      } catch (e) {
-        console.error('[Storyboard] JSON parse error');
-        resolve({ count: 0, rectangles: [], images: [] });
-      }
-    });
+      });
+    };
     
-    proc.on('error', err => {
-      console.error('[Storyboard] Spawn error:', err.message);
-      resolve({ count: 0, rectangles: [], images: [] });
-    });
+    tryPython('python3');
   });
 }
 
@@ -224,9 +242,6 @@ RULES:
   }
 }
 
-/**
- * Group frames into shots
- */
 function groupIntoShots(frames) {
   const groups = {};
   
@@ -254,9 +269,6 @@ function groupIntoShots(frames) {
   }));
 }
 
-/**
- * Main extraction endpoint
- */
 app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'storyboard-'));
   
@@ -269,7 +281,6 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
     
-    // Convert PDF to images
     let pageImages = [];
     if (req.file.mimetype === 'application/pdf') {
       pageImages = await pdfToImages(req.file.buffer, imageDir);
@@ -299,7 +310,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       
       console.log(`[Storyboard] Page ${i + 1}: ${textData.frames?.length || 0} text frames`);
       
-      // Match rectangles to text frames by position (both sorted reading order)
+      // Match rectangles to text frames by position
       const textFrames = textData.frames || [];
       const images = detected.images || [];
       
@@ -318,7 +329,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       }
     }
     
-    console.log(`[Storyboard] Total: ${allFrames.length} frames`);
+    console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images`);
     
     // Group by spot
     const spotGroups = {};
