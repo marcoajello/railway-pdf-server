@@ -18,10 +18,11 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf') {
+    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+    if (allowed.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Only PDF files allowed'), false);
+      cb(new Error('Only PDF, JPEG, PNG, or WebP files allowed'), false);
     }
   }
 });
@@ -143,8 +144,8 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
     
     const page = await browser.newPage();
     
-    // Set large viewport for good resolution
-    await page.setViewport({ width: 1600, height: 2200, deviceScaleFactor: 2 });
+    // Set viewport for reasonable resolution
+    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1.5 });
     
     // Create HTML page that renders PDF using PDF.js
     const base64Pdf = pdfBuffer.toString('base64');
@@ -177,7 +178,7 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
           if (pageNum > pdf.numPages) return null;
           
           const pdfPage = await pdf.getPage(pageNum);
-          const scale = 2.0;
+          const scale = 1.5; // Reduced from 2.0 for faster processing
           const viewport = pdfPage.getViewport({ scale });
           
           const canvas = document.getElementById('canvas');
@@ -224,8 +225,8 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
       
       // Screenshot the canvas
       const canvas = await page.$('#canvas');
-      const imagePath = path.join(outputDir, `page-${i}.png`);
-      await canvas.screenshot({ path: imagePath, type: 'png' });
+      const imagePath = path.join(outputDir, `page-${i}.jpg`);
+      await canvas.screenshot({ path: imagePath, type: 'jpeg', quality: 85 });
       images.push(imagePath);
     }
     
@@ -243,7 +244,14 @@ async function extractPageData(imageBuffer) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
   
-  const base64Image = imageBuffer.toString('base64');
+  // Resize image for faster analysis (max 1500px on longest side)
+  const resized = await sharp(imageBuffer)
+    .resize(1500, 1500, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  
+  const base64Image = resized.toString('base64');
+  console.log(`[Storyboard] Sending image to Claude: ${Math.round(resized.length / 1024)}KB`);
   
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -256,7 +264,7 @@ async function extractPageData(imageBuffer) {
             type: 'image',
             source: {
               type: 'base64',
-              media_type: 'image/png',
+              media_type: 'image/jpeg',
               data: base64Image
             }
           },
@@ -344,9 +352,11 @@ async function cropFrameImages(pageImagePath, frames) {
     try {
       const cropped = await sharp(imageBuffer)
         .extract({ left: safeLeft, top: safeTop, width: safeWidth, height: safeHeight })
-        .jpeg({ quality: 85 })
+        .resize(800, 800, { fit: 'inside', withoutEnlargement: true }) // Limit size
+        .jpeg({ quality: 75 })
         .toBuffer();
       
+      console.log(`[Storyboard] Cropped frame ${frame.frameNumber}: ${Math.round(cropped.length / 1024)}KB`);
       croppedImages.push(cropped.toString('base64'));
     } catch (e) {
       console.error('Failed to crop frame:', e);
@@ -403,21 +413,36 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No PDF file uploaded' });
+      return res.status(400).json({ error: 'No file uploaded' });
     }
     
     if (!process.env.ANTHROPIC_API_KEY) {
       return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
     }
     
-    console.log('[Storyboard] Processing PDF:', req.file.originalname, 'Size:', req.file.size);
+    console.log('[Storyboard] Processing:', req.file.originalname, 'Type:', req.file.mimetype, 'Size:', req.file.size);
     
-    // Convert PDF to page images
+    let pageImages = [];
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
     
-    const pageImages = await pdfToPageImages(req.file.buffer, imageDir);
-    console.log(`[Storyboard] Rendered ${pageImages.length} pages`);
+    // Handle based on file type
+    if (req.file.mimetype === 'application/pdf') {
+      // PDF: render pages to images
+      pageImages = await pdfToPageImages(req.file.buffer, imageDir);
+    } else {
+      // Image: save directly
+      const imagePath = path.join(imageDir, 'page-1.jpg');
+      
+      // Convert to JPEG and normalize
+      await sharp(req.file.buffer)
+        .jpeg({ quality: 90 })
+        .toFile(imagePath);
+      
+      pageImages = [imagePath];
+    }
+    
+    console.log(`[Storyboard] Processing ${pageImages.length} page(s)`);
     
     // Extract data from each page
     const allFrames = [];
