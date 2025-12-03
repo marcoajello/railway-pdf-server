@@ -1,4 +1,4 @@
-// Version 2.5.0 - Parallel page processing
+// Version 2.6.0 - Added HTML generation for broadcast
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '2.5.0', features: ['pdf-generation', 'storyboard-extraction'] });
+  res.json({ status: 'ok', version: '2.6.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction'] });
 });
 
 // PDF generation endpoint
@@ -66,6 +66,107 @@ app.post('/generate-pdf', async (req, res) => {
     res.send(pdfBuffer);
   } catch (error) {
     console.error('PDF error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (browser) await browser.close();
+  }
+});
+
+// HTML generation endpoint (for broadcast)
+app.post('/generate-html', async (req, res) => {
+  let browser = null;
+  try {
+    const { html } = req.body;
+    if (!html) return res.status(400).json({ error: 'HTML required' });
+    
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+    });
+    
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1400, height: 900 });
+    await page.setContent(html, { waitUntil: ['load', 'networkidle0'] });
+    
+    // Extract the rendered HTML with computed styles inlined
+    const renderedHtml = await page.evaluate(() => {
+      // Get all stylesheets as text
+      let styleText = '';
+      for (const sheet of document.styleSheets) {
+        try {
+          for (const rule of sheet.cssRules) {
+            styleText += rule.cssText + '\n';
+          }
+        } catch (e) {
+          // Skip cross-origin stylesheets
+        }
+      }
+      
+      // Clone body
+      const clone = document.body.cloneNode(true);
+      
+      // Remove scripts
+      clone.querySelectorAll('script').forEach(s => s.remove());
+      
+      // Remove interactive elements
+      clone.querySelectorAll('button, input[type="checkbox"], .drag-cell, .sharpie, .actions-cell, .row-drag-handle').forEach(el => {
+        el.remove();
+      });
+      
+      // Remove contenteditable
+      clone.querySelectorAll('[contenteditable]').forEach(el => {
+        el.removeAttribute('contenteditable');
+      });
+      
+      // Remove draggable
+      clone.querySelectorAll('[draggable]').forEach(el => {
+        el.removeAttribute('draggable');
+      });
+      
+      // Remove hidden columns (display: none)
+      clone.querySelectorAll('[style*="display: none"], [style*="display:none"]').forEach(el => {
+        el.remove();
+      });
+      
+      return { styles: styleText, body: clone.innerHTML };
+    });
+    
+    // Build complete HTML document
+    const fullHtml = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    ${renderedHtml.styles}
+    
+    /* Broadcast overrides */
+    body {
+      margin: 0;
+      padding: 16px;
+      background: #fff;
+    }
+    .row-complete td {
+      opacity: 0.5;
+      text-decoration: line-through;
+      text-decoration-color: #e53935;
+    }
+    @media screen and (max-width: 768px) {
+      body { padding: 8px; }
+      table { font-size: 11px; }
+    }
+  </style>
+</head>
+<body>
+${renderedHtml.body}
+</body>
+</html>`;
+    
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(fullHtml);
+    
+  } catch (error) {
+    console.error('HTML generation error:', error);
     res.status(500).json({ error: error.message });
   } finally {
     if (browser) await browser.close();
