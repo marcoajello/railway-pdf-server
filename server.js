@@ -1,4 +1,4 @@
-// Version 2.4.0 - Dockerfile with python3-opencv 
+// Version 2.5.0 - Parallel page processing
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '2.4.0', features: ['pdf-generation', 'storyboard-extraction'] });
+  res.json({ status: 'ok', version: '2.5.0', features: ['pdf-generation', 'storyboard-extraction'] });
 });
 
 // PDF generation endpoint
@@ -277,6 +277,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
     
     console.log('[Storyboard] Processing:', req.file.originalname);
+    const startTime = Date.now();
     
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
@@ -290,27 +291,33 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       pageImages = [imgPath];
     }
     
-    console.log(`[Storyboard] ${pageImages.length} page(s)`);
+    console.log(`[Storyboard] ${pageImages.length} page(s) - starting parallel processing`);
     
+    // Process all pages in parallel
+    const pageResults = await Promise.all(pageImages.map(async (imagePath, i) => {
+      const pageNum = i + 1;
+      console.log(`[Storyboard] Page ${pageNum}: starting...`);
+      
+      const imageBuffer = await fs.readFile(imagePath);
+      
+      // Run OpenCV and Claude in parallel for each page
+      const [detected, textData] = await Promise.all([
+        detectRectangles(imagePath),
+        extractText(imageBuffer)
+      ]);
+      
+      console.log(`[Storyboard] Page ${pageNum}: ${detected.count} rectangles, ${textData.frames?.length || 0} text frames`);
+      
+      return { detected, textData, pageNum };
+    }));
+    
+    // Combine results in order
     const allFrames = [];
     let currentSpot = null;
     
-    for (let i = 0; i < pageImages.length; i++) {
-      console.log(`[Storyboard] Page ${i + 1}: detecting rectangles...`);
-      
-      // Detect rectangles with OpenCV
-      const detected = await detectRectangles(pageImages[i]);
-      console.log(`[Storyboard] Page ${i + 1}: found ${detected.count} rectangles`);
-      
-      // Extract text with Claude
-      const imageBuffer = await fs.readFile(pageImages[i]);
-      const textData = await extractText(imageBuffer);
-      
+    for (const { detected, textData } of pageResults) {
       if (textData.spotName) currentSpot = textData.spotName;
       
-      console.log(`[Storyboard] Page ${i + 1}: ${textData.frames?.length || 0} text frames`);
-      
-      // Match rectangles to text frames by position
       const textFrames = textData.frames || [];
       const images = detected.images || [];
       
@@ -329,7 +336,8 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       }
     }
     
-    console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images`);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images (${elapsed}s)`);
     
     // Group by spot
     const spotGroups = {};
