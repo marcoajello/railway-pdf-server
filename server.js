@@ -1,4 +1,4 @@
-// Version 2.3.0 - OpenCV via pip (not nix packages)
+// Version 2.4.0 - Dockerfile with python3-opencv
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '2.3.0', features: ['pdf-generation', 'storyboard-extraction'] });
+  res.json({ status: 'ok', version: '2.4.0', features: ['pdf-generation', 'storyboard-extraction'] });
 });
 
 // PDF generation endpoint
