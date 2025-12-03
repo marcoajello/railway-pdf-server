@@ -1,6 +1,6 @@
-# Force Node.js as primary with Python for OpenCV
+# Node.js only - no Python needed
 [phases.setup]
-nixPkgs = ["nodejs_18", "python311", "python311Packages.pip", "python311Packages.opencv4", "python311Packages.numpy"]
+nixPkgs = ["nodejs_18"]
 
 [phases.install]
 cmds = ["npm ci"]
