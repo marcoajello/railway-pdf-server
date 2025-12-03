@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "python311"]
+nixPkgs = ["nodejs_20", "python311", "python311Packages.pip"]
 
 [phases.install]
-cmds = ["npm install", "pip3 install opencv-python-headless numpy"]
+cmds = ["npm install", "python3 -m pip install opencv-python-headless numpy"]
 
 [start]
 cmd = "node server.js"
