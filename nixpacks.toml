@@ -1,6 +1,6 @@
-# Node.js only - no Python needed
+\# Node.js + Python/OpenCV for rectangle detection
 [phases.setup]
-nixPkgs = ["nodejs_18"]
+nixPkgs = ["nodejs_20", "python311", "python311Packages.opencv4", "python311Packages.numpy"]
 
 [phases.install]
 cmds = ["npm ci"]
