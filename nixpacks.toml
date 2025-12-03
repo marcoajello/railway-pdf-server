@@ -1,4 +1,4 @@
-# Node.js + Python/OpenCV for rectangle detection
+# Node.js + Python/OpenCV for rectangle detection 
 [phases.setup]
 nixPkgs = ["nodejs_20", "python311", "python311Packages.opencv4", "python311Packages.numpy"]
 
