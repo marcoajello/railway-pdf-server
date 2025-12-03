@@ -1,4 +1,4 @@
-// Version 1.2.0 - OpenCV frame detection
+// Version 2.0.0 - Claude grid detection (no OpenCV)
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -9,160 +9,77 @@ const sharp = require('sharp');
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
-const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Multer for file uploads
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only PDF, JPEG, PNG, or WebP files allowed'), false);
-    }
+    cb(null, allowed.includes(file.mimetype));
   }
 });
 
-// Initialize Anthropic client (lazy - only when needed)
 let anthropic = null;
 function getAnthropicClient() {
   if (!anthropic && process.env.ANTHROPIC_API_KEY) {
-    anthropic = new Anthropic({
-      apiKey: process.env.ANTHROPIC_API_KEY
-    });
+    anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   }
   return anthropic;
 }
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-/**
- * Run Python frame detector
- */
-async function detectFrames(imagePath) {
-  return new Promise((resolve, reject) => {
-    const pythonScript = path.join(__dirname, 'frame_detector.py');
-    const proc = spawn('python3', [pythonScript, imagePath, 'crop']);
-    
-    let stdout = '';
-    let stderr = '';
-    
-    proc.stdout.on('data', (data) => { stdout += data; });
-    proc.stderr.on('data', (data) => { stderr += data; });
-    
-    proc.on('close', (code) => {
-      if (code !== 0) {
-        console.error('[FrameDetector] stderr:', stderr);
-        reject(new Error(`Frame detection failed: ${stderr}`));
-        return;
-      }
-      
-      try {
-        const result = JSON.parse(stdout);
-        resolve(result);
-      } catch (e) {
-        reject(new Error(`Failed to parse frame detector output: ${e.message}`));
-      }
-    });
-    
-    proc.on('error', (err) => {
-      reject(new Error(`Failed to spawn Python: ${err.message}`));
-    });
-  });
-}
-
-// Health check endpoint
+// Health check
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
-    message: 'Railway PDF Server running',
-    version: '1.1.0',
+    version: '2.0.0',
     features: ['pdf-generation', 'storyboard-extraction']
   });
 });
 
-// PDF generation endpoint
+// PDF generation
 app.post('/generate-pdf', async (req, res) => {
   let browser = null;
-  
   try {
     const { html, orientation = 'landscape' } = req.body;
-    
-    if (!html) {
-      return res.status(400).json({ error: 'HTML content is required' });
-    }
-    
-    console.log('Launching browser...');
-    console.log('Requested orientation:', orientation);
+    if (!html) return res.status(400).json({ error: 'HTML required' });
     
     browser = await puppeteer.launch({
       headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--disable-extensions'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
     
-    console.log('Browser launched, creating page...');
     const page = await browser.newPage();
-    
-    await page.setContent(html, {
-      waitUntil: ['load', 'networkidle0']
-    });
-    
-    console.log('Generating PDF with orientation:', orientation);
+    await page.setContent(html, { waitUntil: ['load', 'networkidle0'] });
     
     const pdfBuffer = await page.pdf({
       format: 'Letter',
       landscape: orientation === 'landscape',
       printBackground: true,
-      margin: {
-        top: '0.4in',
-        right: '0.4in',
-        bottom: '0.4in',
-        left: '0.4in'
-      },
+      margin: { top: '0.4in', right: '0.4in', bottom: '0.4in', left: '0.4in' },
       preferCSSPageSize: true
     });
-    
-    console.log('PDF generated successfully');
     
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename="schedule.pdf"');
     res.send(pdfBuffer);
-    
   } catch (error) {
-    console.error('PDF generation error:', error);
-    res.status(500).json({ 
-      error: 'Failed to generate PDF',
-      message: error.message
-    });
+    console.error('PDF error:', error);
+    res.status(500).json({ error: error.message });
   } finally {
-    if (browser) {
-      await browser.close();
-      console.log('Browser closed');
-    }
+    if (browser) await browser.close();
   }
 });
 
 // ============================================
-// STORYBOARD EXTRACTION ENDPOINT
+// STORYBOARD EXTRACTION
 // ============================================
 
-/**
- * Convert PDF to page images using Puppeteer
- */
 async function pdfToPageImages(pdfBuffer, outputDir) {
   let browser = null;
   const images = [];
@@ -170,31 +87,19 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
   try {
     browser = await puppeteer.launch({
       headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
     
     const page = await browser.newPage();
-    
-    // Set viewport for reasonable resolution
     await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1.5 });
     
-    // Create HTML page that renders PDF using PDF.js
     const base64Pdf = pdfBuffer.toString('base64');
-    
     const html = `
     <!DOCTYPE html>
     <html>
     <head>
       <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-      <style>
-        body { margin: 0; background: white; }
-        canvas { display: block; margin: 0 auto; }
-      </style>
+      <style>body { margin: 0; background: white; } canvas { display: block; }</style>
     </head>
     <body>
       <canvas id="canvas"></canvas>
@@ -204,344 +109,280 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
         window.renderPage = async function(pageNum) {
           const pdfData = atob('${base64Pdf}');
           const pdfArray = new Uint8Array(pdfData.length);
-          for (let i = 0; i < pdfData.length; i++) {
-            pdfArray[i] = pdfData.charCodeAt(i);
-          }
+          for (let i = 0; i < pdfData.length; i++) pdfArray[i] = pdfData.charCodeAt(i);
           
           const pdf = await pdfjsLib.getDocument({ data: pdfArray }).promise;
-          window.totalPages = pdf.numPages;
-          
           if (pageNum > pdf.numPages) return null;
           
           const pdfPage = await pdf.getPage(pageNum);
-          const scale = 1.5; // Reduced from 2.0 for faster processing
-          const viewport = pdfPage.getViewport({ scale });
-          
+          const viewport = pdfPage.getViewport({ scale: 1.5 });
           const canvas = document.getElementById('canvas');
-          const context = canvas.getContext('2d');
           canvas.width = viewport.width;
           canvas.height = viewport.height;
           
-          await pdfPage.render({ canvasContext: context, viewport }).promise;
+          await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
           return { width: canvas.width, height: canvas.height };
         };
         
         window.getPageCount = async function() {
           const pdfData = atob('${base64Pdf}');
           const pdfArray = new Uint8Array(pdfData.length);
-          for (let i = 0; i < pdfData.length; i++) {
-            pdfArray[i] = pdfData.charCodeAt(i);
-          }
-          const pdf = await pdfjsLib.getDocument({ data: pdfArray }).promise;
-          return pdf.numPages;
+          for (let i = 0; i < pdfData.length; i++) pdfArray[i] = pdfData.charCodeAt(i);
+          return (await pdfjsLib.getDocument({ data: pdfArray }).promise).numPages;
         };
       </script>
     </body>
-    </html>
-    `;
+    </html>`;
     
     await page.setContent(html, { waitUntil: 'networkidle0' });
-    
-    // Wait for PDF.js to load
     await page.waitForFunction('typeof pdfjsLib !== "undefined"', { timeout: 10000 });
     
-    // Get page count
     const pageCount = await page.evaluate('getPageCount()');
-    console.log(`[Storyboard] PDF has ${pageCount} pages`);
+    console.log(`[Storyboard] PDF: ${pageCount} pages`);
     
-    // Render each page
     for (let i = 1; i <= pageCount; i++) {
-      console.log(`[Storyboard] Rendering page ${i}/${pageCount}`);
-      
       const dimensions = await page.evaluate(`renderPage(${i})`);
       if (!dimensions) continue;
+      await new Promise(r => setTimeout(r, 300));
       
-      // Wait for render
-      await new Promise(r => setTimeout(r, 500));
-      
-      // Screenshot the canvas
       const canvas = await page.$('#canvas');
       const imagePath = path.join(outputDir, `page-${i}.jpg`);
-      await canvas.screenshot({ path: imagePath, type: 'jpeg', quality: 85 });
+      await canvas.screenshot({ path: imagePath, type: 'jpeg', quality: 90 });
       images.push(imagePath);
     }
     
     return images;
-    
   } finally {
     if (browser) await browser.close();
   }
 }
 
 /**
- * Extract text data from a page image using Claude (no bounding boxes)
+ * Ask Claude for grid layout + text extraction in one call
  */
-async function extractPageText(imageBuffer) {
+async function analyzePageWithClaude(imageBuffer) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
   
-  // Resize image for faster analysis
   const resized = await sharp(imageBuffer)
-    .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 80 })
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 85 })
     .toBuffer();
-  
-  const base64Image = resized.toString('base64');
-  console.log(`[Storyboard] Sending image to Claude for text extraction: ${Math.round(resized.length / 1024)}KB`);
   
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 4096,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: 'image/jpeg',
-              data: base64Image
-            }
-          },
-          {
-            type: 'text',
-            text: `Analyze this storyboard page and extract the TEXT content for each frame.
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') }
+        },
+        {
+          type: 'text',
+          text: `Analyze this storyboard page.
 
-For each frame visible on the page, extract:
-1. Frame number (e.g., "1", "1A", "2B") - look for labels like "Frame 1" or "FR 1A"
-2. Spot/Scene name if visible at the top of the page
-3. Description - the action/direction text
-4. Dialog - spoken text, VO, or copy with character names
-5. Original - the complete text as it appears under the frame
+STEP 1 - COUNT THE GRID:
+- How many COLUMNS of storyboard frames? (usually 2 or 3)
+- How many ROWS of storyboard frames? (usually 2-4)
+- Only count actual frame cells, not headers or titles
 
-Return JSON in order from top-left to bottom-right:
+STEP 2 - EXTRACT TEXT for each cell (left-to-right, top-to-bottom):
+- frameNumber: The label (e.g. "1A", "FR 2B", "3.")
+- description: Action/direction text
+- dialog: Spoken lines with character names (e.g. "MARTHA: Hello...")
+- hasContent: true if cell has a frame, false if empty
+
+Return JSON only:
 {
-  "spotName": "Spot name or null",
-  "frameCount": 6,
+  "spotName": "Spot/scene name from header, or null",
+  "grid": { "cols": 2, "rows": 3 },
   "frames": [
-    {
-      "frameNumber": "1A",
-      "description": "Martha talks to camera.",
-      "dialog": "MARTHA: Hello...",
-      "original": "Full original text..."
-    }
+    { "frameNumber": "1A", "description": "...", "dialog": "...", "hasContent": true }
   ]
 }
 
-Do NOT include bounding boxes - just extract the text content.
-If no frames found, return {"spotName": null, "frameCount": 0, "frames": []}`
-          }
-        ]
-      }
-    ]
+RULES:
+- frames.length MUST equal cols × rows
+- Order: left-to-right, top-to-bottom (reading order)
+- Empty cells: include with hasContent: false
+- No grid (title page): return { "grid": null, "frames": [] }`
+        }
+      ]
+    }]
   });
   
   const text = response.content[0].text;
-  let jsonStr = text;
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) jsonStr = jsonMatch[1];
+  const jsonStr = jsonMatch ? jsonMatch[1] : text;
   
   try {
     return JSON.parse(jsonStr.trim());
   } catch (e) {
-    console.error('Failed to parse response:', text);
-    return { spotName: null, frameCount: 0, frames: [] };
+    console.error('[Storyboard] Parse error:', text.substring(0, 200));
+    return { spotName: null, grid: null, frames: [] };
   }
 }
 
 /**
- * Match detected frame images with extracted text data
- * Assumes both are in reading order (top-to-bottom, left-to-right)
+ * Slice image into grid cells based on detected layout
  */
-function matchFramesWithText(detectedFrames, textData) {
-  const frames = textData.frames || [];
-  const images = detectedFrames.images || [];
+async function sliceIntoGrid(imagePath, grid) {
+  if (!grid?.cols || !grid?.rows) return [];
   
-  const results = [];
-  const maxLen = Math.max(frames.length, images.length);
+  const metadata = await sharp(imagePath).metadata();
+  const { width, height } = metadata;
   
-  for (let i = 0; i < maxLen; i++) {
-    const textFrame = frames[i] || {};
-    const image = images[i] || null;
-    
-    results.push({
-      frameNumber: textFrame.frameNumber || `${i + 1}`,
-      description: textFrame.description || '',
-      dialog: textFrame.dialog || '',
-      original: textFrame.original || '',
-      image: image,
-      spotName: textData.spotName
-    });
+  // Margins - adjust if your storyboards have different headers
+  const marginTop = Math.round(height * 0.06);
+  const marginBottom = Math.round(height * 0.02);
+  const marginSide = Math.round(width * 0.02);
+  
+  const gridWidth = width - (marginSide * 2);
+  const gridHeight = height - marginTop - marginBottom;
+  const cellWidth = Math.round(gridWidth / grid.cols);
+  const cellHeight = Math.round(gridHeight / grid.rows);
+  
+  const cells = [];
+  
+  for (let row = 0; row < grid.rows; row++) {
+    for (let col = 0; col < grid.cols; col++) {
+      const left = marginSide + (col * cellWidth);
+      const top = marginTop + (row * cellHeight);
+      const inset = 4; // Small inset to avoid border lines
+      
+      try {
+        const cropped = await sharp(imagePath)
+          .extract({
+            left: Math.max(0, left + inset),
+            top: Math.max(0, top + inset),
+            width: Math.min(cellWidth - inset * 2, width - left - inset),
+            height: Math.min(cellHeight - inset * 2, height - top - inset)
+          })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+        
+        cells.push(cropped.toString('base64'));
+      } catch (e) {
+        console.error('[Storyboard] Crop error:', e.message);
+        cells.push(null);
+      }
+    }
   }
   
-  return results;
+  return cells;
 }
 
-/**
- * Group frames into shots (1A, 1B, 1C -> Shot 1)
- */
 function groupFramesIntoShots(allFrames) {
   const shotGroups = {};
   
   for (const frame of allFrames) {
+    if (!frame.hasContent) continue;
+    
     const match = frame.frameNumber?.match(/^(\d+)/);
-    const shotNum = match ? match[1] : frame.frameNumber || 'unknown';
+    const shotNum = match ? match[1] : frame.frameNumber || 'X';
     
     if (!shotGroups[shotNum]) {
-      shotGroups[shotNum] = {
-        shotNumber: shotNum,
-        frames: [],
-        images: [],
-        descriptions: [],
-        dialogs: [],
-        originals: []
-      };
+      shotGroups[shotNum] = { shotNumber: shotNum, frames: [], images: [], descriptions: [], dialogs: [] };
     }
     
     shotGroups[shotNum].frames.push(frame.frameNumber);
     if (frame.image) shotGroups[shotNum].images.push(frame.image);
     if (frame.description) shotGroups[shotNum].descriptions.push(frame.description);
     if (frame.dialog) shotGroups[shotNum].dialogs.push(frame.dialog);
-    if (frame.original) shotGroups[shotNum].originals.push(frame.original);
   }
   
-  return Object.values(shotGroups).map(group => ({
-    shotNumber: group.shotNumber,
-    frames: group.frames,
-    images: group.images,
-    description: group.descriptions.join('\n'),
-    dialog: group.dialogs.join('\n'),
-    original: group.originals.join('\n')
+  return Object.values(shotGroups).map(g => ({
+    shotNumber: g.shotNumber,
+    frames: g.frames,
+    images: g.images,
+    description: g.descriptions.join('\n'),
+    dialog: g.dialogs.join('\n'),
+    combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n')
   }));
 }
 
-/**
- * Storyboard extraction endpoint
- */
 app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'storyboard-'));
   
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
     
-    if (!process.env.ANTHROPIC_API_KEY) {
-      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
-    }
+    console.log('[Storyboard] File:', req.file.originalname, req.file.mimetype);
     
-    console.log('[Storyboard] Processing:', req.file.originalname, 'Type:', req.file.mimetype, 'Size:', req.file.size);
-    
-    let pageImages = [];
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
     
-    // Handle based on file type
+    let pageImages = [];
     if (req.file.mimetype === 'application/pdf') {
-      // PDF: render pages to images
       pageImages = await pdfToPageImages(req.file.buffer, imageDir);
     } else {
-      // Image: save directly
       const imagePath = path.join(imageDir, 'page-1.jpg');
-      
-      // Convert to JPEG and normalize
-      await sharp(req.file.buffer)
-        .jpeg({ quality: 90 })
-        .toFile(imagePath);
-      
+      await sharp(req.file.buffer).jpeg({ quality: 90 }).toFile(imagePath);
       pageImages = [imagePath];
     }
     
-    console.log(`[Storyboard] Processing ${pageImages.length} page(s)`);
+    console.log(`[Storyboard] ${pageImages.length} page(s)`);
     
-    // Process each page
     const allFrames = [];
     let currentSpotName = null;
     
     for (let i = 0; i < pageImages.length; i++) {
-      console.log(`[Storyboard] Page ${i + 1}/${pageImages.length}: Detecting frames with OpenCV...`);
+      console.log(`[Storyboard] Page ${i + 1}/${pageImages.length}`);
       
-      // Step 1: Use OpenCV to detect and crop frames
-      let detectedFrames;
-      try {
-        detectedFrames = await detectFrames(pageImages[i]);
-        console.log(`[Storyboard] OpenCV detected ${detectedFrames.count} frames`);
-      } catch (cvError) {
-        console.error('[Storyboard] OpenCV failed, falling back to full page:', cvError.message);
-        // Fallback: use full page as single frame
-        const pageBuffer = await fs.readFile(pageImages[i]);
-        const resized = await sharp(pageBuffer)
-          .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 80 })
-          .toBuffer();
-        detectedFrames = {
-          count: 1,
-          frames: [{ x: 0, y: 0, width: 800, height: 600 }],
-          images: [resized.toString('base64')]
-        };
-      }
-      
-      // Step 2: Use Claude to extract text data
-      console.log(`[Storyboard] Page ${i + 1}: Extracting text with Claude...`);
       const imageBuffer = await fs.readFile(pageImages[i]);
-      const textData = await extractPageText(imageBuffer);
+      const pageData = await analyzePageWithClaude(imageBuffer);
       
-      if (textData.spotName) {
-        currentSpotName = textData.spotName;
+      if (pageData.spotName) currentSpotName = pageData.spotName;
+      
+      if (!pageData.grid) {
+        console.log(`[Storyboard] Page ${i + 1}: no grid`);
+        continue;
       }
       
-      console.log(`[Storyboard] Claude found ${textData.frameCount || textData.frames?.length || 0} frames in text`);
+      console.log(`[Storyboard] Page ${i + 1}: ${pageData.grid.cols}x${pageData.grid.rows} = ${pageData.frames?.length || 0} frames`);
       
-      // Step 3: Match images with text
-      const matchedFrames = matchFramesWithText(detectedFrames, textData);
+      const cellImages = await sliceIntoGrid(pageImages[i], pageData.grid);
       
-      for (const frame of matchedFrames) {
+      for (let j = 0; j < (pageData.frames || []).length; j++) {
+        const frame = pageData.frames[j];
+        if (!frame.hasContent) continue;
+        
         allFrames.push({
           ...frame,
-          spotName: frame.spotName || currentSpotName
+          image: cellImages[j] || null,
+          spotName: currentSpotName
         });
       }
     }
     
-    console.log(`[Storyboard] Total extracted: ${allFrames.length} frames`);
+    console.log(`[Storyboard] Total: ${allFrames.length} frames`);
     
-    // Group by spot name
     const spotGroups = {};
     for (const frame of allFrames) {
-      const spotName = frame.spotName || 'Untitled Spot';
-      if (!spotGroups[spotName]) {
-        spotGroups[spotName] = [];
-      }
-      spotGroups[spotName].push(frame);
+      const spot = frame.spotName || 'Untitled';
+      if (!spotGroups[spot]) spotGroups[spot] = [];
+      spotGroups[spot].push(frame);
     }
     
-    // Build final response
     const spots = Object.entries(spotGroups).map(([name, frames]) => ({
       name,
       shots: groupFramesIntoShots(frames)
     }));
     
-    console.log(`[Storyboard] Returning ${spots.length} spots`);
-    
     res.json({ spots });
     
   } catch (error) {
     console.error('[Storyboard] Error:', error);
-    res.status(500).json({ error: error.message || 'Extraction failed' });
-    
+    res.status(500).json({ error: error.message });
   } finally {
-    try {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    } catch (e) {
-      console.error('Cleanup error:', e);
-    }
+    try { await fs.rm(tempDir, { recursive: true, force: true }); } catch (e) {}
   }
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`Railway PDF Server listening on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'production'}`);
-  console.log(`Storyboard extraction: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled (no API key)'}`);
+  console.log(`Server on port ${PORT}`);
+  console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
