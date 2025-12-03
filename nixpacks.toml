@@ -1,8 +1,9 @@
+# Force Node.js as primary with Python for OpenCV
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip"]
+nixPkgs = ["nodejs_18", "python311", "python311Packages.pip", "python311Packages.opencv4", "python311Packages.numpy"]
 
 [phases.install]
-cmds = ["npm ci", "pip install -r requirements.txt --break-system-packages"]
+cmds = ["npm ci"]
 
 [start]
 cmd = "node server.js"
