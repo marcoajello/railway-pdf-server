@@ -1,4 +1,4 @@
-// Version 2.0.0 - Claude grid detection (no OpenCV)
+// Version 2.1.0 - OpenCV rectangle detection
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -9,6 +9,7 @@ const sharp = require('sharp');
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,16 +34,11 @@ function getAnthropicClient() {
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    version: '2.0.0',
-    features: ['pdf-generation', 'storyboard-extraction']
-  });
+  res.json({ status: 'ok', version: '2.1.0', features: ['pdf-generation', 'storyboard-extraction'] });
 });
 
-// PDF generation
+// PDF generation endpoint
 app.post('/generate-pdf', async (req, res) => {
   let browser = null;
   try {
@@ -80,7 +76,45 @@ app.post('/generate-pdf', async (req, res) => {
 // STORYBOARD EXTRACTION
 // ============================================
 
-async function pdfToPageImages(pdfBuffer, outputDir) {
+/**
+ * Detect rectangles using Python/OpenCV
+ */
+async function detectRectangles(imagePath) {
+  return new Promise((resolve) => {
+    const script = path.join(__dirname, 'frame_detector.py');
+    const proc = spawn('python3', [script, imagePath, 'crop']);
+    
+    let stdout = '';
+    let stderr = '';
+    
+    proc.stdout.on('data', d => stdout += d);
+    proc.stderr.on('data', d => stderr += d);
+    
+    proc.on('close', code => {
+      if (code !== 0) {
+        console.error('[Storyboard] Python error:', stderr);
+        resolve({ count: 0, rectangles: [], images: [] });
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e) {
+        console.error('[Storyboard] JSON parse error');
+        resolve({ count: 0, rectangles: [], images: [] });
+      }
+    });
+    
+    proc.on('error', err => {
+      console.error('[Storyboard] Spawn error:', err.message);
+      resolve({ count: 0, rectangles: [], images: [] });
+    });
+  });
+}
+
+/**
+ * Convert PDF to page images
+ */
+async function pdfToImages(pdfBuffer, outputDir) {
   let browser = null;
   const images = [];
   
@@ -91,64 +125,44 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
     });
     
     const page = await browser.newPage();
-    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1.5 });
+    await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 2 });
     
     const base64Pdf = pdfBuffer.toString('base64');
-    const html = `
-    <!DOCTYPE html>
-    <html>
-    <head>
+    const html = `<!DOCTYPE html><html><head>
       <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-      <style>body { margin: 0; background: white; } canvas { display: block; }</style>
-    </head>
-    <body>
-      <canvas id="canvas"></canvas>
-      <script>
-        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-        
-        window.renderPage = async function(pageNum) {
-          const pdfData = atob('${base64Pdf}');
-          const pdfArray = new Uint8Array(pdfData.length);
-          for (let i = 0; i < pdfData.length; i++) pdfArray[i] = pdfData.charCodeAt(i);
-          
-          const pdf = await pdfjsLib.getDocument({ data: pdfArray }).promise;
-          if (pageNum > pdf.numPages) return null;
-          
-          const pdfPage = await pdf.getPage(pageNum);
-          const viewport = pdfPage.getViewport({ scale: 1.5 });
-          const canvas = document.getElementById('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          
-          await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-          return { width: canvas.width, height: canvas.height };
-        };
-        
-        window.getPageCount = async function() {
-          const pdfData = atob('${base64Pdf}');
-          const pdfArray = new Uint8Array(pdfData.length);
-          for (let i = 0; i < pdfData.length; i++) pdfArray[i] = pdfData.charCodeAt(i);
-          return (await pdfjsLib.getDocument({ data: pdfArray }).promise).numPages;
-        };
-      </script>
-    </body>
-    </html>`;
+      <style>body{margin:0;background:white}canvas{display:block}</style>
+    </head><body><canvas id="canvas"></canvas><script>
+      pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      window.renderPage=async function(n){
+        const d=atob('${base64Pdf}'),a=new Uint8Array(d.length);
+        for(let i=0;i<d.length;i++)a[i]=d.charCodeAt(i);
+        const pdf=await pdfjsLib.getDocument({data:a}).promise;
+        if(n>pdf.numPages)return null;
+        const pg=await pdf.getPage(n),vp=pg.getViewport({scale:2}),c=document.getElementById('canvas');
+        c.width=vp.width;c.height=vp.height;
+        await pg.render({canvasContext:c.getContext('2d'),viewport:vp}).promise;
+        return{w:c.width,h:c.height};
+      };
+      window.getPageCount=async function(){
+        const d=atob('${base64Pdf}'),a=new Uint8Array(d.length);
+        for(let i=0;i<d.length;i++)a[i]=d.charCodeAt(i);
+        return(await pdfjsLib.getDocument({data:a}).promise).numPages;
+      };
+    </script></body></html>`;
     
     await page.setContent(html, { waitUntil: 'networkidle0' });
-    await page.waitForFunction('typeof pdfjsLib !== "undefined"', { timeout: 10000 });
+    await page.waitForFunction('typeof pdfjsLib!=="undefined"', { timeout: 10000 });
     
     const pageCount = await page.evaluate('getPageCount()');
     console.log(`[Storyboard] PDF: ${pageCount} pages`);
     
     for (let i = 1; i <= pageCount; i++) {
-      const dimensions = await page.evaluate(`renderPage(${i})`);
-      if (!dimensions) continue;
-      await new Promise(r => setTimeout(r, 300));
-      
+      await page.evaluate(`renderPage(${i})`);
+      await new Promise(r => setTimeout(r, 400));
       const canvas = await page.$('#canvas');
-      const imagePath = path.join(outputDir, `page-${i}.jpg`);
-      await canvas.screenshot({ path: imagePath, type: 'jpeg', quality: 90 });
-      images.push(imagePath);
+      const imgPath = path.join(outputDir, `page-${i}.png`);
+      await canvas.screenshot({ path: imgPath, type: 'png' });
+      images.push(imgPath);
     }
     
     return images;
@@ -158,11 +172,11 @@ async function pdfToPageImages(pdfBuffer, outputDir) {
 }
 
 /**
- * Ask Claude for grid layout + text extraction in one call
+ * Extract text from page using Claude
  */
-async function analyzePageWithClaude(imageBuffer) {
+async function extractText(imageBuffer) {
   const client = getAnthropicClient();
-  if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
+  if (!client) throw new Error('ANTHROPIC_API_KEY not set');
   
   const resized = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
@@ -175,125 +189,62 @@ async function analyzePageWithClaude(imageBuffer) {
     messages: [{
       role: 'user',
       content: [
-        {
-          type: 'image',
-          source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') }
-        },
-        {
-          type: 'text',
-          text: `Analyze this storyboard page.
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
+        { type: 'text', text: `Extract text from this storyboard page.
 
-STEP 1 - COUNT THE GRID:
-- How many COLUMNS of storyboard frames? (usually 2 or 3)
-- How many ROWS of storyboard frames? (usually 2-4)
-- Only count actual frame cells, not headers or titles
-
-STEP 2 - EXTRACT TEXT for each cell (left-to-right, top-to-bottom):
-- frameNumber: The label (e.g. "1A", "FR 2B", "3.")
-- description: Action/direction text
-- dialog: Spoken lines with character names (e.g. "MARTHA: Hello...")
-- hasContent: true if cell has a frame, false if empty
-
-Return JSON only:
+Return JSON:
 {
-  "spotName": "Spot/scene name from header, or null",
-  "grid": { "cols": 2, "rows": 3 },
+  "spotName": "Scene/spot name from header or null",
   "frames": [
-    { "frameNumber": "1A", "description": "...", "dialog": "...", "hasContent": true }
+    {
+      "frameNumber": "1A",
+      "description": "Action description text",
+      "dialog": "CHAR: Spoken dialog..."
+    }
   ]
 }
 
 RULES:
-- frames.length MUST equal cols × rows
-- Order: left-to-right, top-to-bottom (reading order)
-- Empty cells: include with hasContent: false
-- No grid (title page): return { "grid": null, "frames": [] }`
-        }
+- List frames in reading order (left-to-right, top-to-bottom)
+- frameNumber: the label like "1A.", "2B", "FR 3"
+- description: the action/direction text
+- dialog: spoken lines with character names
+- Skip empty cells` }
       ]
     }]
   });
   
   const text = response.content[0].text;
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const jsonStr = jsonMatch ? jsonMatch[1] : text;
-  
   try {
-    return JSON.parse(jsonStr.trim());
+    return JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
   } catch (e) {
-    console.error('[Storyboard] Parse error:', text.substring(0, 200));
-    return { spotName: null, grid: null, frames: [] };
+    console.error('[Storyboard] Text parse error');
+    return { spotName: null, frames: [] };
   }
 }
 
 /**
- * Slice image into grid cells based on detected layout
+ * Group frames into shots
  */
-async function sliceIntoGrid(imagePath, grid) {
-  if (!grid?.cols || !grid?.rows) return [];
+function groupIntoShots(frames) {
+  const groups = {};
   
-  const metadata = await sharp(imagePath).metadata();
-  const { width, height } = metadata;
-  
-  // Margins - adjust if your storyboards have different headers
-  const marginTop = Math.round(height * 0.06);
-  const marginBottom = Math.round(height * 0.02);
-  const marginSide = Math.round(width * 0.02);
-  
-  const gridWidth = width - (marginSide * 2);
-  const gridHeight = height - marginTop - marginBottom;
-  const cellWidth = Math.round(gridWidth / grid.cols);
-  const cellHeight = Math.round(gridHeight / grid.rows);
-  
-  const cells = [];
-  
-  for (let row = 0; row < grid.rows; row++) {
-    for (let col = 0; col < grid.cols; col++) {
-      const left = marginSide + (col * cellWidth);
-      const top = marginTop + (row * cellHeight);
-      const inset = 4; // Small inset to avoid border lines
-      
-      try {
-        const cropped = await sharp(imagePath)
-          .extract({
-            left: Math.max(0, left + inset),
-            top: Math.max(0, top + inset),
-            width: Math.min(cellWidth - inset * 2, width - left - inset),
-            height: Math.min(cellHeight - inset * 2, height - top - inset)
-          })
-          .jpeg({ quality: 85 })
-          .toBuffer();
-        
-        cells.push(cropped.toString('base64'));
-      } catch (e) {
-        console.error('[Storyboard] Crop error:', e.message);
-        cells.push(null);
-      }
-    }
-  }
-  
-  return cells;
-}
-
-function groupFramesIntoShots(allFrames) {
-  const shotGroups = {};
-  
-  for (const frame of allFrames) {
-    if (!frame.hasContent) continue;
+  for (const f of frames) {
+    const match = f.frameNumber?.match(/^(\d+)/);
+    const num = match ? match[1] : f.frameNumber || 'X';
     
-    const match = frame.frameNumber?.match(/^(\d+)/);
-    const shotNum = match ? match[1] : frame.frameNumber || 'X';
-    
-    if (!shotGroups[shotNum]) {
-      shotGroups[shotNum] = { shotNumber: shotNum, frames: [], images: [], descriptions: [], dialogs: [] };
+    if (!groups[num]) {
+      groups[num] = { shotNumber: num, frames: [], images: [], descriptions: [], dialogs: [] };
     }
     
-    shotGroups[shotNum].frames.push(frame.frameNumber);
-    if (frame.image) shotGroups[shotNum].images.push(frame.image);
-    if (frame.description) shotGroups[shotNum].descriptions.push(frame.description);
-    if (frame.dialog) shotGroups[shotNum].dialogs.push(frame.dialog);
+    groups[num].frames.push(f.frameNumber);
+    if (f.image) groups[num].images.push(f.image);
+    if (f.description) groups[num].descriptions.push(f.description);
+    if (f.dialog) groups[num].dialogs.push(f.dialog);
   }
   
-  return Object.values(shotGroups).map(g => ({
+  return Object.values(groups).map(g => ({
     shotNumber: g.shotNumber,
     frames: g.frames,
     images: g.images,
@@ -303,6 +254,9 @@ function groupFramesIntoShots(allFrames) {
   }));
 }
 
+/**
+ * Main extraction endpoint
+ */
 app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'storyboard-'));
   
@@ -310,66 +264,73 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
     
-    console.log('[Storyboard] File:', req.file.originalname, req.file.mimetype);
+    console.log('[Storyboard] Processing:', req.file.originalname);
     
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
     
+    // Convert PDF to images
     let pageImages = [];
     if (req.file.mimetype === 'application/pdf') {
-      pageImages = await pdfToPageImages(req.file.buffer, imageDir);
+      pageImages = await pdfToImages(req.file.buffer, imageDir);
     } else {
-      const imagePath = path.join(imageDir, 'page-1.jpg');
-      await sharp(req.file.buffer).jpeg({ quality: 90 }).toFile(imagePath);
-      pageImages = [imagePath];
+      const imgPath = path.join(imageDir, 'page-1.png');
+      await sharp(req.file.buffer).png().toFile(imgPath);
+      pageImages = [imgPath];
     }
     
     console.log(`[Storyboard] ${pageImages.length} page(s)`);
     
     const allFrames = [];
-    let currentSpotName = null;
+    let currentSpot = null;
     
     for (let i = 0; i < pageImages.length; i++) {
-      console.log(`[Storyboard] Page ${i + 1}/${pageImages.length}`);
+      console.log(`[Storyboard] Page ${i + 1}: detecting rectangles...`);
       
+      // Detect rectangles with OpenCV
+      const detected = await detectRectangles(pageImages[i]);
+      console.log(`[Storyboard] Page ${i + 1}: found ${detected.count} rectangles`);
+      
+      // Extract text with Claude
       const imageBuffer = await fs.readFile(pageImages[i]);
-      const pageData = await analyzePageWithClaude(imageBuffer);
+      const textData = await extractText(imageBuffer);
       
-      if (pageData.spotName) currentSpotName = pageData.spotName;
+      if (textData.spotName) currentSpot = textData.spotName;
       
-      if (!pageData.grid) {
-        console.log(`[Storyboard] Page ${i + 1}: no grid`);
-        continue;
-      }
+      console.log(`[Storyboard] Page ${i + 1}: ${textData.frames?.length || 0} text frames`);
       
-      console.log(`[Storyboard] Page ${i + 1}: ${pageData.grid.cols}x${pageData.grid.rows} = ${pageData.frames?.length || 0} frames`);
+      // Match rectangles to text frames by position (both sorted reading order)
+      const textFrames = textData.frames || [];
+      const images = detected.images || [];
       
-      const cellImages = await sliceIntoGrid(pageImages[i], pageData.grid);
-      
-      for (let j = 0; j < (pageData.frames || []).length; j++) {
-        const frame = pageData.frames[j];
-        if (!frame.hasContent) continue;
+      const maxLen = Math.max(textFrames.length, images.length);
+      for (let j = 0; j < maxLen; j++) {
+        const tf = textFrames[j] || {};
+        const img = images[j] || null;
         
         allFrames.push({
-          ...frame,
-          image: cellImages[j] || null,
-          spotName: currentSpotName
+          frameNumber: tf.frameNumber || `${j + 1}`,
+          description: tf.description || '',
+          dialog: tf.dialog || '',
+          image: img,
+          spotName: currentSpot
         });
       }
     }
     
     console.log(`[Storyboard] Total: ${allFrames.length} frames`);
     
+    // Group by spot
     const spotGroups = {};
-    for (const frame of allFrames) {
-      const spot = frame.spotName || 'Untitled';
+    for (const f of allFrames) {
+      const spot = f.spotName || 'Untitled';
       if (!spotGroups[spot]) spotGroups[spot] = [];
-      spotGroups[spot].push(frame);
+      spotGroups[spot].push(f);
     }
     
     const spots = Object.entries(spotGroups).map(([name, frames]) => ({
       name,
-      shots: groupFramesIntoShots(frames)
+      shots: groupIntoShots(frames)
     }));
     
     res.json({ spots });
