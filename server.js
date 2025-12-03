@@ -73,6 +73,8 @@ app.post('/generate-pdf', async (req, res) => {
 });
 
 // HTML generation endpoint (for broadcast)
+// The input HTML from buildCompleteHTML already has embedded images and inline styles
+// We just render it and return the cleaned version
 app.post('/generate-html', async (req, res) => {
   let browser = null;
   try {
@@ -88,79 +90,24 @@ app.post('/generate-html', async (req, res) => {
     await page.setViewport({ width: 1400, height: 900 });
     await page.setContent(html, { waitUntil: ['load', 'networkidle0'] });
     
-    // Extract the rendered HTML with computed styles inlined
+    // Get the full rendered HTML with minimal changes
     const renderedHtml = await page.evaluate(() => {
-      // Get all stylesheets as text
-      let styleText = '';
-      for (const sheet of document.styleSheets) {
-        try {
-          for (const rule of sheet.cssRules) {
-            styleText += rule.cssText + '\n';
-          }
-        } catch (e) {
-          // Skip cross-origin stylesheets
-        }
-      }
+      // Remove scripts only
+      document.querySelectorAll('script').forEach(s => s.remove());
       
-      // Clone body
-      const clone = document.body.cloneNode(true);
+      // Remove interactive elements but preserve structure
+      document.querySelectorAll('button, input[type="checkbox"]').forEach(el => el.remove());
       
-      // Remove scripts
-      clone.querySelectorAll('script').forEach(s => s.remove());
+      // Remove contenteditable and draggable attributes
+      document.querySelectorAll('[contenteditable]').forEach(el => el.removeAttribute('contenteditable'));
+      document.querySelectorAll('[draggable]').forEach(el => el.removeAttribute('draggable'));
       
-      // Remove interactive elements
-      clone.querySelectorAll('button, input[type="checkbox"], .drag-cell, .sharpie, .actions-cell, .row-drag-handle').forEach(el => {
-        el.remove();
-      });
-      
-      // Remove contenteditable
-      clone.querySelectorAll('[contenteditable]').forEach(el => {
-        el.removeAttribute('contenteditable');
-      });
-      
-      // Remove draggable
-      clone.querySelectorAll('[draggable]').forEach(el => {
-        el.removeAttribute('draggable');
-      });
-      
-      // Remove hidden columns (display: none)
-      clone.querySelectorAll('[style*="display: none"], [style*="display:none"]').forEach(el => {
-        el.remove();
-      });
-      
-      return { styles: styleText, body: clone.innerHTML };
+      // Return the entire document HTML
+      return document.documentElement.outerHTML;
     });
     
-    // Build complete HTML document
-    const fullHtml = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    ${renderedHtml.styles}
-    
-    /* Broadcast overrides */
-    body {
-      margin: 0;
-      padding: 16px;
-      background: #fff;
-    }
-    .row-complete td {
-      opacity: 0.5;
-      text-decoration: line-through;
-      text-decoration-color: #e53935;
-    }
-    @media screen and (max-width: 768px) {
-      body { padding: 8px; }
-      table { font-size: 11px; }
-    }
-  </style>
-</head>
-<body>
-${renderedHtml.body}
-</body>
-</html>`;
+    // Return the full document
+    const fullHtml = `<!DOCTYPE html>\n${renderedHtml}`;
     
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(fullHtml);
