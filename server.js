@@ -228,8 +228,20 @@ async function pdfToImages(pdfBuffer, outputDir) {
       await page.evaluate(`renderPage(${i})`);
       await new Promise(r => setTimeout(r, 400));
       const canvas = await page.$('#canvas');
-      const imgPath = path.join(outputDir, `page-${i}.png`);
-      await canvas.screenshot({ path: imgPath, type: 'png' });
+      const tempPath = path.join(outputDir, `page-${i}-temp.png`);
+      const imgPath = path.join(outputDir, `page-${i}.jpg`);
+      
+      // Take screenshot as PNG
+      await canvas.screenshot({ path: tempPath, type: 'png' });
+      
+      // Compress to JPEG at 75% quality
+      await sharp(tempPath)
+        .jpeg({ quality: 75, progressive: true })
+        .toFile(imgPath);
+      
+      // Delete temp PNG
+      await fs.unlink(tempPath);
+      
       images.push(imgPath);
     }
     
