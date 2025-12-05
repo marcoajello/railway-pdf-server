@@ -191,6 +191,8 @@ async function pdfToImages(pdfBuffer, outputDir) {
     });
     
     const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(120000); // 2 minutes
+    page.setDefaultTimeout(120000);
     await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 2 });
     
     const base64Pdf = pdfBuffer.toString('base64');
@@ -216,8 +218,8 @@ async function pdfToImages(pdfBuffer, outputDir) {
       };
     </script></body></html>`;
     
-    await page.setContent(html, { waitUntil: 'networkidle0' });
-    await page.waitForFunction('typeof pdfjsLib!=="undefined"', { timeout: 10000 });
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 120000 });
+    await page.waitForFunction('typeof pdfjsLib!=="undefined"', { timeout: 60000 });
     
     const pageCount = await page.evaluate('getPageCount()');
     console.log(`[Storyboard] PDF: ${pageCount} pages`);
