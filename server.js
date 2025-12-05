@@ -193,7 +193,7 @@ async function pdfToImages(pdfBuffer, outputDir) {
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(120000); // 2 minutes
     page.setDefaultTimeout(120000);
-    await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 1.5 });
+    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1 });
     
     const base64Pdf = pdfBuffer.toString('base64');
     const html = `<!DOCTYPE html><html><head>
@@ -234,9 +234,10 @@ async function pdfToImages(pdfBuffer, outputDir) {
       // Take screenshot as PNG
       await canvas.screenshot({ path: tempPath, type: 'png' });
       
-      // Compress to JPEG at 75% quality
+      // Aggressively compress: resize to 1200px max, JPEG quality 40
       await sharp(tempPath)
-        .jpeg({ quality: 75, progressive: true })
+        .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
+        .jpeg({ quality: 40, progressive: true })
         .toFile(imgPath);
       
       // Delete temp PNG
