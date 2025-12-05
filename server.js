@@ -193,7 +193,7 @@ async function pdfToImages(pdfBuffer, outputDir) {
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(120000); // 2 minutes
     page.setDefaultTimeout(120000);
-    await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 2 });
+    await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 1.5 });
     
     const base64Pdf = pdfBuffer.toString('base64');
     const html = `<!DOCTYPE html><html><head>
