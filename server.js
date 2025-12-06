@@ -193,9 +193,33 @@ If NO pages have hanging chads, respond: { "issues": [] }`
     
     const text = response.content[0]?.text || '{"issues":[]}';
     
-    // Parse JSON response (handle markdown code blocks)
-    const cleanText = text.replace(/```json|```/g, '').trim();
-    const result = JSON.parse(cleanText);
+    console.log('[PDF Analyze] Raw Claude response:', text.substring(0, 200));
+    
+    // Parse JSON response - handle markdown code blocks and natural language preamble
+    let cleanText = text;
+    
+    // Remove markdown code blocks
+    cleanText = cleanText.replace(/```json\s*/g, '').replace(/```\s*/g, '');
+    
+    // Try to find JSON object in the response
+    const jsonMatch = cleanText.match(/\{[\s\S]*"issues"[\s\S]*\}/);
+    if (jsonMatch) {
+      cleanText = jsonMatch[0];
+    }
+    
+    let result;
+    try {
+      result = JSON.parse(cleanText.trim());
+    } catch (parseError) {
+      console.error('[PDF Analyze] JSON parse failed, raw text:', text);
+      // Return empty result if we can't parse
+      return res.json({
+        success: true,
+        issues: [],
+        rowsToBreakBefore: [],
+        hasIssues: false
+      });
+    }
     
     const issues = result.issues || [];
     const rowsToBreakBefore = issues.map(i => i.lastRowOnPage);
