@@ -1,4 +1,4 @@
-// Version 2.6.0 - Added HTML generation for broadcast
+// Version 2.7.0 - Added hanging chad detection endpoint
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '2.6.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction'] });
+  res.json({ status: 'ok', version: '2.7.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'hanging-chad-detection'] });
 });
 
 // PDF generation endpoint
@@ -73,8 +73,6 @@ app.post('/generate-pdf', async (req, res) => {
 });
 
 // HTML generation endpoint (for broadcast)
-// The input HTML from buildCompleteHTML already has embedded images and inline styles
-// We just render it and return the cleaned version
 app.post('/generate-html', async (req, res) => {
   let browser = null;
   try {
@@ -90,23 +88,14 @@ app.post('/generate-html', async (req, res) => {
     await page.setViewport({ width: 1400, height: 900 });
     await page.setContent(html, { waitUntil: ['load', 'networkidle0'] });
     
-    // Get the full rendered HTML with minimal changes
     const renderedHtml = await page.evaluate(() => {
-      // Remove scripts only
       document.querySelectorAll('script').forEach(s => s.remove());
-      
-      // Remove interactive elements but preserve structure
       document.querySelectorAll('button, input[type="checkbox"]').forEach(el => el.remove());
-      
-      // Remove contenteditable and draggable attributes
       document.querySelectorAll('[contenteditable]').forEach(el => el.removeAttribute('contenteditable'));
       document.querySelectorAll('[draggable]').forEach(el => el.removeAttribute('draggable'));
-      
-      // Return the entire document HTML
       return document.documentElement.outerHTML;
     });
     
-    // Return the full document
     const fullHtml = `<!DOCTYPE html>\n${renderedHtml}`;
     
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -121,6 +110,99 @@ app.post('/generate-html', async (req, res) => {
 });
 
 // ============================================
+// HANGING CHAD DETECTION (AI-powered)
+// ============================================
+
+/**
+ * Analyze PDF page bottoms for hanging borders using Claude Vision
+ * POST /api/analyze-pdf-pages
+ * Body: { images: [{ pageNum: 1, dataUrl: "data:image/png;base64,..." }, ...] }
+ */
+app.post('/api/analyze-pdf-pages', async (req, res) => {
+  try {
+    const { images } = req.body;
+    
+    if (!images || !Array.isArray(images)) {
+      return res.status(400).json({ error: 'Missing or invalid images array' });
+    }
+    
+    const client = getAnthropicClient();
+    if (!client) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+    }
+    
+    console.log(`[PDF Analyze] Analyzing ${images.length} page bottoms...`);
+    
+    // Build image content array for Claude
+    const imageContents = images.map(img => [
+      {
+        type: 'text',
+        text: `Page ${img.pageNum} bottom:`
+      },
+      {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          // Handle both raw base64 and data URL format
+          data: img.dataUrl.includes(',') ? img.dataUrl.split(',')[1] : img.dataUrl
+        }
+      }
+    ]).flat();
+    
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `You are analyzing the bottom edges of PDF pages from a schedule/call sheet document.
+
+Look at each page bottom and determine if there is a "hanging chad" - an orphaned horizontal line/border at the very bottom of the page that appears to be the bottom border of a table row that got cut off and continues on the next page.
+
+Signs of a hanging chad:
+- A horizontal line very close to the bottom edge
+- The line appears to be a row border (often with some white space above it where content would be)
+- There may be partial text visible that's been cut off
+- The border looks incomplete or orphaned
+
+For each page, respond with ONLY a JSON array of page numbers that have hanging chads.
+Example response: [1, 3, 5]
+If no pages have issues, respond with: []
+
+Only output the JSON array, nothing else.`
+          },
+          ...imageContents
+        ]
+      }]
+    });
+    
+    const text = response.content[0]?.text || '[]';
+    
+    // Parse JSON response (handle markdown code blocks)
+    const cleanText = text.replace(/```json|```/g, '').trim();
+    const pagesWithIssues = JSON.parse(cleanText);
+    
+    console.log(`[PDF Analyze] Found issues on pages:`, pagesWithIssues);
+    
+    return res.json({
+      success: true,
+      pagesWithIssues,
+      hasIssues: pagesWithIssues.length > 0
+    });
+    
+  } catch (error) {
+    console.error('[PDF Analyze] Error:', error);
+    return res.status(500).json({ 
+      error: 'Analysis failed',
+      message: error.message 
+    });
+  }
+});
+
+// ============================================
 // STORYBOARD EXTRACTION
 // ============================================
 
@@ -131,7 +213,6 @@ async function detectRectangles(imagePath) {
   return new Promise((resolve) => {
     const script = path.join(__dirname, 'frame_detector.py');
     
-    // Try python3 first, then python
     const tryPython = (cmd) => {
       const proc = spawn(cmd, [script, imagePath, 'crop']);
       
@@ -191,7 +272,7 @@ async function pdfToImages(pdfBuffer, outputDir) {
     });
     
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(120000); // 2 minutes
+    page.setDefaultNavigationTimeout(120000);
     page.setDefaultTimeout(120000);
     await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1 });
     
@@ -231,16 +312,13 @@ async function pdfToImages(pdfBuffer, outputDir) {
       const tempPath = path.join(outputDir, `page-${i}-temp.png`);
       const imgPath = path.join(outputDir, `page-${i}.jpg`);
       
-      // Take screenshot as PNG
       await canvas.screenshot({ path: tempPath, type: 'png' });
       
-      // Aggressively compress: resize to 1200px max, JPEG quality 40
       await sharp(tempPath)
         .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
         .jpeg({ quality: 40, progressive: true })
         .toFile(imgPath);
       
-      // Delete temp PNG
       await fs.unlink(tempPath);
       
       images.push(imgPath);
@@ -356,14 +434,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
     console.log(`[Storyboard] ${pageImages.length} page(s) - starting parallel processing`);
     
-    // Process all pages in parallel
     const pageResults = await Promise.all(pageImages.map(async (imagePath, i) => {
       const pageNum = i + 1;
       console.log(`[Storyboard] Page ${pageNum}: starting...`);
       
       const imageBuffer = await fs.readFile(imagePath);
       
-      // Run OpenCV and Claude in parallel for each page
       const [detected, textData] = await Promise.all([
         detectRectangles(imagePath),
         extractText(imageBuffer)
@@ -374,7 +450,6 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       return { detected, textData, pageNum };
     }));
     
-    // Combine results in order
     const allFrames = [];
     let currentSpot = null;
     
@@ -402,7 +477,6 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images (${elapsed}s)`);
     
-    // Group by spot
     const spotGroups = {};
     for (const f of allFrames) {
       const spot = f.spotName || 'Untitled';
@@ -428,4 +502,5 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server on port ${PORT}`);
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
