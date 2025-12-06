@@ -158,32 +158,30 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
         content: [
           {
             type: 'text',
-            text: `You are looking at PDF pages of a schedule table. Check for border problems caused by page breaks.
+            text: `You are analyzing PDF pages of a schedule table. Count the DATA rows on each page.
 
-FOR EACH PAGE, examine:
+DATA ROWS are the white rows with content (times, descriptions, images). 
+DO NOT count the gray HEADER row (START-END, DUR, #, DESCRIPTION, etc).
+Row 1 = the first data row after the header.
 
-1. BOTTOM OF PAGE: Is there an empty/incomplete row at the bottom with vertical cell dividers visible but no content? This row's borders should be removed entirely.
-
-2. TOP OF PAGE (page 2 and later): Is the header row or first data row missing its TOP border line? Which row needs a top border added?
-
-Count rows starting from 1 (first data row after the gray header).
+For EACH page image, count how many data rows are visible (even partially).
 
 RESPOND WITH ONLY JSON:
 {
-  "fixes": [
-    {"page": 1, "action": "removeRow", "rowNumber": 9, "reason": "empty partial row at bottom"},
-    {"page": 2, "action": "addTopBorder", "rowNumber": 1, "reason": "first row missing top border"}
+  "pages": [
+    {"page": 1, "rowCount": 7},
+    {"page": 2, "rowCount": 4}
   ]
 }
 
-If no issues: {"fixes": []}`
+This tells me: Page 1 has rows 1-7, Page 2 has rows 8-11.`
           },
           ...imageContents
         ]
       }]
     });
     
-    const text = response.content[0]?.text || '{"fixes":[]}';
+    const text = response.content[0]?.text || '{"pages":[]}';
     
     console.log('[PDF Analyze] Raw Claude response:', text.substring(0, 500));
     
@@ -191,7 +189,7 @@ If no issues: {"fixes": []}`
     let cleanText = text.replace(/```json\s*/g, '').replace(/```\s*/g, '');
     
     // Try to find JSON object in the response
-    const jsonMatch = cleanText.match(/\{[\s\S]*"fixes"[\s\S]*\}/);
+    const jsonMatch = cleanText.match(/\{[\s\S]*"pages"[\s\S]*\}/);
     if (jsonMatch) {
       cleanText = jsonMatch[0];
     }
@@ -203,19 +201,35 @@ If no issues: {"fixes": []}`
       console.error('[PDF Analyze] JSON parse failed, raw text:', text);
       return res.json({
         success: true,
-        fixes: [],
+        pages: [],
         hasIssues: false
       });
     }
     
-    const fixes = result.fixes || [];
+    const pages = result.pages || [];
     
-    console.log(`[PDF Analyze] Found ${fixes.length} fixes needed:`, fixes);
+    // Calculate row ranges from counts
+    // e.g., [{page:1, rowCount:7}, {page:2, rowCount:4}] 
+    // becomes [{page:1, startRow:1, endRow:7}, {page:2, startRow:8, endRow:11}]
+    let currentRow = 1;
+    const pageRanges = pages.map(p => {
+      const range = {
+        page: p.page,
+        startRow: currentRow,
+        endRow: currentRow + p.rowCount - 1,
+        rowCount: p.rowCount
+      };
+      currentRow += p.rowCount;
+      return range;
+    });
+    
+    console.log(`[PDF Analyze] Page ranges:`, pageRanges);
     
     return res.json({
       success: true,
-      fixes,
-      hasIssues: fixes.length > 0
+      pages: pageRanges,
+      totalRows: currentRow - 1,
+      hasIssues: pages.length > 0
     });
     
   } catch (error) {
