@@ -1,4 +1,4 @@
-// Version 2.8.0 - Improved hanging chad detection with row counting
+// Version 3.0.0 - AI-powered border fix detection (context-aware)
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '2.8.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'hanging-chad-detection'] });
+  res.json({ status: 'ok', version: '3.0.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
 });
 
 // PDF generation endpoint
@@ -158,42 +158,40 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
         content: [
           {
             type: 'text',
-            text: `Analyze these PDF pages for page break problems in a table.
+            text: `You are looking at PDF pages of a schedule table. Check for border problems caused by page breaks.
 
-PROBLEM 1 - "Hanging chad" at BOTTOM of a page:
-- Look for VERTICAL border lines extending down into empty white space at the very bottom of the page
-- This means a table row started but was cut off before its content could render
-- The vertical cell dividers are visible but the row is empty/incomplete
+FOR EACH PAGE, examine:
 
-PROBLEM 2 - Missing top border AFTER a page break:
-- On page 2+, check if the header row at the top is missing its TOP border line
-- The header cells should have a border on all sides, including the top
+1. BOTTOM OF PAGE: Is there an empty/incomplete row at the bottom with vertical cell dividers visible but no content? This row's borders should be removed entirely.
 
-If you see EITHER problem on a page, count the DATA rows on that page (row 1 = first row after header) and report the last row number.
+2. TOP OF PAGE (page 2 and later): Is the header row or first data row missing its TOP border line? Which row needs a top border added?
+
+Count rows starting from 1 (first data row after the gray header).
 
 RESPOND WITH ONLY JSON:
-{"issues":[{"page":1,"lastRowOnPage":8}]}
+{
+  "fixes": [
+    {"page": 1, "action": "removeRow", "rowNumber": 9, "reason": "empty partial row at bottom"},
+    {"page": 2, "action": "addTopBorder", "rowNumber": 1, "reason": "first row missing top border"}
+  ]
+}
 
-If no issues found:
-{"issues":[]}`
+If no issues: {"fixes": []}`
           },
           ...imageContents
         ]
       }]
     });
     
-    const text = response.content[0]?.text || '{"issues":[]}';
+    const text = response.content[0]?.text || '{"fixes":[]}';
     
-    console.log('[PDF Analyze] Raw Claude response:', text.substring(0, 200));
+    console.log('[PDF Analyze] Raw Claude response:', text.substring(0, 500));
     
-    // Parse JSON response - handle markdown code blocks and natural language preamble
-    let cleanText = text;
-    
-    // Remove markdown code blocks
-    cleanText = cleanText.replace(/```json\s*/g, '').replace(/```\s*/g, '');
+    // Parse JSON response
+    let cleanText = text.replace(/```json\s*/g, '').replace(/```\s*/g, '');
     
     // Try to find JSON object in the response
-    const jsonMatch = cleanText.match(/\{[\s\S]*"issues"[\s\S]*\}/);
+    const jsonMatch = cleanText.match(/\{[\s\S]*"fixes"[\s\S]*\}/);
     if (jsonMatch) {
       cleanText = jsonMatch[0];
     }
@@ -203,26 +201,21 @@ If no issues found:
       result = JSON.parse(cleanText.trim());
     } catch (parseError) {
       console.error('[PDF Analyze] JSON parse failed, raw text:', text);
-      // Return empty result if we can't parse
       return res.json({
         success: true,
-        issues: [],
-        rowsToBreakBefore: [],
+        fixes: [],
         hasIssues: false
       });
     }
     
-    const issues = result.issues || [];
-    const rowsToBreakBefore = issues.map(i => i.lastRowOnPage);
+    const fixes = result.fixes || [];
     
-    console.log(`[PDF Analyze] Found ${issues.length} pages with issues:`, issues);
-    console.log(`[PDF Analyze] Rows to force page break before:`, rowsToBreakBefore);
+    console.log(`[PDF Analyze] Found ${fixes.length} fixes needed:`, fixes);
     
     return res.json({
       success: true,
-      issues,
-      rowsToBreakBefore,
-      hasIssues: issues.length > 0
+      fixes,
+      hasIssues: fixes.length > 0
     });
     
   } catch (error) {
