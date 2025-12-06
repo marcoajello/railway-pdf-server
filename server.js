@@ -158,33 +158,24 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
         content: [
           {
             type: 'text',
-            text: `You are analyzing PDF pages from a schedule/call sheet document to detect page break issues.
+            text: `Analyze these PDF pages for page break problems in a table.
 
-TASK: Look at the BOTTOM EDGE of each page image. Determine if there is a "hanging chad" - this is when a table row is SPLIT across a page break, leaving an orphaned horizontal border line at the very bottom of the page.
+PROBLEM 1 - "Hanging chad" at BOTTOM of a page:
+- Look for VERTICAL border lines extending down into empty white space at the very bottom of the page
+- This means a table row started but was cut off before its content could render
+- The vertical cell dividers are visible but the row is empty/incomplete
 
-WHAT TO LOOK FOR:
-- A thin horizontal gray line very close to the bottom edge of the page
-- This line is the BOTTOM BORDER of a table row that got cut in half
-- Above the line there may be empty white space (the row content didn't fit)
-- The line runs across most or all of the table width
+PROBLEM 2 - Missing top border AFTER a page break:
+- On page 2+, check if the header row at the top is missing its TOP border line
+- The header cells should have a border on all sides, including the top
 
-WHAT IS NOT A HANGING CHAD:
-- A complete row with content visible above its bottom border - that's fine
-- The natural end of content with space below - that's fine
+If you see EITHER problem on a page, count the DATA rows on that page (row 1 = first row after header) and report the last row number.
 
-If you find a hanging chad on a page, COUNT the rows on that page:
-- Start counting from 1 at the first DATA row (after the gray header row)
-- Count down to the last row that is VISIBLE (even partially) on that page
-- That row number is "lastRowOnPage"
+RESPOND WITH ONLY JSON:
+{"issues":[{"page":1,"lastRowOnPage":8}]}
 
-RESPOND WITH JSON ONLY:
-{
-  "issues": [
-    { "page": 1, "lastRowOnPage": 8 }
-  ]
-}
-
-If NO pages have hanging chads, respond: { "issues": [] }`
+If no issues found:
+{"issues":[]}`
           },
           ...imageContents
         ]
