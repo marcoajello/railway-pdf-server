@@ -137,7 +137,7 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
     const imageContents = images.map(img => [
       {
         type: 'text',
-        text: `Page ${img.pageNum} bottom:`
+        text: `Page ${img.pageNum}:`
       },
       {
         type: 'image',
@@ -158,39 +158,49 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
         content: [
           {
             type: 'text',
-            text: `You are analyzing the bottom edges of PDF pages from a schedule/call sheet document.
+            text: `You are analyzing PDF pages from a schedule document. Each page shows a table with numbered rows.
 
-Look at each page bottom and determine if there is a "hanging chad" - an orphaned horizontal line/border at the very bottom of the page that appears to be the bottom border of a table row that got cut off and continues on the next page.
+For each page, look at the BOTTOM of the page and determine:
+1. Is there a "hanging chad" - an orphaned border line at the very bottom suggesting a row was cut off mid-way?
+2. If yes, count which row number (starting from 1, counting from the first data row after the header) is the LAST row visible on that page.
 
-Signs of a hanging chad:
-- A horizontal line very close to the bottom edge
-- The line appears to be a row border (often with some white space above it where content would be)
-- There may be partial text visible that's been cut off
-- The border looks incomplete or orphaned
+The first data row after the header row is row 1. Count down from there.
 
-For each page, respond with ONLY a JSON array of page numbers that have hanging chads.
-Example response: [1, 3, 5]
-If no pages have issues, respond with: []
+Respond with a JSON object:
+{
+  "issues": [
+    { "page": 1, "lastRowOnPage": 8 },
+    { "page": 3, "lastRowOnPage": 15 }
+  ]
+}
 
-Only output the JSON array, nothing else.`
+If a page has no hanging chad (clean break between rows), don't include it.
+If no pages have issues, respond with: { "issues": [] }
+
+Only output the JSON object, nothing else.`
           },
           ...imageContents
         ]
       }]
     });
     
-    const text = response.content[0]?.text || '[]';
+    const text = response.content[0]?.text || '{"issues":[]}';
     
     // Parse JSON response (handle markdown code blocks)
     const cleanText = text.replace(/```json|```/g, '').trim();
-    const pagesWithIssues = JSON.parse(cleanText);
+    const result = JSON.parse(cleanText);
     
-    console.log(`[PDF Analyze] Found issues on pages:`, pagesWithIssues);
+    const issues = result.issues || [];
+    const rowsToBreakBefore = issues.map(i => i.lastRowOnPage);
+    
+    console.log(`[PDF Analyze] Found ${issues.length} pages with issues:`, issues);
+    console.log(`[PDF Analyze] Rows to force page break before:`, rowsToBreakBefore);
     
     return res.json({
       success: true,
-      pagesWithIssues,
-      hasIssues: pagesWithIssues.length > 0
+      issues,
+      rowsToBreakBefore,
+      hasIssues: issues.length > 0
     });
     
   } catch (error) {
