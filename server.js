@@ -113,14 +113,53 @@ app.post('/generate-html', async (req, res) => {
 // HANGING CHAD DETECTION (AI-powered)
 // ============================================
 
+// ============================================================
+// PDF Page Analysis Cache
+// ============================================================
+// Caches analysis results to avoid redundant API calls.
+// Key: hash of schedule content + settings
+// Value: { pages, totalRows, timestamp }
+// TTL: 24 hours (schedule changes invalidate the hash anyway)
+
+const analysisCache = new Map();
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+function cleanExpiredCache() {
+  const now = Date.now();
+  for (const [key, value] of analysisCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL_MS) {
+      analysisCache.delete(key);
+    }
+  }
+}
+
+// Clean cache every hour
+setInterval(cleanExpiredCache, 60 * 60 * 1000);
+
 /**
  * Analyze PDF page bottoms for hanging borders using Claude Vision
  * POST /api/analyze-pdf-pages
- * Body: { images: [{ pageNum: 1, dataUrl: "data:image/png;base64,..." }, ...] }
+ * Body: { images: [...], contentHash: "optional-hash-for-caching" }
  */
 app.post('/api/analyze-pdf-pages', async (req, res) => {
   try {
-    const { images } = req.body;
+    const { images, contentHash } = req.body;
+    
+    // Check cache first if contentHash provided
+    if (contentHash) {
+      const cached = analysisCache.get(contentHash);
+      if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
+        console.log(`[PDF Analyze] Cache HIT for hash: ${contentHash.substring(0, 16)}...`);
+        return res.json({
+          success: true,
+          pages: cached.pages,
+          totalRows: cached.totalRows,
+          hasIssues: cached.pages.length > 0,
+          cached: true
+        });
+      }
+      console.log(`[PDF Analyze] Cache MISS for hash: ${contentHash.substring(0, 16)}...`);
+    }
     
     if (!images || !Array.isArray(images)) {
       return res.status(400).json({ error: 'Missing or invalid images array' });
@@ -224,6 +263,16 @@ This tells me: Page 1 has rows 1-7, Page 2 has rows 8-11.`
     });
     
     console.log(`[PDF Analyze] Page ranges:`, pageRanges);
+    
+    // Cache the result if contentHash was provided
+    if (contentHash) {
+      analysisCache.set(contentHash, {
+        pages: pageRanges,
+        totalRows: currentRow - 1,
+        timestamp: Date.now()
+      });
+      console.log(`[PDF Analyze] Cached result for hash: ${contentHash.substring(0, 16)}... (cache size: ${analysisCache.size})`);
+    }
     
     return res.json({
       success: true,
