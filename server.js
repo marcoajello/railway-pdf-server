@@ -1,4 +1,4 @@
-// Version 2.7.0 - Added hanging chad detection endpoint
+// Version 2.8.0 - Improved hanging chad detection with row counting
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -35,7 +35,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '2.7.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'hanging-chad-detection'] });
+  res.json({ status: 'ok', version: '2.8.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'hanging-chad-detection'] });
 });
 
 // PDF generation endpoint
@@ -158,26 +158,33 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
         content: [
           {
             type: 'text',
-            text: `You are analyzing PDF pages from a schedule document. Each page shows a table with numbered rows.
+            text: `You are analyzing PDF pages from a schedule/call sheet document to detect page break issues.
 
-For each page, look at the BOTTOM of the page and determine:
-1. Is there a "hanging chad" - an orphaned border line at the very bottom suggesting a row was cut off mid-way?
-2. If yes, count which row number (starting from 1, counting from the first data row after the header) is the LAST row visible on that page.
+TASK: Look at the BOTTOM EDGE of each page image. Determine if there is a "hanging chad" - this is when a table row is SPLIT across a page break, leaving an orphaned horizontal border line at the very bottom of the page.
 
-The first data row after the header row is row 1. Count down from there.
+WHAT TO LOOK FOR:
+- A thin horizontal gray line very close to the bottom edge of the page
+- This line is the BOTTOM BORDER of a table row that got cut in half
+- Above the line there may be empty white space (the row content didn't fit)
+- The line runs across most or all of the table width
 
-Respond with a JSON object:
+WHAT IS NOT A HANGING CHAD:
+- A complete row with content visible above its bottom border - that's fine
+- The natural end of content with space below - that's fine
+
+If you find a hanging chad on a page, COUNT the rows on that page:
+- Start counting from 1 at the first DATA row (after the gray header row)
+- Count down to the last row that is VISIBLE (even partially) on that page
+- That row number is "lastRowOnPage"
+
+RESPOND WITH JSON ONLY:
 {
   "issues": [
-    { "page": 1, "lastRowOnPage": 8 },
-    { "page": 3, "lastRowOnPage": 15 }
+    { "page": 1, "lastRowOnPage": 8 }
   ]
 }
 
-If a page has no hanging chad (clean break between rows), don't include it.
-If no pages have issues, respond with: { "issues": [] }
-
-Only output the JSON object, nothing else.`
+If NO pages have hanging chads, respond: { "issues": [] }`
           },
           ...imageContents
         ]
