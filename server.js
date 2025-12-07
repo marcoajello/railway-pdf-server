@@ -236,105 +236,132 @@ This tells me: Page 1 has rows 1-7, Page 2 has rows 8-11.`
     let result;
     try {
       result = JSON.parse(cleanText.trim());
-    } catch (e) {
-      console.error('[PDF Analyze] JSON parse error:', e.message);
-      return res.status(400).json({ error: 'Failed to parse Claude response', raw: text.substring(0, 200) });
-    }
-    
-    if (!result.pages || !Array.isArray(result.pages)) {
-      return res.status(400).json({ error: 'Invalid response format' });
-    }
-    
-    // Cache the result
-    if (contentHash) {
-      analysisCache.set(contentHash, {
-        pages: result.pages,
-        totalRows: result.pages.reduce((sum, p) => sum + p.rowCount, 0),
-        timestamp: Date.now()
+    } catch (parseError) {
+      console.error('[PDF Analyze] JSON parse failed, raw text:', text);
+      return res.json({
+        success: true,
+        pages: [],
+        hasIssues: false
       });
     }
     
-    res.json({
+    const pages = result.pages || [];
+    
+    // Calculate row ranges from counts
+    // e.g., [{page:1, rowCount:7}, {page:2, rowCount:4}] 
+    // becomes [{page:1, startRow:1, endRow:7}, {page:2, startRow:8, endRow:11}]
+    let currentRow = 1;
+    const pageRanges = pages.map(p => {
+      const range = {
+        page: p.page,
+        startRow: currentRow,
+        endRow: currentRow + p.rowCount - 1,
+        rowCount: p.rowCount
+      };
+      currentRow += p.rowCount;
+      return range;
+    });
+    
+    console.log(`[PDF Analyze] Page ranges:`, pageRanges);
+    
+    // Cache the result if contentHash was provided
+    if (contentHash) {
+      analysisCache.set(contentHash, {
+        pages: pageRanges,
+        totalRows: currentRow - 1,
+        timestamp: Date.now()
+      });
+      console.log(`[PDF Analyze] Cached result for hash: ${contentHash.substring(0, 16)}... (cache size: ${analysisCache.size})`);
+    }
+    
+    return res.json({
       success: true,
-      pages: result.pages,
-      totalRows: result.pages.reduce((sum, p) => sum + p.rowCount, 0),
-      hasIssues: false
+      pages: pageRanges,
+      totalRows: currentRow - 1,
+      hasIssues: pages.length > 0
     });
     
   } catch (error) {
     console.error('[PDF Analyze] Error:', error);
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ 
+      error: 'Analysis failed',
+      message: error.message 
+    });
   }
 });
 
-// ============================================================
+// ============================================
 // STORYBOARD EXTRACTION
-// ============================================================
+// ============================================
 
 /**
- * Detect rectangles in image using Claude Vision
+ * Detect rectangles using Python/OpenCV
  */
 async function detectRectangles(imagePath) {
-  const client = getAnthropicClient();
-  if (!client) throw new Error('ANTHROPIC_API_KEY not set');
-  
-  const imageBuffer = await fs.readFile(imagePath);
-  const resized = await sharp(imageBuffer)
-    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 85 })
-    .toBuffer();
-  
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
-        { type: 'text', text: `Find all storyboard frame rectangles in this image.
-        
-Return JSON with image crops for each rectangle found (top-left to bottom-right):
-{
-  "count": 6,
-  "images": ["base64-crop-1", "base64-crop-2", ...]
-}
-
-Extract each rectangle as a JPEG base64 string.` }
-      ]
-    }]
-  });
-  
-  const text = response.content[0].text;
-  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  try {
-    const data = JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
-    return {
-      count: data.count || 0,
-      images: data.images || []
+  return new Promise((resolve) => {
+    const script = path.join(__dirname, 'frame_detector.py');
+    
+    const tryPython = (cmd) => {
+      const proc = spawn(cmd, [script, imagePath, 'crop']);
+      
+      let stdout = '';
+      let stderr = '';
+      
+      proc.stdout.on('data', d => stdout += d);
+      proc.stderr.on('data', d => stderr += d);
+      
+      proc.on('close', code => {
+        if (code !== 0) {
+          console.error(`[Storyboard] ${cmd} error (code ${code}):`, stderr);
+          if (cmd === 'python3') {
+            console.log('[Storyboard] Trying python instead...');
+            tryPython('python');
+            return;
+          }
+          resolve({ count: 0, rectangles: [], images: [] });
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          console.log(`[Storyboard] Found ${result.count} rectangles`);
+          resolve(result);
+        } catch (e) {
+          console.error('[Storyboard] JSON parse error');
+          resolve({ count: 0, rectangles: [], images: [] });
+        }
+      });
+      
+      proc.on('error', err => {
+        console.error(`[Storyboard] ${cmd} spawn error:`, err.message);
+        if (cmd === 'python3') {
+          console.log('[Storyboard] Trying python instead...');
+          tryPython('python');
+          return;
+        }
+        resolve({ count: 0, rectangles: [], images: [] });
+      });
     };
-  } catch (e) {
-    console.error('[Storyboard] Rectangle detection parse error');
-    return { count: 0, images: [] };
-  }
+    
+    tryPython('python3');
+  });
 }
 
 /**
- * Convert PDF to images for storyboard extraction
- * Fixed: Removed networkidle0, reduced page wait times for faster processing
+ * Convert PDF to page images
  */
 async function pdfToImages(pdfBuffer, outputDir) {
   let browser = null;
+  const images = [];
+  
   try {
-    const images = [];
-    
     browser = await puppeteer.launch({
       headless: 'new',
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
     
     const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(60000);
-    page.setDefaultTimeout(60000);
+    page.setDefaultNavigationTimeout(120000);
+    page.setDefaultTimeout(120000);
     await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1 });
     
     const base64Pdf = pdfBuffer.toString('base64');
@@ -360,15 +387,15 @@ async function pdfToImages(pdfBuffer, outputDir) {
       };
     </script></body></html>`;
     
-    await page.setContent(html, { waitUntil: 'load', timeout: 60000 });
-    await page.waitForFunction('typeof pdfjsLib!=="undefined"', { timeout: 30000 });
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 120000 });
+    await page.waitForFunction('typeof pdfjsLib!=="undefined"', { timeout: 60000 });
     
     const pageCount = await page.evaluate('getPageCount()');
     console.log(`[Storyboard] PDF: ${pageCount} pages`);
     
     for (let i = 1; i <= pageCount; i++) {
       await page.evaluate(`renderPage(${i})`);
-      await new Promise(r => setTimeout(r, 120));
+      await new Promise(r => setTimeout(r, 400));
       const canvas = await page.$('#canvas');
       const tempPath = path.join(outputDir, `page-${i}-temp.png`);
       const imgPath = path.join(outputDir, `page-${i}.jpg`);
@@ -377,7 +404,7 @@ async function pdfToImages(pdfBuffer, outputDir) {
       
       await sharp(tempPath)
         .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
-        .jpeg({ quality: 60, progressive: true })
+        .jpeg({ quality: 40, progressive: true })
         .toFile(imgPath);
       
       await fs.unlink(tempPath);
