@@ -593,8 +593,12 @@ function groupIntoShots(frames) {
       const currNum = (f.frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
       startNewShot = prevNum !== currNum;
     } else {
-      // No visible numbers - use AI's continuity detection
-      startNewShot = !f.continuesPrevious;
+      // No visible numbers - use AI's grouping (shotGroup field) or continuity detection
+      if (f.shotGroup !== undefined && frames[i-1].shotGroup !== undefined) {
+        startNewShot = f.shotGroup !== frames[i-1].shotGroup;
+      } else {
+        startNewShot = !f.continuesPrevious;
+      }
     }
     
     if (startNewShot) {
@@ -625,6 +629,97 @@ function groupIntoShots(frames) {
     dialog: g.dialogs.join('\n'),
     combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n')
   }));
+}
+
+// Pass 2: AI-powered shot grouping analysis
+async function analyzeGroupings(frames) {
+  const client = getAnthropicClient();
+  if (!client) return frames; // Fallback to pass 1 results
+  
+  // Only analyze if we have images and no visible numbers
+  const framesWithImages = frames.filter(f => f.image);
+  if (framesWithImages.length < 2) return frames;
+  if (frames.every(f => f.hasVisibleNumber)) return frames; // Trust visible numbers
+  
+  try {
+    // Build a grid of thumbnails for the AI to analyze
+    const imageContents = [];
+    
+    // Create smaller thumbnails for pass 2
+    for (let i = 0; i < Math.min(framesWithImages.length, 24); i++) {
+      const f = framesWithImages[i];
+      if (f.image) {
+        const thumb = await sharp(Buffer.from(f.image, 'base64'))
+          .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 70 })
+          .toBuffer();
+        
+        imageContents.push({
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') }
+        });
+      }
+    }
+    
+    if (imageContents.length < 2) return frames;
+    
+    console.log(`[Storyboard] Pass 2: Analyzing ${imageContents.length} frames for shot grouping`);
+    
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      messages: [{
+        role: 'user',
+        content: [
+          ...imageContents,
+          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
+
+Group them into SHOTS. A shot is one continuous camera setup - frames belong to the SAME shot if:
+- Same camera angle/position (even if action changes)
+- Same POV (e.g., all "from inside fridge looking out")
+- Camera move within one take (push, pan, dolly)
+
+Frames are DIFFERENT shots if:
+- Camera angle changes (wide to closeup, front to side)
+- Cut to different character or location
+- Insert/cutaway shot
+
+Return ONLY a JSON array of shot groups. Each group lists which frame numbers belong together:
+[
+  [1, 2],
+  [3],
+  [4, 5, 6],
+  [7, 8]
+]
+
+This example means: frames 1-2 are shot 1, frame 3 alone is shot 2, frames 4-6 are shot 3, frames 7-8 are shot 4.` }
+        ]
+      }]
+    });
+    
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    
+    if (jsonMatch) {
+      const groups = JSON.parse(jsonMatch[0]);
+      console.log(`[Storyboard] Pass 2: AI grouped into ${groups.length} shots`);
+      
+      // Apply groupings to frames
+      groups.forEach((group, shotIdx) => {
+        group.forEach(frameNum => {
+          const idx = frameNum - 1; // Convert to 0-indexed
+          if (frames[idx]) {
+            frames[idx].shotGroup = shotIdx;
+          }
+        });
+      });
+    }
+  } catch (e) {
+    console.error('[Storyboard] Pass 2 error:', e.message);
+    // Fallback to pass 1 results
+  }
+  
+  return frames;
 }
 
 app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
@@ -706,9 +801,9 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       spotGroups[spot].push(f);
     }
     
-    // For each spot, check if we need to renumber
-    // If frames don't have visible numbers OR numbers repeat across pages, renumber sequentially
-    const spots = Object.entries(spotGroups).map(([name, frames]) => {
+    // For each spot, check if we need to renumber, then run pass 2 analysis
+    const spots = [];
+    for (const [name, frames] of Object.entries(spotGroups)) {
       // Check if any frame lacks visible numbers
       const anyWithoutNumbers = frames.some(f => !f.hasVisibleNumber);
       
@@ -730,13 +825,16 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         frames.forEach((f, idx) => {
           f.frameNumber = String(idx + 1);
         });
+        
+        // Pass 2: AI grouping analysis (only for unnumbered storyboards)
+        await analyzeGroupings(frames);
       }
       
-      return {
+      spots.push({
         name,
         shots: groupIntoShots(frames)
-      };
-    });
+      });
+    }
     
     res.json({ spots });
     
