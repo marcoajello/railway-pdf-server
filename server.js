@@ -835,8 +835,137 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   }
 });
 
+// CAST EXTRACTION
+app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cast-'));
+  
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+    
+    console.log('[Cast] Processing:', req.file.originalname);
+    const startTime = Date.now();
+    
+    const imageDir = path.join(tempDir, 'images');
+    await fs.mkdir(imageDir, { recursive: true });
+    
+    let pageImages = [];
+    if (req.file.mimetype === 'application/pdf') {
+      pageImages = await pdfToImages(req.file.buffer, imageDir);
+    } else {
+      const imgPath = path.join(imageDir, 'page-1.png');
+      await sharp(req.file.buffer).png().toFile(imgPath);
+      pageImages = [imgPath];
+    }
+    
+    console.log(`[Cast] ${pageImages.length} page(s) - processing`);
+    
+    const allCast = [];
+    
+    for (let i = 0; i < pageImages.length; i++) {
+      const imagePath = pageImages[i];
+      const pageNum = i + 1;
+      
+      console.log(`[Cast] Page ${pageNum}: analyzing...`);
+      
+      const imageBuffer = await fs.readFile(imagePath);
+      
+      // Detect rectangles (headshots)
+      const detected = await detectRectangles(imagePath);
+      
+      // Use AI to extract actor/character names
+      const castData = await extractCastText(imageBuffer);
+      
+      console.log(`[Cast] Page ${pageNum}: ${detected.count} images, ${castData.members?.length || 0} members`);
+      
+      // Match images to cast members
+      const members = castData.members || [];
+      const images = detected.images || [];
+      
+      for (let j = 0; j < members.length; j++) {
+        const member = members[j];
+        const img = images[j] || null;
+        
+        allCast.push({
+          actorName: member.actorName || '',
+          characterName: member.characterName || '',
+          role: member.role || '',
+          image: img
+        });
+      }
+    }
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Cast] Total: ${allCast.length} cast members (${elapsed}s)`);
+    
+    res.json({ cast: allCast });
+    
+  } catch (error) {
+    console.error('[Cast] Error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    try { await fs.rm(tempDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// AI function to extract cast info from page
+async function extractCastText(imageBuffer) {
+  const client = getAnthropicClient();
+  if (!client) throw new Error('ANTHROPIC_API_KEY not set');
+  
+  const resized = await sharp(imageBuffer)
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 85 })
+    .toBuffer();
+  
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4096,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
+        { type: 'text', text: `Extract cast/talent information from this page.
+
+For each headshot/photo, identify:
+1. ACTOR NAME - The real person's name
+2. CHARACTER NAME - The role they play (if shown)
+3. ROLE - Any role description (e.g., "BARTENDER", "GUY AT BAR")
+
+Return JSON:
+{
+  "members": [
+    {
+      "actorName": "John Smith",
+      "characterName": "Detective Jones",
+      "role": "Lead"
+    }
+  ]
+}
+
+RULES:
+- List members in reading order (left-to-right, top-to-bottom)
+- actorName: The talent/actor's real name
+- characterName: The character they play (may be same as role, or empty)
+- role: Description like "BARTENDER", "MOM", etc.
+- Skip any photos without names` }
+      ]
+    }]
+  });
+  
+  const text = response.content[0].text;
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  try {
+    return JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
+  } catch (e) {
+    console.error('[Cast] Text parse error');
+    return { members: [] };
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`Server on port ${PORT}`);
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
