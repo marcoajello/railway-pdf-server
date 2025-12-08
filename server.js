@@ -653,11 +653,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const allFrames = [];
     let currentSpot = null;
     
-    for (const { detected, textData } of pageResults) {
+    for (const { detected, textData, pageNum } of pageResults) {
       if (textData.spotName) currentSpot = textData.spotName;
       
       const textFrames = textData.frames || [];
       const images = detected.images || [];
+      const hasVisibleNumbers = textData.hasVisibleNumbers === true;
       
       const maxLen = Math.max(textFrames.length, images.length);
       for (let j = 0; j < maxLen; j++) {
@@ -666,10 +667,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         
         allFrames.push({
           frameNumber: tf.frameNumber || `${j + 1}`,
+          hasVisibleNumber: hasVisibleNumbers,
           description: tf.description || '',
           dialog: tf.dialog || '',
           image: img,
-          spotName: currentSpot
+          spotName: currentSpot,
+          pageNum: pageNum
         });
       }
     }
@@ -677,6 +680,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images (${elapsed}s)`);
     
+    // Group frames by spot
     const spotGroups = {};
     for (const f of allFrames) {
       const spot = f.spotName || 'Untitled';
@@ -684,10 +688,37 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       spotGroups[spot].push(f);
     }
     
-    const spots = Object.entries(spotGroups).map(([name, frames]) => ({
-      name,
-      shots: groupIntoShots(frames)
-    }));
+    // For each spot, check if we need to renumber
+    // If frames don't have visible numbers OR numbers repeat across pages, renumber sequentially
+    const spots = Object.entries(spotGroups).map(([name, frames]) => {
+      // Check if any frame lacks visible numbers
+      const anyWithoutNumbers = frames.some(f => !f.hasVisibleNumber);
+      
+      // Check for duplicate frame numbers (same number on different pages = needs renumbering)
+      const numberPageMap = {};
+      let hasDuplicates = false;
+      for (const f of frames) {
+        const key = f.frameNumber;
+        if (numberPageMap[key] && numberPageMap[key] !== f.pageNum) {
+          hasDuplicates = true;
+          break;
+        }
+        numberPageMap[key] = f.pageNum;
+      }
+      
+      // Renumber if needed
+      if (anyWithoutNumbers || hasDuplicates) {
+        console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames (duplicates: ${hasDuplicates}, missing numbers: ${anyWithoutNumbers})`);
+        frames.forEach((f, idx) => {
+          f.frameNumber = String(idx + 1);
+        });
+      }
+      
+      return {
+        name,
+        shots: groupIntoShots(frames)
+      };
+    });
     
     res.json({ spots });
     
