@@ -1056,7 +1056,6 @@ app.post('/api/auto-tag-batch', async (req, res) => {
   
   console.log('[AutoTagBatch] Processing', frames.length, 'rows for characters:', characters);
   console.log('[AutoTagBatch] Headshots available:', headshotsAvailable);
-  console.log('[AutoTagBatch] Using model: claude-haiku-4-5-20251001');
   
   try {
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -1123,27 +1122,50 @@ app.post('/api/auto-tag-batch', async (req, res) => {
       }
     }
     
-    // Add the analysis prompt - simplified for Haiku
+    // Add the analysis prompt
     content.push({
       type: 'text',
-      text: `Count the people in each storyboard frame and identify them.
+      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify characters VISUALLY PRESENT in each frame.
 
-CHARACTERS: ${characters.join(', ')}
-${headshotsAvailable > 0 ? 'Reference photos of each character are shown above.' : ''}
+CHARACTERS TO IDENTIFY: ${characters.join(', ')}
+${headshotsAvailable > 0 ? '\nYou have reference photos of each character above. Match the storyboard drawings to these real faces - pay attention to gender, hair, and build.' : ''}
 
-RULES:
-1. Count how many people are DRAWN in each image
-2. Identify each person using the reference photos
-3. Number of names MUST equal number of people drawn
+=== CRITICAL RULE ===
 
-DO NOT use the description text to decide who is in frame - ONLY look at the drawings.
+COUNT BODIES FIRST. The number of characters you tag MUST EQUAL the number of human figures drawn.
 
-JSON response format:
-{"assignments": [{"rowNum": "1", "bodyCount": 1, "characters": ["RICK"]}, {"rowNum": "2", "bodyCount": 2, "characters": ["RICK", "TANYA"]}, ...]}`
+If you see 1 person → tag exactly 1 character
+If you see 2 people → tag exactly 2 characters  
+If you see 3 people → tag exactly 3 characters
+
+NEVER tag more characters than bodies visible. This is the most important rule.
+
+=== ANALYSIS STEPS ===
+
+For each row:
+1. Count human figures DRAWN in the image(s) - write this number down
+2. Identify each figure by matching to reference photos
+3. Verify: does your character count match your body count? If not, fix it.
+
+STRICT RULES:
+- Only tag characters you can SEE drawn
+- Descriptions often mention characters NOT in frame - ignore the text, trust your eyes
+- ${headshotsAvailable > 0 ? 'Use reference photos to distinguish similar characters' : 'Build profiles from establishing shots'}
+
+Respond with JSON:
+{
+  "assignments": [
+    {"rowNum": "1", "bodyCount": 1, "characters": ["RICK"], "reasoning": "1 male figure in doorway"},
+    {"rowNum": "2", "bodyCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "2 figures - male + female entering"},
+    ...
+  ]
+}
+
+VALIDATION: For each row, characters.length MUST equal bodyCount. Double-check before responding.`
     });
     
     const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: 'claude-sonnet-4-20250514',
       max_tokens: 8000,
       messages: [{
         role: 'user',
@@ -1204,5 +1226,5 @@ app.listen(PORT, () => {
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Auto-tag batch (Haiku): ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Auto-tag batch: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
