@@ -1081,60 +1081,56 @@ app.post('/api/auto-tag-batch', async (req, res) => {
     // Add the analysis prompt - two-phase approach
     content.push({
       type: 'text',
-      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify ALL characters visible in each frame.
+      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify characters VISUALLY PRESENT in each frame.
 
 CHARACTERS TO IDENTIFY: ${characters.join(', ')}
 
 === PHASE 1: BUILD CHARACTER PROFILES ===
 
-First, find ESTABLISHING SHOTS - frames where a character is:
-- Clearly the only person in frame AND named in the description
-- In a close-up or medium shot where their face/features are clear
-- Explicitly labeled in the image itself
+First, find ESTABLISHING SHOTS - frames where:
+- Only ONE person is clearly visible in the image
+- That person is named in the description
+- Their features are clearly drawable
 
-For each character, study their visual appearance in these establishing shots:
-- Hair: style, length, color (dark/light in grayscale)
-- Face shape and features
-- Body type and build
+Study and memorize each character's visual appearance:
+- Hair: style, length, shade (dark/light)
 - Gender presentation
-- Clothing/costume they wear throughout
-- Any distinguishing features
+- Body type and build
+- Clothing they wear
 
-Example: If frame 5 description says "HENRY reaches into cabinet" and shows one person reaching, that person IS Henry - memorize their appearance.
+Example: If frame shows ONE person reaching into cabinet and description says "HENRY reaches...", that person IS Henry - memorize their look.
 
-=== PHASE 2: APPLY PROFILES TO ALL FRAMES ===
+=== PHASE 2: COUNT AND IDENTIFY ===
 
-Now scan EVERY frame and identify ALL characters visible by matching to the profiles you built:
-
-- Look for EVERY human figure in each frame (foreground, background, partial)
-- Match each figure to the character profiles you established
-- Characters maintain consistent appearance throughout (same hair, same build, same clothes)
-- If you see 3 people at a table, identify all 3
-- Hands, backs, silhouettes count - identify based on context and adjacent frames
-- If description mentions interaction between characters, BOTH should be tagged
+For EACH frame:
+1. FIRST: Count how many human figures are VISIBLE in the image (not mentioned in text - actually VISIBLE)
+2. THEN: Identify each visible figure by matching to character profiles
 
 CRITICAL RULES:
-- A character mentioned in the description is DEFINITELY in the frame - find them
-- If description says "X walks over to Y" - BOTH X and Y are in frame
-- If description uses pronouns like "him/her" referring to earlier character - that character is in frame
-- Adjacent frames showing same location likely have same characters
-- ERR ON THE SIDE OF INCLUSION
+- COUNT PEOPLE IN THE IMAGE FIRST - if you see 1 person, tag 1 character. If you see 3, tag 3.
+- DO NOT tag characters just because they're mentioned in the description - they must be VISIBLE
+- Descriptions often mention characters from OTHER frames - ignore text, LOOK at the image
+- Partial figures count (hands, backs) - but only if actually drawn in the frame
+- The same character looks the same across all frames
+
+WRONG: Description says "RICK tells TANYA about HENRY" → tagging all 3
+RIGHT: Image shows 2 people talking → tag only those 2 visible people
 
 Respond with JSON:
 {
   "characterProfiles": {
-    "HENRY": "Established in frame X - adult male, short dark hair, wearing apron...",
-    "TANYA": "Established in frame Y - adult female, long hair...",
+    "HENRY": "adult male, short dark hair, apron",
+    "TANYA": "adult female, long hair, casual clothes",
     ...
   },
   "assignments": [
-    {"rowNum": "1", "characters": ["RICK"], "reasoning": "Single figure matching RICK profile from establishing shot"},
-    {"rowNum": "2", "characters": ["RICK", "TANYA"], "reasoning": "Two figures - RICK at door, TANYA entering"},
+    {"rowNum": "1", "visibleCount": 1, "characters": ["RICK"], "reasoning": "Single male figure in doorway"},
+    {"rowNum": "2", "visibleCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "Two figures - male at door, female entering"},
     ...
   ]
 }
 
-Include ALL frames. Only use character names from the provided list.`
+Include ALL frames. Report visibleCount accurately - this is how many people you SEE in the image.`
     });
     
     const response = await anthropic.messages.create({
