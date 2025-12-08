@@ -672,32 +672,28 @@ async function analyzeGroupings(frames) {
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
+          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence.
 
-Group them into SHOTS based on CAMERA SETUP. Frames belong to the SAME SHOT if:
+Group consecutive frames into SHOTS. 
 
-1. SAME BACKGROUND ARCHITECTURE - Look for fixed elements: range hoods, cabinets, windows, doorframes, ceiling lines, shelving. If the same distinctive architectural element appears from the same angle, it's the same shot.
+DEFAULT ASSUMPTION: Consecutive frames are the SAME SHOT unless there's clear evidence of a CUT.
 
-2. SAME CHARACTER POSITIONS - Characters maintain same left/right arrangement relative to each other.
+SAME SHOT (group together):
+- Same characters visible, even if framing changes
+- Same location/environment  
+- Camera tilts, pans, pushes, or pulls (still one shot)
+- Action continues from previous frame
 
-3. CAMERA MOVES ARE ONE SHOT - A tilt (up/down) or pan (left/right) is still ONE continuous shot. If background elements shift position but remain visible from the same angle, the camera is moving within a single take.
+DIFFERENT SHOT (split only if):
+- Camera jumps to OPPOSITE side of characters (crosses the line)
+- Completely different location or scene
+- Different characters entirely
+- Clear cutaway (product insert, reaction shot from new angle)
 
-4. SAME ENVIRONMENT PERSPECTIVE - Shot from same direction (front, side, POV), even if framing is tighter or looser.
+Storyboard artists are inconsistent - ignore scale differences. If same people are in same place doing continuous action, it's ONE SHOT.
 
-CRITICAL: Storyboard artists are inconsistent with scale and detail. Focus on:
-- Distinctive background shapes (a trapezoidal hood, an arched window)
-- Character left/right arrangement
-- Environmental continuity
-
-Frames are DIFFERENT SHOTS only if:
-- Camera clearly moves to opposite side of characters
-- Completely different location/background
-- Cut to different subject entirely (insert, reaction, new scene)
-
-BIAS TOWARD GROUPING: When uncertain, frames showing the same characters in the same environment are likely ONE SHOT with camera movement.
-
-Return ONLY a JSON array:
-[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` }
+Return ONLY a JSON array of frame groups:
+[[1, 2, 3, 4], [5, 6], [7], [8, 9, 10]]` }
         ]
       }]
     });
