@@ -517,17 +517,15 @@ async function extractText(imageBuffer) {
         { type: 'text', text: `Extract storyboard data from this page.
 
 STEP 1 - SPOT NAME:
-Look for the COMMERCIAL/PROJECT TITLE at the top of the page (e.g., "ACME CORP - PRODUCT :30", "BRAND NAME 'CAMPAIGN' :15 TVC").
-This is NOT scene descriptions like "INT. KITCHEN" or "EXT. HOUSE" - those are just scene headers within the commercial.
-spotName should be the overall project/commercial title, or null if not visible.
+Look for the COMMERCIAL/PROJECT TITLE at the top of the page (e.g., "BRAND - PRODUCT :30").
+This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within the commercial.
 
 STEP 2 - GRID LAYOUT:
-Identify the grid structure (e.g., 2x3 = 2 columns, 3 rows).
-Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
+Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
 STEP 3 - FRAME NUMBERS:
-- If frames have visible numbers (1, 2, 1A, 1B, FR3, etc.), use those exactly
-- If NO visible numbers, number sequentially: 1, 2, 3, 4, 5, 6...
+- If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
+- If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 4 - EXTRACT:
 Return JSON:
@@ -545,11 +543,10 @@ Return JSON:
 }
 
 RULES:
-- spotName: The commercial/project title only, NOT scene headers like "INT. KITCHEN"
-- description: action/camera direction text near the frame
-- dialog: spoken lines with character name prefix
-- Skip completely empty frames
-- Preserve reading order strictly` }
+- spotName: Commercial title only, NOT scene headers
+- description: action/camera direction text
+- dialog: spoken lines with character prefix
+- Skip empty frames` }
       ]
     }]
   });
@@ -586,11 +583,12 @@ function groupIntoShots(frames) {
       const currNum = (f.frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
       startNewShot = prevNum !== currNum;
     } else {
-      // No visible numbers - use AI's grouping (shotGroup field) or continuity detection
+      // No visible numbers - use AI's grouping (shotGroup field from Pass 2)
       if (f.shotGroup !== undefined && frames[i-1].shotGroup !== undefined) {
         startNewShot = f.shotGroup !== frames[i-1].shotGroup;
       } else {
-        startNewShot = !f.continuesPrevious;
+        // Fallback: each frame is its own shot
+        startNewShot = true;
       }
     }
     
@@ -665,27 +663,29 @@ async function analyzeGroupings(frames) {
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence.
+          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
 
-Group consecutive frames into SHOTS.
+Group them into SHOTS based on CAMERA SETUP, not scene. Frames belong to the SAME SHOT if:
 
-SAME SHOT (group together):
-- Same camera position/angle viewing same subjects
-- Camera tilts, pans, or pushes (still one continuous shot)
-- Same characters in same location, action continues
+1. SAME CHARACTER POSITIONS - Characters maintain same left/right positions relative to each other
+2. SAME COMPOSITIONAL TYPE - All two-shots, or all close-ups, or all wide shots
+3. SAME CAMERA ANGLE - Shooting from same direction (front, side, POV)
+4. SAME BACKGROUND - Same environment visible from same angle
+5. CONTINUOUS ACTION - Action flows naturally (even across multiple frames)
 
-DIFFERENT SHOTS (must split):
-- SHOT/REVERSE-SHOT: Camera flips to opposite side (e.g., looking AT someone vs FROM their POV)
-- POV REVERSAL: Looking INTO something vs looking OUT FROM inside it
-- Different location or completely different framing
-- Cutaway to different subject (product insert, reaction from new angle)
+IMPORTANT: Storyboard artists draw at varying scales. Ignore minor size differences - focus on CHARACTER ARRANGEMENT and CAMERA ANGLE.
 
-EXAMPLE: Person opens fridge (shot 1) → Cut to view FROM INSIDE fridge looking out (shot 2). These are DIFFERENT shots even though action continues.
+Frames are DIFFERENT SHOTS if:
+- Characters swap positions (person on left moves to right)
+- Camera angle clearly changes (front view to side view)
+- Different location or background
+- Cut to completely different subject (insert shot, reaction shot)
+- Different shot type (wide shot cuts to extreme close-up of hands)
 
-BIAS: When uncertain about same-angle continuous action, GROUP them. When POV clearly reverses, SPLIT them.
+BIAS TOWARD GROUPING: When uncertain, group frames together. Consecutive frames showing the same characters from roughly the same angle are likely ONE SHOT.
 
 Return ONLY a JSON array:
-[[1], [2, 3, 4], [5, 6, 7, 8], [9], [10]]` }
+[[1, 2, 3], [4], [5, 6], [7, 8, 9]]` }
         ]
       }]
     });
@@ -773,7 +773,6 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         allFrames.push({
           frameNumber: tf.frameNumber || `${j + 1}`,
           hasVisibleNumber: hasVisibleNumbers,
-          continuesPrevious: tf.continuesPrevious === true,
           description: tf.description || '',
           dialog: tf.dialog || '',
           image: img,
