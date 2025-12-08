@@ -517,18 +517,19 @@ async function extractText(imageBuffer) {
         { type: 'text', text: `Extract storyboard data from this page.
 
 STEP 1 - GRID LAYOUT:
-First, identify the grid structure (e.g., 2x3 = 2 columns, 3 rows).
+Identify the grid structure (e.g., 2x3 = 2 columns, 3 rows).
 Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
 STEP 2 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, FR3, etc.), use those exactly
-- If NO numbers are visible, AUTO-NUMBER based on visual continuity:
-  - Same shot continuing (camera move, same action evolving): 1A, 1B, 1C
-  - New shot (cut to different angle/scene/character): increment to 2, 3, 4
-  - Look for: same background, continuing motion, connected poses = SAME SHOT (A/B/C)
-  - Look for: different location, new character, scene change = NEW SHOT (next number)
+- If NO visible numbers, number sequentially: 1, 2, 3, 4, 5, 6...
 
-STEP 3 - EXTRACT:
+STEP 3 - CONTINUITY:
+For each frame, determine if it CONTINUES the previous frame (same shot) or is a CUT (new shot).
+- CONTINUES: same background, camera move, evolving action, same characters in motion
+- CUT: different location, new scene, different characters, clear scene break
+
+STEP 4 - EXTRACT:
 Return JSON:
 {
   "spotName": "Scene/spot title from header or null",
@@ -536,19 +537,26 @@ Return JSON:
   "hasVisibleNumbers": true/false,
   "frames": [
     {
-      "frameNumber": "1A",
+      "frameNumber": "1",
+      "continuesPrevious": false,
       "description": "Action/direction text",
       "dialog": "CHARACTER: Spoken lines..."
+    },
+    {
+      "frameNumber": "2",
+      "continuesPrevious": true,
+      "description": "Camera pushes in as he turns",
+      "dialog": ""
     }
   ]
 }
 
 RULES:
-- frameNumber: visible label OR auto-generated (1A, 1B, 2, 3A, 3B, etc.)
+- continuesPrevious: true if this frame is part of the same uninterrupted shot as previous
+- First frame on page is always continuesPrevious: false
 - description: action/camera direction text near the frame
 - dialog: spoken lines with character name prefix
-- Skip completely empty frames
-- Preserve reading order strictly` }
+- Skip completely empty frames` }
       ]
     }]
   });
@@ -564,43 +572,52 @@ RULES:
 }
 
 function groupIntoShots(frames) {
-  const groups = {};
+  const shots = [];
+  let currentShot = null;
+  let shotNumber = 1;
   
-  for (const f of frames) {
-    // Extract base number: "1A" -> "1", "12B" -> "12", "FR 3" -> "3"
-    const cleaned = (f.frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '');
-    const match = cleaned.match(/^(\d+)/);
-    const baseNum = match ? match[1] : null;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
     
-    // If no number found, use position-based key
-    const groupKey = baseNum || `_pos_${Object.keys(groups).length + 1}`;
+    // Start new shot if:
+    // - First frame
+    // - Frame doesn't continue previous
+    // - Has visible numbers and number changed (different base number)
+    let startNewShot = false;
     
-    if (!groups[groupKey]) {
-      groups[groupKey] = { 
-        shotNumber: baseNum || String(Object.keys(groups).length + 1), 
-        frames: [], 
-        images: [], 
-        descriptions: [], 
-        dialogs: [] 
+    if (i === 0) {
+      startNewShot = true;
+    } else if (f.hasVisibleNumber) {
+      // If has visible numbers, group by base number (existing logic)
+      const prevNum = (frames[i-1].frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
+      const currNum = (f.frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
+      startNewShot = prevNum !== currNum;
+    } else {
+      // No visible numbers - use AI's continuity detection
+      startNewShot = !f.continuesPrevious;
+    }
+    
+    if (startNewShot) {
+      if (currentShot) shots.push(currentShot);
+      currentShot = {
+        shotNumber: String(shotNumber++),
+        frames: [],
+        images: [],
+        descriptions: [],
+        dialogs: []
       };
     }
     
-    groups[groupKey].frames.push(f.frameNumber || groupKey);
-    if (f.image) groups[groupKey].images.push(f.image);
-    if (f.description) groups[groupKey].descriptions.push(f.description);
-    if (f.dialog) groups[groupKey].dialogs.push(f.dialog);
+    currentShot.frames.push(f.frameNumber);
+    if (f.image) currentShot.images.push(f.image);
+    if (f.description) currentShot.descriptions.push(f.description);
+    if (f.dialog) currentShot.dialogs.push(f.dialog);
   }
   
-  // Sort by numeric value, then return
-  const sorted = Object.entries(groups)
-    .sort((a, b) => {
-      const numA = parseInt(a[0]) || 999;
-      const numB = parseInt(b[0]) || 999;
-      return numA - numB;
-    })
-    .map(([_, g]) => g);
+  // Don't forget the last shot
+  if (currentShot) shots.push(currentShot);
   
-  return sorted.map(g => ({
+  return shots.map(g => ({
     shotNumber: g.shotNumber,
     frames: g.frames,
     images: g.images,
@@ -668,6 +685,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         allFrames.push({
           frameNumber: tf.frameNumber || `${j + 1}`,
           hasVisibleNumber: hasVisibleNumbers,
+          continuesPrevious: tf.continuesPrevious === true,
           description: tf.description || '',
           dialog: tf.dialog || '',
           image: img,
