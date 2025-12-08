@@ -516,47 +516,40 @@ async function extractText(imageBuffer) {
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
         { type: 'text', text: `Extract storyboard data from this page.
 
-STEP 1 - GRID LAYOUT:
+STEP 1 - SPOT NAME:
+Look for the COMMERCIAL/PROJECT TITLE at the top of the page (e.g., "ACME CORP - PRODUCT :30", "BRAND NAME 'CAMPAIGN' :15 TVC").
+This is NOT scene descriptions like "INT. KITCHEN" or "EXT. HOUSE" - those are just scene headers within the commercial.
+spotName should be the overall project/commercial title, or null if not visible.
+
+STEP 2 - GRID LAYOUT:
 Identify the grid structure (e.g., 2x3 = 2 columns, 3 rows).
 Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
-STEP 2 - FRAME NUMBERS:
+STEP 3 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, FR3, etc.), use those exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4, 5, 6...
-
-STEP 3 - CONTINUITY:
-For each frame, determine if it CONTINUES the previous frame (same shot) or is a CUT (new shot).
-- CONTINUES: same background, camera move, evolving action, same characters in motion
-- CUT: different location, new scene, different characters, clear scene break
 
 STEP 4 - EXTRACT:
 Return JSON:
 {
-  "spotName": "Scene/spot title from header or null",
+  "spotName": "BRAND - PRODUCT :30" or null,
   "gridLayout": "2x3",
   "hasVisibleNumbers": true/false,
   "frames": [
     {
       "frameNumber": "1",
-      "continuesPrevious": false,
       "description": "Action/direction text",
       "dialog": "CHARACTER: Spoken lines..."
-    },
-    {
-      "frameNumber": "2",
-      "continuesPrevious": true,
-      "description": "Camera pushes in as he turns",
-      "dialog": ""
     }
   ]
 }
 
 RULES:
-- continuesPrevious: true if this frame is part of the same uninterrupted shot as previous
-- First frame on page is always continuesPrevious: false
+- spotName: The commercial/project title only, NOT scene headers like "INT. KITCHEN"
 - description: action/camera direction text near the frame
 - dialog: spoken lines with character name prefix
-- Skip completely empty frames` }
+- Skip completely empty frames
+- Preserve reading order strictly` }
       ]
     }]
   });
@@ -674,26 +667,25 @@ async function analyzeGroupings(frames) {
           ...imageContents,
           { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence.
 
-Group consecutive frames into SHOTS. 
-
-DEFAULT ASSUMPTION: Consecutive frames are the SAME SHOT unless there's clear evidence of a CUT.
+Group consecutive frames into SHOTS.
 
 SAME SHOT (group together):
-- Same characters visible, even if framing changes
-- Same location/environment  
-- Camera tilts, pans, pushes, or pulls (still one shot)
-- Action continues from previous frame
+- Same camera position/angle viewing same subjects
+- Camera tilts, pans, or pushes (still one continuous shot)
+- Same characters in same location, action continues
 
-DIFFERENT SHOT (split only if):
-- Camera jumps to OPPOSITE side of characters (crosses the line)
-- Completely different location or scene
-- Different characters entirely
-- Clear cutaway (product insert, reaction shot from new angle)
+DIFFERENT SHOTS (must split):
+- SHOT/REVERSE-SHOT: Camera flips to opposite side (e.g., looking AT someone vs FROM their POV)
+- POV REVERSAL: Looking INTO something vs looking OUT FROM inside it
+- Different location or completely different framing
+- Cutaway to different subject (product insert, reaction from new angle)
 
-Storyboard artists are inconsistent - ignore scale differences. If same people are in same place doing continuous action, it's ONE SHOT.
+EXAMPLE: Person opens fridge (shot 1) → Cut to view FROM INSIDE fridge looking out (shot 2). These are DIFFERENT shots even though action continues.
 
-Return ONLY a JSON array of frame groups:
-[[1, 2, 3, 4], [5, 6], [7], [8, 9, 10]]` }
+BIAS: When uncertain about same-angle continuous action, GROUP them. When POV clearly reverses, SPLIT them.
+
+Return ONLY a JSON array:
+[[1], [2, 3, 4], [5, 6, 7, 8], [9], [10]]` }
         ]
       }]
     });
