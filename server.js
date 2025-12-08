@@ -1078,54 +1078,68 @@ app.post('/api/auto-tag-batch', async (req, res) => {
       });
     }
     
-    // Add the analysis prompt
+    // Add the analysis prompt - two-phase approach
     content.push({
       type: 'text',
       text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify ALL characters visible in each frame.
 
 CHARACTERS TO IDENTIFY: ${characters.join(', ')}
 
-ANALYSIS APPROACH:
-1. First, find frames where character names are explicitly labeled in the image or mentioned in the description text
-2. Study the visual appearance of each character in those labeled frames:
-   - Hair style, color, length
-   - Gender
-   - Clothing/costume
-   - Body type
-   - Any distinguishing features
-3. Then examine ALL frames and identify EVERY character visible, including:
-   - Characters in the foreground
-   - Characters in the background
-   - Partially visible characters (hands, backs, silhouettes)
-   - Characters in group shots (count ALL people visible)
+=== PHASE 1: BUILD CHARACTER PROFILES ===
 
-IMPORTANT RULES:
-- Tag ALL characters visible in frame, not just the "main" one
-- If you see 3 people in a frame, tag all 3
-- The same character maintains consistent appearance across all frames
-- If description says "HENRY does X" and you see one person, that's HENRY - learn their appearance
-- If a frame shows the same setting/angle as an adjacent frame, the same characters are likely present
-- Hands reaching into frame still count - identify whose hand based on context
-- When in doubt about a background figure, include them if they match a known character's appearance
+First, find ESTABLISHING SHOTS - frames where a character is:
+- Clearly the only person in frame AND named in the description
+- In a close-up or medium shot where their face/features are clear
+- Explicitly labeled in the image itself
 
-Respond with a JSON array mapping each frame to ALL characters that appear in it:
+For each character, study their visual appearance in these establishing shots:
+- Hair: style, length, color (dark/light in grayscale)
+- Face shape and features
+- Body type and build
+- Gender presentation
+- Clothing/costume they wear throughout
+- Any distinguishing features
+
+Example: If frame 5 description says "HENRY reaches into cabinet" and shows one person reaching, that person IS Henry - memorize their appearance.
+
+=== PHASE 2: APPLY PROFILES TO ALL FRAMES ===
+
+Now scan EVERY frame and identify ALL characters visible by matching to the profiles you built:
+
+- Look for EVERY human figure in each frame (foreground, background, partial)
+- Match each figure to the character profiles you established
+- Characters maintain consistent appearance throughout (same hair, same build, same clothes)
+- If you see 3 people at a table, identify all 3
+- Hands, backs, silhouettes count - identify based on context and adjacent frames
+- If description mentions interaction between characters, BOTH should be tagged
+
+CRITICAL RULES:
+- A character mentioned in the description is DEFINITELY in the frame - find them
+- If description says "X walks over to Y" - BOTH X and Y are in frame
+- If description uses pronouns like "him/her" referring to earlier character - that character is in frame
+- Adjacent frames showing same location likely have same characters
+- ERR ON THE SIDE OF INCLUSION
+
+Respond with JSON:
 {
+  "characterProfiles": {
+    "HENRY": "Established in frame X - adult male, short dark hair, wearing apron...",
+    "TANYA": "Established in frame Y - adult female, long hair...",
+    ...
+  },
   "assignments": [
-    {"rowNum": "1", "characters": []},
-    {"rowNum": "2", "characters": ["RICK"]},
-    {"rowNum": "3", "characters": ["TANYA", "HENRY", "RICK"]},
+    {"rowNum": "1", "characters": ["RICK"], "reasoning": "Single figure matching RICK profile from establishing shot"},
+    {"rowNum": "2", "characters": ["RICK", "TANYA"], "reasoning": "Two figures - RICK at door, TANYA entering"},
     ...
   ]
 }
 
-Include ALL frames in your response, even if no characters are identified (empty array).
-Only include character names from the list above - do not invent new names.
-ERR ON THE SIDE OF INCLUSION - if a figure MIGHT be a character, include them.`
+Include ALL frames. Only use character names from the provided list.`
     });
     
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
+      max_tokens: 8000,
       messages: [{
         role: 'user',
         content
@@ -1142,10 +1156,21 @@ ERR ON THE SIDE OF INCLUSION - if a figure MIGHT be a character, include them.`
       try {
         const result = JSON.parse(jsonMatch[0]);
         
+        // Log character profiles if present
+        if (result.characterProfiles) {
+          console.log('[AutoTagBatch] Character profiles:', Object.keys(result.characterProfiles));
+          for (const [char, profile] of Object.entries(result.characterProfiles)) {
+            console.log(`  ${char}: ${profile.substring(0, 100)}...`);
+          }
+        }
+        
         // Add rowId mapping back
         if (result.assignments) {
           result.assignments = result.assignments.map(a => {
             const frame = frames.find(f => f.rowNum === a.rowNum || f.rowNum === String(a.rowNum));
+            if (a.reasoning) {
+              console.log(`[AutoTagBatch] Row ${a.rowNum}: ${a.characters.join(', ')} - ${a.reasoning}`);
+            }
             return {
               ...a,
               rowId: frame?.rowId || null
@@ -1157,6 +1182,7 @@ ERR ON THE SIDE OF INCLUSION - if a figure MIGHT be a character, include them.`
         return res.json(result);
       } catch (parseErr) {
         console.error('[AutoTagBatch] JSON parse error:', parseErr);
+        console.error('[AutoTagBatch] Raw text:', text.substring(0, 500));
         return res.status(500).json({ error: 'Failed to parse AI response' });
       }
     }
