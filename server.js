@@ -1056,6 +1056,7 @@ app.post('/api/auto-tag-batch', async (req, res) => {
   
   console.log('[AutoTagBatch] Processing', frames.length, 'rows for characters:', characters);
   console.log('[AutoTagBatch] Headshots available:', headshotsAvailable);
+  console.log('[AutoTagBatch] Using model: claude-haiku-4-5-20251001');
   
   try {
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -1165,7 +1166,7 @@ VALIDATION: For each row, characters.length MUST equal bodyCount. Double-check b
     });
     
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 8000,
       messages: [{
         role: 'user',
@@ -1226,5 +1227,5 @@ app.listen(PORT, () => {
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Auto-tag batch: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Auto-tag batch (Haiku): ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
