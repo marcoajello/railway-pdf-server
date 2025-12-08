@@ -1037,102 +1037,125 @@ If none of those specific names appear in the image, respond:
 // ============================================================================
 
 app.post('/api/auto-tag-batch', async (req, res) => {
-  const { frames, characters } = req.body;
+  const { frames, characterRefs } = req.body;
   
   if (!frames || !Array.isArray(frames) || frames.length === 0) {
     return res.status(400).json({ error: 'Missing frames array' });
   }
   
-  if (!characters || !Array.isArray(characters) || characters.length === 0) {
-    return res.status(400).json({ error: 'Missing characters array' });
+  if (!characterRefs || !Array.isArray(characterRefs) || characterRefs.length === 0) {
+    return res.status(400).json({ error: 'Missing characterRefs array' });
   }
   
   if (!process.env.ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'AI not configured' });
   }
   
-  console.log('[AutoTagBatch] Processing', frames.length, 'frames for characters:', characters);
+  const characters = characterRefs.map(c => c.characterName);
+  const headshotsAvailable = characterRefs.filter(c => c.image).length;
+  
+  console.log('[AutoTagBatch] Processing', frames.length, 'rows for characters:', characters);
+  console.log('[AutoTagBatch] Headshots available:', headshotsAvailable);
   
   try {
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     
-    // Build content array with all images and their descriptions
+    // Build content array
     const content = [];
     
-    // Add each frame as an image with its description
-    for (let i = 0; i < frames.length; i++) {
-      const frame = frames[i];
-      
+    // FIRST: Add character reference headshots
+    if (headshotsAvailable > 0) {
       content.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: 'image/jpeg',
-          data: frame.image
-        }
+        type: 'text',
+        text: '=== CHARACTER REFERENCE PHOTOS ===\nThese are photos of the actual actors. Use these to identify characters in the storyboard frames:'
       });
+      
+      for (const charRef of characterRefs) {
+        if (charRef.image) {
+          content.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/jpeg',
+              data: charRef.image
+            }
+          });
+          content.push({
+            type: 'text',
+            text: `This is ${charRef.characterName}`
+          });
+        }
+      }
       
       content.push({
         type: 'text',
-        text: `[Frame ${frame.rowNum}] ${frame.copyText || '(no description)'}`
+        text: '\n=== STORYBOARD FRAMES TO ANALYZE ===\n'
       });
     }
     
-    // Add the analysis prompt - two-phase approach
+    // Add each row's images with description
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i];
+      const images = frame.images || (frame.image ? [frame.image] : []);
+      
+      for (let j = 0; j < images.length; j++) {
+        content.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/jpeg',
+            data: images[j]
+          }
+        });
+        
+        if (images.length > 1) {
+          content.push({
+            type: 'text',
+            text: `[Row ${frame.rowNum}, Image ${j + 1} of ${images.length}] ${j === 0 ? (frame.copyText || '(no description)') : '(continuation)'}`
+          });
+        } else {
+          content.push({
+            type: 'text',
+            text: `[Row ${frame.rowNum}] ${frame.copyText || '(no description)'}`
+          });
+        }
+      }
+    }
+    
+    // Add the analysis prompt
     content.push({
       type: 'text',
       text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify characters VISUALLY PRESENT in each frame.
 
 CHARACTERS TO IDENTIFY: ${characters.join(', ')}
+${headshotsAvailable > 0 ? '\nYou have reference photos of each character above. Match the storyboard drawings to these real faces - pay attention to gender, hair, and build.' : ''}
 
-=== PHASE 1: BUILD CHARACTER PROFILES ===
+=== ANALYSIS RULES ===
 
-Find ESTABLISHING SHOTS - frames where:
-- Only ONE person is clearly visible
-- That person is named in the description
-- Their features are clear
-
-Study and memorize each character's visual appearance:
-- Hair: style, length, shade (dark/light)
-- Gender presentation  
-- Body type and build
-- Clothing they wear throughout
-
-=== PHASE 2: COUNT AND IDENTIFY ===
-
-IMPORTANT: Some rows have MULTIPLE IMAGES. Analyze each image separately but combine results for the row.
-
-For EACH frame/image:
-1. COUNT how many human figures are VISIBLE in the actual drawing
-2. IDENTIFY each visible figure by matching to character profiles
-3. Check FOREGROUND and BACKGROUND - wide shots often have people in background (eating, sitting, etc.)
+1. COUNT BODIES FIRST: For each image, count how many human figures are DRAWN
+2. IDENTIFY by matching to reference photos or established appearance
+3. For rows with MULTIPLE IMAGES: analyze each image separately, combine all characters seen
 
 STRICT RULES:
-- COUNT BODIES IN THE IMAGE - if you see 1 person, tag 1. If you see 4, tag 4.
-- DO NOT tag characters just because description mentions them - they must be DRAWN
-- Look carefully at backgrounds in kitchen/table scenes - other family members may be visible
-- Hands/arms reaching into frame only count if you can identify whose they are
-- When a row has multiple images, look at ALL of them - a character might appear in image 2 but not image 1
-
-COMMON MISTAKES TO AVOID:
-- Tagging someone because they're mentioned in description but NOT drawn in frame
-- Missing background figures in wide shots (people at table, in doorway, etc.)
-- Missing characters who appear in the 2nd or 3rd image of a multi-image row
+- Only tag characters you can SEE drawn in the frame
+- DO NOT tag characters just because they're mentioned in the description
+- Check BACKGROUNDS in wide shots - people at tables, in doorways
+- ${headshotsAvailable > 0 ? 'Use the reference photos to distinguish similar-looking characters (e.g., adult woman KAREN vs teen boy HENRY)' : 'Build visual profiles from establishing shots'}
 
 Respond with JSON:
 {
   "characterProfiles": {
-    "HENRY": "adult male, short dark hair, apron",
-    "TANYA": "adult female, long hair",
+    "HENRY": "teen boy, short hair",
+    "KAREN": "adult woman, different build than HENRY",
     ...
   },
   "assignments": [
-    {"rowNum": "1", "visibleCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "Image 1: 1 male (RICK). Image 2: same male + female entering (TANYA)"},
+    {"rowNum": "1", "visibleCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "Image 1: 1 male. Image 2: same male + female entering"},
     ...
   ]
 }
 
-Include ALL frames. Be precise about who you actually SEE drawn.`
+Include ALL rows. Only tag characters you SEE drawn.`
     });
     
     const response = await anthropic.messages.create({
