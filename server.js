@@ -1094,6 +1094,7 @@ app.post('/api/auto-tag-batch', async (req, res) => {
     }
     
     // Add each row's images with description
+    // Use very explicit labels so API doesn't confuse image sequence with row numbers
     for (let i = 0; i < frames.length; i++) {
       const frame = frames[i];
       const images = frame.images || (frame.image ? [frame.image] : []);
@@ -1111,12 +1112,12 @@ app.post('/api/auto-tag-batch', async (req, res) => {
         if (images.length > 1) {
           content.push({
             type: 'text',
-            text: `[Row ${frame.rowNum}, Image ${j + 1} of ${images.length}] ${j === 0 ? (frame.copyText || '(no description)') : '(continuation)'}`
+            text: `^^^ THIS IMAGE BELONGS TO ROW ${frame.rowNum} (image ${j + 1}/${images.length}) ${j === 0 ? frame.copyText || '' : ''}`
           });
         } else {
           content.push({
             type: 'text',
-            text: `[Row ${frame.rowNum}] ${frame.copyText || '(no description)'}`
+            text: `^^^ THIS IMAGE BELONGS TO ROW ${frame.rowNum} - ${frame.copyText || '(no description)'}`
           });
         }
       }
@@ -1130,6 +1131,14 @@ app.post('/api/auto-tag-batch', async (req, res) => {
 CHARACTERS TO IDENTIFY: ${characters.join(', ')}
 ${headshotsAvailable > 0 ? '\nYou have reference photos of each character above. Match the storyboard drawings to these real faces - pay attention to gender, hair, and build.' : ''}
 
+=== IMPORTANT: ROW NUMBERS ===
+
+Each image above is labeled with its ROW NUMBER (e.g., "ROW 1", "ROW 2", etc.).
+Some rows have MULTIPLE images - combine all characters from all images in that row.
+Use the ROW NUMBERS from the labels - do NOT number images sequentially yourself.
+
+There are exactly ${frames.length} rows to analyze. Your response must have exactly ${frames.length} assignments.
+
 === CRITICAL RULE ===
 
 COUNT BODIES FIRST. The number of characters you tag MUST EQUAL the number of human figures drawn.
@@ -1142,7 +1151,7 @@ NEVER tag more characters than bodies visible. This is the most important rule.
 
 === ANALYSIS STEPS ===
 
-For each row:
+For each ROW (using the row number from the label):
 1. Count human figures DRAWN in the image(s) - write this number down
 2. Identify each figure by matching to reference photos
 3. Verify: does your character count match your body count? If not, fix it.
@@ -1161,7 +1170,10 @@ Respond with JSON:
   ]
 }
 
-VALIDATION: For each row, characters.length MUST equal bodyCount. Double-check before responding.`
+VALIDATION: 
+- Use the ROW NUMBERS from the image labels (ROW 1, ROW 2, etc.)
+- You must have exactly ${frames.length} assignments
+- For each row, characters.length MUST equal bodyCount`
     });
     
     const response = await anthropic.messages.create({
