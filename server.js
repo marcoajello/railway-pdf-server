@@ -1125,52 +1125,43 @@ app.post('/api/auto-tag-batch', async (req, res) => {
     // Add the analysis prompt
     content.push({
       type: 'text',
-      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify ALL characters VISUALLY PRESENT in each frame.
+      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify characters VISUALLY PRESENT in each frame.
 
 CHARACTERS TO IDENTIFY: ${characters.join(', ')}
-${headshotsAvailable > 0 ? '\nYou have reference photos of each character above. Match the storyboard drawings to these real faces.' : ''}
+${headshotsAvailable > 0 ? '\nYou have reference photos of each character above. Match the storyboard drawings to these real faces - pay attention to gender, hair, and build.' : ''}
 
-=== CRITICAL COUNTING RULE ===
+=== CRITICAL RULE ===
 
-LOOK CAREFULLY and count ALL human figures in each frame:
-- 1 person alone = "single" or "close-up"
-- 2 people in frame = "2-shot" (very common in dialogue/interaction scenes)
-- 3 people in frame = "3-shot" (group scenes)
-- 4+ people = "group shot"
+COUNT BODIES FIRST. The number of characters you tag MUST EQUAL the number of human figures drawn.
 
-The number of characters you tag MUST EQUAL the number of human figures you count.
+If you see 1 person → tag exactly 1 character
+If you see 2 people → tag exactly 2 characters  
+If you see 3 people → tag exactly 3 characters
 
-=== HOW TO COUNT ACCURATELY ===
+NEVER tag more characters than bodies visible. This is the most important rule.
 
-For each image, scan the ENTIRE frame:
-- Foreground figures (main action)
-- Background figures (watching, reacting, at tables)
-- Partial figures (someone's shoulder, back of head, hand entering frame)
-- Side-by-side figures (two people standing/sitting together)
-
-COMMON PATTERNS TO WATCH FOR:
-- One person gesturing TO another person → 2-shot (both visible)
-- Someone showing something to someone → 2-shot
-- Kitchen/table scenes often have multiple family members
-- "Over the shoulder" shots have 2 people (the shoulder AND the face)
-
-=== ANALYSIS ===
+=== ANALYSIS STEPS ===
 
 For each row:
-1. Describe what you see: "I see X human figures - one in foreground doing Y, one in background doing Z"
-2. Match each figure to a character using reference photos
-3. VERIFY: If I counted N figures, I must tag N characters
+1. Count human figures DRAWN in the image(s) - write this number down
+2. Identify each figure by matching to reference photos
+3. Verify: does your character count match your body count? If not, fix it.
+
+STRICT RULES:
+- Only tag characters you can SEE drawn
+- Descriptions often mention characters NOT in frame - ignore the text, trust your eyes
+- ${headshotsAvailable > 0 ? 'Use reference photos to distinguish similar characters' : 'Build profiles from establishing shots'}
 
 Respond with JSON:
 {
   "assignments": [
-    {"rowNum": "1", "bodyCount": 1, "characters": ["RICK"], "reasoning": "Single male figure in doorway looking into kitchen"},
-    {"rowNum": "2", "bodyCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "2-shot: male on left, female entering on right"},
+    {"rowNum": "1", "bodyCount": 1, "characters": ["RICK"], "reasoning": "1 male figure in doorway"},
+    {"rowNum": "2", "bodyCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "2 figures - male + female entering"},
     ...
   ]
 }
 
-FINAL CHECK: characters.length MUST equal bodyCount for every row.`
+VALIDATION: For each row, characters.length MUST equal bodyCount. Double-check before responding.`
     });
     
     const response = await anthropic.messages.create({
