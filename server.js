@@ -674,27 +674,30 @@ async function analyzeGroupings(frames) {
           ...imageContents,
           { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
 
-Group them into SHOTS based on CAMERA SETUP, not scene. Frames belong to the SAME SHOT if:
+Group them into SHOTS based on CAMERA SETUP. Frames belong to the SAME SHOT if:
 
-1. SAME CHARACTER POSITIONS - Characters maintain same left/right positions relative to each other
-2. SAME COMPOSITIONAL TYPE - All two-shots, or all close-ups, or all wide shots
-3. SAME CAMERA ANGLE - Shooting from same direction (front, side, POV)
-4. SAME BACKGROUND - Same environment visible from same angle
-5. CONTINUOUS ACTION - Action flows naturally (even across multiple frames)
+1. SAME BACKGROUND ARCHITECTURE - Look for fixed elements: range hoods, cabinets, windows, doorframes, ceiling lines, shelving. If the same distinctive architectural element appears from the same angle, it's the same shot.
 
-IMPORTANT: Storyboard artists draw at varying scales. Ignore minor size differences - focus on CHARACTER ARRANGEMENT and CAMERA ANGLE.
+2. SAME CHARACTER POSITIONS - Characters maintain same left/right arrangement relative to each other.
 
-Frames are DIFFERENT SHOTS if:
-- Characters swap positions (person on left moves to right)
-- Camera angle clearly changes (front view to side view)
-- Different location or background
-- Cut to completely different subject (insert shot, reaction shot)
-- Different shot type (wide shot cuts to extreme close-up of hands)
+3. CAMERA MOVES ARE ONE SHOT - A tilt (up/down) or pan (left/right) is still ONE continuous shot. If background elements shift position but remain visible from the same angle, the camera is moving within a single take.
 
-BIAS TOWARD GROUPING: When uncertain, group frames together. Consecutive frames showing the same characters from roughly the same angle are likely ONE SHOT.
+4. SAME ENVIRONMENT PERSPECTIVE - Shot from same direction (front, side, POV), even if framing is tighter or looser.
+
+CRITICAL: Storyboard artists are inconsistent with scale and detail. Focus on:
+- Distinctive background shapes (a trapezoidal hood, an arched window)
+- Character left/right arrangement
+- Environmental continuity
+
+Frames are DIFFERENT SHOTS only if:
+- Camera clearly moves to opposite side of characters
+- Completely different location/background
+- Cut to different subject entirely (insert, reaction, new scene)
+
+BIAS TOWARD GROUPING: When uncertain, frames showing the same characters in the same environment are likely ONE SHOT with camera movement.
 
 Return ONLY a JSON array:
-[[1, 2, 3], [4], [5, 6], [7, 8, 9]]` }
+[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` }
         ]
       }]
     });
