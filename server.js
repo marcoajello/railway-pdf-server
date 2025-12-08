@@ -1087,50 +1087,52 @@ CHARACTERS TO IDENTIFY: ${characters.join(', ')}
 
 === PHASE 1: BUILD CHARACTER PROFILES ===
 
-First, find ESTABLISHING SHOTS - frames where:
-- Only ONE person is clearly visible in the image
+Find ESTABLISHING SHOTS - frames where:
+- Only ONE person is clearly visible
 - That person is named in the description
-- Their features are clearly drawable
+- Their features are clear
 
 Study and memorize each character's visual appearance:
 - Hair: style, length, shade (dark/light)
-- Gender presentation
+- Gender presentation  
 - Body type and build
-- Clothing they wear
-
-Example: If frame shows ONE person reaching into cabinet and description says "HENRY reaches...", that person IS Henry - memorize their look.
+- Clothing they wear throughout
 
 === PHASE 2: COUNT AND IDENTIFY ===
 
-For EACH frame:
-1. FIRST: Count how many human figures are VISIBLE in the image (not mentioned in text - actually VISIBLE)
-2. THEN: Identify each visible figure by matching to character profiles
+IMPORTANT: Some rows have MULTIPLE IMAGES. Analyze each image separately but combine results for the row.
 
-CRITICAL RULES:
-- COUNT PEOPLE IN THE IMAGE FIRST - if you see 1 person, tag 1 character. If you see 3, tag 3.
-- DO NOT tag characters just because they're mentioned in the description - they must be VISIBLE
-- Descriptions often mention characters from OTHER frames - ignore text, LOOK at the image
-- Partial figures count (hands, backs) - but only if actually drawn in the frame
-- The same character looks the same across all frames
+For EACH frame/image:
+1. COUNT how many human figures are VISIBLE in the actual drawing
+2. IDENTIFY each visible figure by matching to character profiles
+3. Check FOREGROUND and BACKGROUND - wide shots often have people in background (eating, sitting, etc.)
 
-WRONG: Description says "RICK tells TANYA about HENRY" → tagging all 3
-RIGHT: Image shows 2 people talking → tag only those 2 visible people
+STRICT RULES:
+- COUNT BODIES IN THE IMAGE - if you see 1 person, tag 1. If you see 4, tag 4.
+- DO NOT tag characters just because description mentions them - they must be DRAWN
+- Look carefully at backgrounds in kitchen/table scenes - other family members may be visible
+- Hands/arms reaching into frame only count if you can identify whose they are
+- When a row has multiple images, look at ALL of them - a character might appear in image 2 but not image 1
+
+COMMON MISTAKES TO AVOID:
+- Tagging someone because they're mentioned in description but NOT drawn in frame
+- Missing background figures in wide shots (people at table, in doorway, etc.)
+- Missing characters who appear in the 2nd or 3rd image of a multi-image row
 
 Respond with JSON:
 {
   "characterProfiles": {
     "HENRY": "adult male, short dark hair, apron",
-    "TANYA": "adult female, long hair, casual clothes",
+    "TANYA": "adult female, long hair",
     ...
   },
   "assignments": [
-    {"rowNum": "1", "visibleCount": 1, "characters": ["RICK"], "reasoning": "Single male figure in doorway"},
-    {"rowNum": "2", "visibleCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "Two figures - male at door, female entering"},
+    {"rowNum": "1", "visibleCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "Image 1: 1 male (RICK). Image 2: same male + female entering (TANYA)"},
     ...
   ]
 }
 
-Include ALL frames. Report visibleCount accurately - this is how many people you SEE in the image.`
+Include ALL frames. Be precise about who you actually SEE drawn.`
     });
     
     const response = await anthropic.messages.create({
