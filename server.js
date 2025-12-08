@@ -963,9 +963,79 @@ RULES:
   }
 }
 
+// ============================================================================
+// AUTO-TAG VISION ENDPOINT
+// ============================================================================
+
+app.post('/api/auto-tag-vision', async (req, res) => {
+  const { image, characters } = req.body;
+  
+  if (!image || !characters || !Array.isArray(characters)) {
+    return res.status(400).json({ error: 'Missing image or characters array' });
+  }
+  
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'AI not configured' });
+  }
+  
+  console.log('[AutoTagVision] Scanning for characters:', characters);
+  
+  try {
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 500,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/jpeg',
+              data: image
+            }
+          },
+          {
+            type: 'text',
+            text: `This is a storyboard frame from a commercial shoot. Look for any text labels or character names in the image.
+
+I'm looking for these character names: ${characters.join(', ')}
+
+If you see any of these names written in the image (as labels, annotations, or dialogue), list ONLY the ones you find.
+
+Respond with JSON only:
+{"found": ["NAME1", "NAME2"]}
+
+If none of those specific names appear in the image, respond:
+{"found": []}`
+          }
+        ]
+      }]
+    });
+    
+    const text = response.content[0].text;
+    console.log('[AutoTagVision] AI response:', text);
+    
+    // Parse JSON response
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const result = JSON.parse(jsonMatch[0]);
+      return res.json(result);
+    }
+    
+    return res.json({ found: [] });
+  } catch (error) {
+    console.error('[AutoTagVision] Error:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server on port ${PORT}`);
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Auto-tag vision: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
