@@ -32,7 +32,7 @@ function getAnthropicClient() {
 }
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '150mb' }));
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', version: '3.0.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
@@ -964,7 +964,7 @@ RULES:
 }
 
 // ============================================================================
-// AUTO-TAG VISION ENDPOINT
+// AUTO-TAG VISION ENDPOINT (single frame - legacy)
 // ============================================================================
 
 app.post('/api/auto-tag-vision', async (req, res) => {
@@ -1032,10 +1032,134 @@ If none of those specific names appear in the image, respond:
   }
 });
 
+// ============================================================================
+// AUTO-TAG BATCH ENDPOINT (all frames at once for cross-referencing)
+// ============================================================================
+
+app.post('/api/auto-tag-batch', async (req, res) => {
+  const { frames, characters } = req.body;
+  
+  if (!frames || !Array.isArray(frames) || frames.length === 0) {
+    return res.status(400).json({ error: 'Missing frames array' });
+  }
+  
+  if (!characters || !Array.isArray(characters) || characters.length === 0) {
+    return res.status(400).json({ error: 'Missing characters array' });
+  }
+  
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'AI not configured' });
+  }
+  
+  console.log('[AutoTagBatch] Processing', frames.length, 'frames for characters:', characters);
+  
+  try {
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    
+    // Build content array with all images and their descriptions
+    const content = [];
+    
+    // Add each frame as an image with its description
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i];
+      
+      content.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/jpeg',
+          data: frame.image
+        }
+      });
+      
+      content.push({
+        type: 'text',
+        text: `[Frame ${frame.rowNum}] ${frame.copyText || '(no description)'}`
+      });
+    }
+    
+    // Add the analysis prompt
+    content.push({
+      type: 'text',
+      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify which characters appear in each frame.
+
+CHARACTERS TO IDENTIFY: ${characters.join(', ')}
+
+ANALYSIS APPROACH:
+1. First, find frames where character names are explicitly labeled or mentioned in the description text
+2. Study the visual appearance of each character in those labeled frames (hair style, clothing, body type, gender, distinguishing features)
+3. Then examine the unlabeled frames and match characters based on visual similarity to what you learned
+4. Use context clues from descriptions (pronouns, actions, relationships) to help identify characters
+
+IMPORTANT:
+- The same character should look consistent across frames (same hair, same general appearance)
+- If a frame shows someone cooking/at stove and description mentions "HENRY cooks", that establishes HENRY's appearance
+- Use that to identify HENRY in other frames even without explicit labels
+- Characters mentioned in one frame's description might appear in adjacent frames doing the same action
+
+Respond with a JSON array mapping each frame to the characters that appear in it:
+{
+  "assignments": [
+    {"rowNum": "1", "characters": []},
+    {"rowNum": "2", "characters": ["RICK"]},
+    {"rowNum": "3", "characters": ["TANYA", "HENRY"]},
+    ...
+  ]
+}
+
+Include ALL frames in your response, even if no characters are identified (empty array).
+Only include character names from the list above - do not invent new names.`
+    });
+    
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4000,
+      messages: [{
+        role: 'user',
+        content
+      }]
+    });
+    
+    const text = response.content[0].text;
+    console.log('[AutoTagBatch] AI response length:', text.length);
+    console.log('[AutoTagBatch] AI response preview:', text.substring(0, 500));
+    
+    // Parse JSON response
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const result = JSON.parse(jsonMatch[0]);
+        
+        // Add rowId mapping back
+        if (result.assignments) {
+          result.assignments = result.assignments.map(a => {
+            const frame = frames.find(f => f.rowNum === a.rowNum || f.rowNum === String(a.rowNum));
+            return {
+              ...a,
+              rowId: frame?.rowId || null
+            };
+          });
+        }
+        
+        console.log('[AutoTagBatch] Parsed', result.assignments?.length, 'assignments');
+        return res.json(result);
+      } catch (parseErr) {
+        console.error('[AutoTagBatch] JSON parse error:', parseErr);
+        return res.status(500).json({ error: 'Failed to parse AI response' });
+      }
+    }
+    
+    return res.json({ assignments: [] });
+  } catch (error) {
+    console.error('[AutoTagBatch] Error:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server on port ${PORT}`);
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Auto-tag vision: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Auto-tag batch: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
