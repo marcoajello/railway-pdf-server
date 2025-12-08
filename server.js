@@ -665,27 +665,24 @@ async function analyzeGroupings(frames) {
           ...imageContents,
           { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
 
-Group them into SHOTS based on CAMERA SETUP, not scene. Frames belong to the SAME SHOT if:
+Group them into SHOTS. Frames belong to the SAME SHOT if:
 
-1. SAME CHARACTER POSITIONS - Characters maintain same left/right positions relative to each other
-2. SAME COMPOSITIONAL TYPE - All two-shots, or all close-ups, or all wide shots
-3. SAME CAMERA ANGLE - Shooting from same direction (front, side, POV)
-4. SAME BACKGROUND - Same environment visible from same angle
-5. CONTINUOUS ACTION - Action flows naturally (even across multiple frames)
+1. SAME BACKGROUND ARCHITECTURE - Same room, same distinctive elements (range hood, cabinets, windows) visible from same angle
+2. SAME CHARACTER ARRANGEMENT - Characters in similar positions relative to each other  
+3. SAME CAMERA ANGLE - Shooting from same general direction
+4. CONTINUOUS ACTION - Action flows naturally across frames
 
-IMPORTANT: Storyboard artists draw at varying scales. Ignore minor size differences - focus on CHARACTER ARRANGEMENT and CAMERA ANGLE.
+IMPORTANT: Storyboard artists are inconsistent with scale. Focus on BACKGROUND ELEMENTS and ENVIRONMENT - if the same room/architecture is visible from the same angle, it's likely one continuous shot even if character positions shift slightly.
 
 Frames are DIFFERENT SHOTS if:
-- Characters swap positions (person on left moves to right)
-- Camera angle clearly changes (front view to side view)
-- Different location or background
-- Cut to completely different subject (insert shot, reaction shot)
-- Different shot type (wide shot cuts to extreme close-up of hands)
+- Completely different location or background
+- Camera clearly on opposite side of characters
+- Cut to different subject entirely (insert, new scene)
 
-BIAS TOWARD GROUPING: When uncertain, group frames together. Consecutive frames showing the same characters from roughly the same angle are likely ONE SHOT.
+BIAS TOWARD GROUPING consecutive frames in the same environment.
 
 Return ONLY a JSON array:
-[[1, 2, 3], [4], [5, 6], [7, 8, 9]]` }
+[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` }
         ]
       }]
     });
