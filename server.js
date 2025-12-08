@@ -674,25 +674,27 @@ async function analyzeGroupings(frames) {
           ...imageContents,
           { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
 
-Group them into SHOTS. A shot is one continuous camera setup - frames belong to the SAME shot if:
-- Same camera angle/position (even if action changes)
-- Same POV (e.g., all "from inside fridge looking out")
-- Camera move within one take (push, pan, dolly)
+Group them into SHOTS based on CAMERA SETUP, not scene. Frames belong to the SAME SHOT if:
 
-Frames are DIFFERENT shots if:
-- Camera angle changes (wide to closeup, front to side)
-- Cut to different character or location
-- Insert/cutaway shot
+1. SAME CHARACTER POSITIONS - Characters maintain same left/right positions relative to each other
+2. SAME COMPOSITIONAL TYPE - All two-shots, or all close-ups, or all wide shots
+3. SAME CAMERA ANGLE - Shooting from same direction (front, side, POV)
+4. SAME BACKGROUND - Same environment visible from same angle
+5. CONTINUOUS ACTION - Action flows naturally (even across multiple frames)
 
-Return ONLY a JSON array of shot groups. Each group lists which frame numbers belong together:
-[
-  [1, 2],
-  [3],
-  [4, 5, 6],
-  [7, 8]
-]
+IMPORTANT: Storyboard artists draw at varying scales. Ignore minor size differences - focus on CHARACTER ARRANGEMENT and CAMERA ANGLE.
 
-This example means: frames 1-2 are shot 1, frame 3 alone is shot 2, frames 4-6 are shot 3, frames 7-8 are shot 4.` }
+Frames are DIFFERENT SHOTS if:
+- Characters swap positions (person on left moves to right)
+- Camera angle clearly changes (front view to side view)
+- Different location or background
+- Cut to completely different subject (insert shot, reaction shot)
+- Different shot type (wide shot cuts to extreme close-up of hands)
+
+BIAS TOWARD GROUPING: When uncertain, group frames together. Consecutive frames showing the same characters from roughly the same angle are likely ONE SHOT.
+
+Return ONLY a JSON array:
+[[1, 2, 3], [4], [5, 6], [7, 8, 9]]` }
         ]
       }]
     });
