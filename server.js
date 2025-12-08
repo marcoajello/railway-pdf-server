@@ -1081,34 +1081,46 @@ app.post('/api/auto-tag-batch', async (req, res) => {
     // Add the analysis prompt
     content.push({
       type: 'text',
-      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify which characters appear in each frame.
+      text: `You are analyzing storyboard frames from a commercial shoot. Your task is to identify ALL characters visible in each frame.
 
 CHARACTERS TO IDENTIFY: ${characters.join(', ')}
 
 ANALYSIS APPROACH:
-1. First, find frames where character names are explicitly labeled or mentioned in the description text
-2. Study the visual appearance of each character in those labeled frames (hair style, clothing, body type, gender, distinguishing features)
-3. Then examine the unlabeled frames and match characters based on visual similarity to what you learned
-4. Use context clues from descriptions (pronouns, actions, relationships) to help identify characters
+1. First, find frames where character names are explicitly labeled in the image or mentioned in the description text
+2. Study the visual appearance of each character in those labeled frames:
+   - Hair style, color, length
+   - Gender
+   - Clothing/costume
+   - Body type
+   - Any distinguishing features
+3. Then examine ALL frames and identify EVERY character visible, including:
+   - Characters in the foreground
+   - Characters in the background
+   - Partially visible characters (hands, backs, silhouettes)
+   - Characters in group shots (count ALL people visible)
 
-IMPORTANT:
-- The same character should look consistent across frames (same hair, same general appearance)
-- If a frame shows someone cooking/at stove and description mentions "HENRY cooks", that establishes HENRY's appearance
-- Use that to identify HENRY in other frames even without explicit labels
-- Characters mentioned in one frame's description might appear in adjacent frames doing the same action
+IMPORTANT RULES:
+- Tag ALL characters visible in frame, not just the "main" one
+- If you see 3 people in a frame, tag all 3
+- The same character maintains consistent appearance across all frames
+- If description says "HENRY does X" and you see one person, that's HENRY - learn their appearance
+- If a frame shows the same setting/angle as an adjacent frame, the same characters are likely present
+- Hands reaching into frame still count - identify whose hand based on context
+- When in doubt about a background figure, include them if they match a known character's appearance
 
-Respond with a JSON array mapping each frame to the characters that appear in it:
+Respond with a JSON array mapping each frame to ALL characters that appear in it:
 {
   "assignments": [
     {"rowNum": "1", "characters": []},
     {"rowNum": "2", "characters": ["RICK"]},
-    {"rowNum": "3", "characters": ["TANYA", "HENRY"]},
+    {"rowNum": "3", "characters": ["TANYA", "HENRY", "RICK"]},
     ...
   ]
 }
 
 Include ALL frames in your response, even if no characters are identified (empty array).
-Only include character names from the list above - do not invent new names.`
+Only include character names from the list above - do not invent new names.
+ERR ON THE SIDE OF INCLUSION - if a figure MIGHT be a character, include them.`
     });
     
     const response = await anthropic.messages.create({
