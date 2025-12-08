@@ -524,10 +524,25 @@ STEP 2 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, FR3, etc.), use those exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4, 5, 6...
 
-STEP 3 - CONTINUITY:
-For each frame, determine if it CONTINUES the previous frame (same shot) or is a CUT (new shot).
-- CONTINUES: same background, camera move, evolving action, same characters in motion
-- CUT: different location, new scene, different characters, clear scene break
+STEP 3 - SHOT CONTINUITY (CRITICAL):
+Determine if each frame is the SAME SHOT or a NEW SHOT compared to the previous frame.
+
+SAME SHOT (continuesPrevious: true) - frames belong together if:
+- Same camera setup/angle (shot from same position, same lens perspective)
+- Same visual POV (e.g., multiple frames all looking out from inside a fridge)
+- Camera move within one take (push in, pan, dolly)
+- Same background/environment FROM THE SAME ANGLE
+- Action evolving but camera position unchanged
+
+NEW SHOT (continuesPrevious: false) - it's a cut if:
+- Camera angle changes (wide to close-up, front to side, reverse angle)
+- Different POV or perspective (even in same scene)
+- Cutaway or insert (product shot, reaction shot, detail shot)
+- Different location or scene
+- Any clear editorial cut point
+
+IMPORTANT: Two frames showing the same characters from DIFFERENT ANGLES are DIFFERENT SHOTS.
+Two frames from the SAME CAMERA POSITION with different action are the SAME SHOT.
 
 STEP 4 - EXTRACT:
 Return JSON:
@@ -541,19 +556,12 @@ Return JSON:
       "continuesPrevious": false,
       "description": "Action/direction text",
       "dialog": "CHARACTER: Spoken lines..."
-    },
-    {
-      "frameNumber": "2",
-      "continuesPrevious": true,
-      "description": "Camera pushes in as he turns",
-      "dialog": ""
     }
   ]
 }
 
 RULES:
-- continuesPrevious: true if this frame is part of the same uninterrupted shot as previous
-- First frame on page is always continuesPrevious: false
+- First frame on page: continuesPrevious is false
 - description: action/camera direction text near the frame
 - dialog: spoken lines with character name prefix
 - Skip completely empty frames` }
