@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
 Simple rectangle detector for storyboard frames.
-Finds black-bordered rectangles. That's it.
+Finds black-bordered rectangles - the actual illustration frames, not outer containers.
 """
-
 import cv2
 import numpy as np
 import json
@@ -11,7 +10,7 @@ import sys
 import base64
 
 def detect_rectangles(image_path):
-    """Find black rectangles in the image, even if borders are slightly broken."""
+    """Find black rectangles in the image, preferring inner frames over containers."""
     
     img = cv2.imread(image_path)
     if img is None:
@@ -27,14 +26,21 @@ def detect_rectangles(image_path):
     kernel = np.ones((5, 5), np.uint8)
     dilated = cv2.dilate(thresh, kernel, iterations=2)
     
-    # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find ALL contours with hierarchy (not just external)
+    contours, hierarchy = cv2.findContours(dilated, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if hierarchy is None:
+        return []
+    
+    hierarchy = hierarchy[0]  # Unwrap
     
     rectangles = []
     min_area = (width * height) * 0.01   # At least 1% of image
     max_area = (width * height) * 0.5    # At most 50% of image
     
-    for contour in contours:
+    candidates = []
+    
+    for i, contour in enumerate(contours):
         area = cv2.contourArea(contour)
         if area < min_area or area > max_area:
             continue
@@ -57,17 +63,69 @@ def detect_rectangles(image_path):
         if fill_ratio < 0.3:  # Too irregular, not a rectangle
             continue
         
-        rectangles.append({
+        # Check hierarchy: [next, prev, first_child, parent]
+        has_parent = hierarchy[i][3] != -1
+        has_child = hierarchy[i][2] != -1
+        
+        candidates.append({
             'x': int(x),
             'y': int(y),
             'width': int(w),
-            'height': int(h)
+            'height': int(h),
+            'area': area,
+            'has_parent': has_parent,
+            'has_child': has_child,
+            'index': i
         })
     
-    # Sort: top to bottom, then left to right (reading order)
-    rectangles.sort(key=lambda r: (r['y'] // 80, r['x']))
+    # Filter: if a rectangle contains another rectangle, check if outer is a container
+    # (has whitespace/text below inner) vs parallax (artwork fills the space)
+    final_rects = []
     
-    return rectangles
+    for cand in candidates:
+        dominated = False
+        for other in candidates:
+            if other['index'] == cand['index']:
+                continue
+            
+            # Check if cand contains other (other is inside cand)
+            if (other['x'] >= cand['x'] and 
+                other['y'] >= cand['y'] and
+                other['x'] + other['width'] <= cand['x'] + cand['width'] and
+                other['y'] + other['height'] <= cand['y'] + cand['height']):
+                
+                # Inner must be substantial (not noise)
+                if other['area'] < cand['area'] * 0.3:
+                    continue
+                
+                # Check the gap below the inner rectangle
+                # If there's significant space below, outer is likely a container with text
+                gap_below = (cand['y'] + cand['height']) - (other['y'] + other['height'])
+                gap_ratio = gap_below / cand['height'] if cand['height'] > 0 else 0
+                
+                # Also check if inner frame is near the top of outer (container pattern)
+                gap_above = other['y'] - cand['y']
+                gap_above_ratio = gap_above / cand['height'] if cand['height'] > 0 else 0
+                
+                # Container pattern: inner near top, significant gap below (for text)
+                # Parallax pattern: inner fills most of outer, gaps are similar on all sides
+                if gap_ratio > 0.1 and gap_above_ratio < 0.05:
+                    # Looks like container - frame at top, text area below
+                    dominated = True
+                    break
+        
+        if not dominated:
+            final_rects.append({
+                'x': cand['x'],
+                'y': cand['y'],
+                'width': cand['width'],
+                'height': cand['height']
+            })
+    
+    # Sort: top to bottom, then left to right (reading order)
+    final_rects.sort(key=lambda r: (r['y'] // 80, r['x']))
+    
+    return final_rects
 
 
 def crop_rectangles(image_path, rectangles):
