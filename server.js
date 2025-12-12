@@ -638,7 +638,9 @@ function groupIntoShots(frames) {
     shotNumber: g.shotNumber,
     frames: g.frames,
     images: g.images,
-    description: g.descriptions.join('\n'),
+    descriptions: g.descriptions,  // Keep as array for per-image tracking
+    dialogs: g.dialogs,            // Keep as array for per-image tracking
+    description: g.descriptions.join('\n'),  // Combined for display
     dialog: g.dialogs.join('\n'),
     combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n')
   }));
