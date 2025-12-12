@@ -521,13 +521,22 @@ Look for the COMMERCIAL/PROJECT TITLE at the top of the page (e.g., "BRAND - PRO
 This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within the commercial.
 
 STEP 2 - GRID LAYOUT:
-Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
+Identify the grid structure. Count rows and columns of frames.
+Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM (like reading a book).
 
-STEP 3 - FRAME NUMBERS:
+STEP 3 - SPATIAL MATCHING (CRITICAL):
+For each frame, identify its GRID POSITION (row, column) starting from 1.
+Text ALWAYS belongs to the image that is SPATIALLY CLOSEST to it.
+- Text below an image belongs to that image
+- Text beside an image belongs to that image
+- NEVER cross column boundaries when matching text to images
+- If a row has 3 images, it has 3 text blocks - one for each image
+
+STEP 4 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
-STEP 4 - EXTRACT:
+STEP 5 - EXTRACT:
 Return JSON:
 {
   "spotName": "BRAND - PRODUCT :30" or null,
@@ -535,18 +544,31 @@ Return JSON:
   "hasVisibleNumbers": true/false,
   "frames": [
     {
+      "row": 1,
+      "column": 1,
       "frameNumber": "1",
       "description": "Action/direction text",
       "dialog": "CHARACTER: Spoken lines..."
+    },
+    {
+      "row": 1,
+      "column": 2,
+      "frameNumber": "2",
+      "description": "Next frame action",
+      "dialog": ""
     }
   ]
 }
 
-RULES:
+CRITICAL RULES:
+- row: which horizontal row (1 = top row, 2 = second row, etc.)
+- column: which vertical column (1 = leftmost, 2 = middle, 3 = rightmost, etc.)
+- Text belongs to the NEAREST image - match by spatial proximity
+- Each image gets its OWN text entry - don't combine multiple images' text
 - spotName: Commercial title only, NOT scene headers
-- description: action/camera direction text
+- description: action/camera direction text for THIS specific frame
 - dialog: spoken lines with character prefix
-- Skip empty frames` }
+- Skip completely empty frames` }
       ]
     }]
   });
@@ -759,16 +781,28 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       if (textData.spotName) currentSpot = textData.spotName;
       
       const textFrames = textData.frames || [];
+      const rectangles = detected.rectangles || [];
       const images = detected.images || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
       
-      const maxLen = Math.max(textFrames.length, images.length);
+      // Sort text frames by row, then column
+      const sortedTextFrames = [...textFrames].sort((a, b) => {
+        const rowDiff = (a.row || 1) - (b.row || 1);
+        if (rowDiff !== 0) return rowDiff;
+        return (a.column || 1) - (b.column || 1);
+      });
+      
+      // Rectangles are already sorted by (y // 80, x) in Python - same as (row, column)
+      // Match by position: both are in reading order now
+      const maxLen = Math.max(sortedTextFrames.length, images.length);
       for (let j = 0; j < maxLen; j++) {
-        const tf = textFrames[j] || {};
+        const tf = sortedTextFrames[j] || {};
         const img = images[j] || null;
         
         allFrames.push({
           frameNumber: tf.frameNumber || `${j + 1}`,
+          row: tf.row || Math.floor(j / 3) + 1,
+          column: tf.column || (j % 3) + 1,
           hasVisibleNumber: hasVisibleNumbers,
           description: tf.description || '',
           dialog: tf.dialog || '',
@@ -878,18 +912,28 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       
       console.log(`[Cast] Page ${pageNum}: ${detected.count} images, ${castData.members?.length || 0} members`);
       
-      // Match images to cast members
+      // Match images to cast members - sort by position
       const members = castData.members || [];
       const images = detected.images || [];
       
-      for (let j = 0; j < members.length; j++) {
-        const member = members[j];
+      // Sort members by row, then column
+      const sortedMembers = [...members].sort((a, b) => {
+        const rowDiff = (a.row || 1) - (b.row || 1);
+        if (rowDiff !== 0) return rowDiff;
+        return (a.column || 1) - (b.column || 1);
+      });
+      
+      // Images are already sorted by (y // 80, x) in Python - same as (row, column)
+      for (let j = 0; j < Math.max(sortedMembers.length, images.length); j++) {
+        const member = sortedMembers[j] || {};
         const img = images[j] || null;
         
         allCast.push({
           actorName: member.actorName || '',
           characterName: member.characterName || '',
           role: member.role || '',
+          row: member.row,
+          column: member.column,
           image: img
         });
       }
@@ -927,15 +971,31 @@ async function extractCastText(imageBuffer) {
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
         { type: 'text', text: `Extract cast/talent information from this page.
 
+STEP 1 - GRID LAYOUT:
+Identify how headshots/photos are arranged. Count rows and columns.
+Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM (like reading a book).
+
+STEP 2 - SPATIAL MATCHING (CRITICAL):
+For each headshot, identify its GRID POSITION (row, column) starting from 1.
+Text/names ALWAYS belong to the NEAREST image.
+- Text below a headshot belongs to that headshot
+- Text beside a headshot belongs to that headshot
+- NEVER cross column boundaries when matching names to images
+- If a row has 4 headshots, it has 4 name blocks - one for each headshot
+
+STEP 3 - EXTRACT:
 For each headshot/photo, identify:
-1. ACTOR NAME - The real person's name
+1. ACTOR NAME - The real person's name (closest text to the headshot)
 2. CHARACTER NAME - The role they play (if shown)
 3. ROLE - Any role description (e.g., "BARTENDER", "GUY AT BAR")
 
 Return JSON:
 {
+  "gridLayout": "3x4",
   "members": [
     {
+      "row": 1,
+      "column": 1,
       "actorName": "John Smith",
       "characterName": "Detective Jones",
       "role": "Lead"
@@ -943,8 +1003,11 @@ Return JSON:
   ]
 }
 
-RULES:
-- List members in reading order (left-to-right, top-to-bottom)
+CRITICAL RULES:
+- row: which horizontal row (1 = top row, 2 = second row, etc.)
+- column: which vertical column (1 = leftmost, 2 = next, etc.)
+- Match names to the NEAREST headshot - use spatial proximity
+- Each headshot gets its OWN name entry - don't mix up names
 - actorName: The talent/actor's real name
 - characterName: The character they play (may be same as role, or empty)
 - role: Description like "BARTENDER", "MOM", etc.
