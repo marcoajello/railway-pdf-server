@@ -22,9 +22,9 @@ def detect_rectangles(image_path):
     # Threshold to get black lines (invert so lines are white)
     _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
     
-    # Dilate to connect broken lines - key for imperfect rectangles
-    kernel = np.ones((5, 5), np.uint8)
-    dilated = cv2.dilate(thresh, kernel, iterations=2)
+    # Light dilation to connect slightly broken lines - but not enough to bridge to text
+    kernel = np.ones((3, 3), np.uint8)
+    dilated = cv2.dilate(thresh, kernel, iterations=1)
     
     # Find contours
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
