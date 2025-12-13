@@ -866,32 +866,54 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       const imagePath = pageImages[i];
       const pageNum = i + 1;
       
-      console.log(`[Cast] Page ${pageNum}: analyzing...`);
+      console.log(`[Cast] Page ${pageNum}: detecting headshots...`);
       
       const imageBuffer = await fs.readFile(imagePath);
       
       // Detect rectangles (headshots)
       const detected = await detectRectangles(imagePath);
-      
-      // Use AI to extract actor/character names
-      const castData = await extractCastText(imageBuffer);
-      
-      console.log(`[Cast] Page ${pageNum}: ${detected.count} images, ${castData.members?.length || 0} members`);
-      
-      // Match images to cast members
-      const members = castData.members || [];
+      const rectangles = detected.rectangles || [];
       const images = detected.images || [];
       
-      for (let j = 0; j < members.length; j++) {
-        const member = members[j];
-        const img = images[j] || null;
+      console.log(`[Cast] Page ${pageNum}: found ${rectangles.length} headshots, identifying each...`);
+      
+      // For each detected headshot, ask AI to identify who it is
+      for (let j = 0; j < rectangles.length; j++) {
+        const rect = rectangles[j];
+        const headshot = images[j];
         
-        allCast.push({
-          actorName: member.actorName || '',
-          characterName: member.characterName || '',
-          role: member.role || '',
-          image: img
-        });
+        if (!headshot) continue;
+        
+        // Extract region around headshot (include area below/beside for text)
+        const margin = 150; // pixels to include around headshot for context
+        const imgMeta = await sharp(imageBuffer).metadata();
+        
+        const extractX = Math.max(0, rect.x - margin);
+        const extractY = Math.max(0, rect.y - margin);
+        const extractW = Math.min(rect.width + margin * 2, imgMeta.width - extractX);
+        const extractH = Math.min(rect.height + margin * 3, imgMeta.height - extractY); // More margin below for text
+        
+        const regionBuffer = await sharp(imageBuffer)
+          .extract({ left: extractX, top: extractY, width: extractW, height: extractH })
+          .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+        
+        try {
+          const castInfo = await identifyHeadshot(regionBuffer);
+          
+          if (castInfo.actorName) {
+            allCast.push({
+              actorName: castInfo.actorName || '',
+              characterName: castInfo.characterName || '',
+              role: castInfo.role || '',
+              image: headshot
+            });
+            console.log(`[Cast] Page ${pageNum}, headshot ${j + 1}: ${castInfo.actorName} - ${castInfo.role}`);
+          }
+        } catch (err) {
+          console.error(`[Cast] Page ${pageNum}, headshot ${j + 1}: identification failed -`, err.message);
+        }
       }
     }
     
@@ -908,60 +930,40 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
   }
 });
 
-// AI function to extract cast info from page
-async function extractCastText(imageBuffer) {
+// AI function to identify a single headshot from its surrounding region
+async function identifyHeadshot(regionBuffer) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not set');
   
-  const resized = await sharp(imageBuffer)
-    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 85 })
-    .toBuffer();
-  
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 4096,
+    max_tokens: 256,
     messages: [{
       role: 'user',
       content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
-        { type: 'text', text: `Extract cast/talent information from this page.
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: regionBuffer.toString('base64') } },
+        { type: 'text', text: `This image shows a headshot photo with a name/role label nearby (below, left, or right of the photo).
 
-CRITICAL: Match each headshot to the text DIRECTLY BELOW or BESIDE it. Do NOT use left-to-right reading order across the page. Each photo has its own caption/label positioned near it.
+Identify the person in this headshot by reading the text label closest to the photo.
 
-For each headshot/photo, identify:
-1. ACTOR NAME - The real person's name (often in a distinct color or italics)
-2. CHARACTER NAME / ROLE - The role they play (often in bold or caps, like "BARTENDER", "MOM")
+Return JSON only:
+{"actorName": "Their Name", "role": "THEIR ROLE", "characterName": ""}
 
-Return JSON:
-{
-  "members": [
-    {
-      "actorName": "John Smith",
-      "characterName": "Detective Jones", 
-      "role": "Lead"
-    }
-  ]
-}
+- actorName: The person's real name
+- role: Their role like "BARTENDER", "MOM", etc.
+- characterName: Character name if different from role, otherwise empty
 
-RULES:
-- ASSOCIATE each photo with the text CLOSEST to it (usually directly below)
-- Photos may be in irregular grid layouts - don't assume strict rows
-- actorName: The talent/actor's real name
-- characterName: The character they play (may be same as role, or empty)
-- role: Description like "BARTENDER", "MOM", etc.
-- Skip any photos without names` }
+If you cannot find a name label, return: {"actorName": "", "role": "", "characterName": ""}` }
       ]
     }]
   });
   
   const text = response.content[0].text;
-  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
   try {
-    return JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
+    return JSON.parse(jsonMatch ? jsonMatch[0] : '{}');
   } catch (e) {
-    console.error('[Cast] Text parse error');
-    return { members: [] };
+    return { actorName: '', role: '', characterName: '' };
   }
 }
 
