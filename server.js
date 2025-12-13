@@ -927,24 +927,26 @@ async function extractCastText(imageBuffer) {
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
         { type: 'text', text: `Extract cast/talent information from this page.
 
+CRITICAL: Match each headshot to the text DIRECTLY BELOW or BESIDE it. Do NOT use left-to-right reading order across the page. Each photo has its own caption/label positioned near it.
+
 For each headshot/photo, identify:
-1. ACTOR NAME - The real person's name
-2. CHARACTER NAME - The role they play (if shown)
-3. ROLE - Any role description (e.g., "BARTENDER", "GUY AT BAR")
+1. ACTOR NAME - The real person's name (often in a distinct color or italics)
+2. CHARACTER NAME / ROLE - The role they play (often in bold or caps, like "BARTENDER", "MOM")
 
 Return JSON:
 {
   "members": [
     {
       "actorName": "John Smith",
-      "characterName": "Detective Jones",
+      "characterName": "Detective Jones", 
       "role": "Lead"
     }
   ]
 }
 
 RULES:
-- List members in reading order (left-to-right, top-to-bottom)
+- ASSOCIATE each photo with the text CLOSEST to it (usually directly below)
+- Photos may be in irregular grid layouts - don't assume strict rows
 - actorName: The talent/actor's real name
 - characterName: The character they play (may be same as role, or empty)
 - role: Description like "BARTENDER", "MOM", etc.
