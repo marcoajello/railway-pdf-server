@@ -881,42 +881,46 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       
       console.log(`[Cast] Page ${pageNum}: found ${pageAnalysis.people.length} people`);
       
-      // For each person, crop a face-centered headshot
+      // For each person, crop their headshot photo
       for (const person of pageAnalysis.people) {
         try {
-          if (!person.face_center_x || !person.face_center_y) {
-            console.log(`[Cast] Skipping ${person.name}: no face location`);
+          // Check for photo bounds
+          if (person.photo_left === undefined || person.photo_top === undefined) {
+            console.log(`[Cast] Skipping ${person.name}: no photo bounds`);
             continue;
           }
           
           // Convert percentages to pixels
-          const faceCenterX = Math.round((person.face_center_x / 100) * imgMeta.width);
-          const faceCenterY = Math.round((person.face_center_y / 100) * imgMeta.height);
-          const faceSize = Math.round(((person.face_size || 8) / 100) * Math.min(imgMeta.width, imgMeta.height));
+          const photoLeft = Math.round((person.photo_left / 100) * imgMeta.width);
+          const photoTop = Math.round((person.photo_top / 100) * imgMeta.height);
+          const photoWidth = Math.round(((person.photo_width || 10) / 100) * imgMeta.width);
+          const photoHeight = Math.round(((person.photo_height || 12) / 100) * imgMeta.height);
           
-          // Calculate crop region centered on face
-          // Make it square and a bit larger than the face for good framing
-          const cropSize = Math.max(faceSize * 2.5, 150);
-          const halfCrop = Math.round(cropSize / 2);
+          // Validate and clamp bounds
+          let cropX = Math.max(0, photoLeft);
+          let cropY = Math.max(0, photoTop);
+          let cropW = Math.min(photoWidth, imgMeta.width - cropX);
+          let cropH = Math.min(photoHeight, imgMeta.height - cropY);
           
-          let cropX = Math.max(0, faceCenterX - halfCrop);
-          let cropY = Math.max(0, faceCenterY - halfCrop);
-          let cropW = Math.min(Math.round(cropSize), imgMeta.width - cropX);
-          let cropH = Math.min(Math.round(cropSize), imgMeta.height - cropY);
+          // Ensure minimum size
+          cropW = Math.max(cropW, 50);
+          cropH = Math.max(cropH, 50);
           
-          // Make it square
-          const minDim = Math.min(cropW, cropH);
-          cropW = minDim;
-          cropH = minDim;
+          // Re-validate after size adjustments
+          cropW = Math.min(cropW, imgMeta.width - cropX);
+          cropH = Math.min(cropH, imgMeta.height - cropY);
           
-          // Re-center after squaring
-          cropX = Math.max(0, Math.min(cropX, imgMeta.width - cropW));
-          cropY = Math.max(0, Math.min(cropY, imgMeta.height - cropH));
+          if (cropW < 20 || cropH < 20) {
+            console.log(`[Cast] Skipping ${person.name}: crop too small (${cropW}x${cropH})`);
+            continue;
+          }
           
-          // Crop and encode
+          console.log(`[Cast] Cropping ${person.name}: ${cropX},${cropY} ${cropW}x${cropH}`);
+          
+          // Crop and encode - resize to square for headshot
           const croppedBuffer = await sharp(imageBuffer)
             .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
-            .resize(300, 300, { fit: 'cover' })
+            .resize(300, 300, { fit: 'cover', position: 'top' }) // 'top' to favor face area
             .jpeg({ quality: 85 })
             .toBuffer();
           
@@ -952,7 +956,7 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
 
 /**
  * Analyze entire page to find all people with headshots
- * Returns name, role, and face center location as percentages
+ * Returns name, role, and photo bounding box as percentages
  */
 async function analyzePageForCast(imageBuffer) {
   const client = getAnthropicClient();
@@ -974,16 +978,20 @@ async function analyzePageForCast(imageBuffer) {
         { type: 'text', text: `Analyze this casting/talent page. Find EVERY person with a headshot photo.
 
 For EACH person, extract:
-1. Their NAME - look for text labels ABOVE, BELOW, or BESIDE each photo
-2. Their ROLE - job title, character name, or descriptor (e.g., "Medical Educator", "Electrician", "Mom")
-3. FACE CENTER - the center point of their face as X,Y percentages (0-100) from top-left
-4. FACE SIZE - approximate face width as percentage of image width
+1. NAME - look for text labels ABOVE, BELOW, or BESIDE each photo
+2. ROLE - job title, character name, or descriptor (e.g., "Medical Educator", "Electrician", "Mom")
+3. PHOTO BOUNDS - the bounding box of the PHOTO (not just the face) as percentages from top-left:
+   - photo_left: left edge X percentage (0-100)
+   - photo_top: top edge Y percentage (0-100)  
+   - photo_width: width as percentage of page width
+   - photo_height: height as percentage of page height
 
 IMPORTANT:
 - Names can appear ABOVE or BELOW the photo - check both
 - Some layouts are irregular - scan the entire page carefully
 - Include EVERYONE with a visible headshot photo
 - Ignore logos, product shots, or non-person images
+- The photo bounds should cover just the photo/image, not the text labels
 
 Return JSON only:
 {
@@ -991,16 +999,18 @@ Return JSON only:
     {
       "name": "Keith Cannon",
       "role": "Electrician", 
-      "face_center_x": 15,
-      "face_center_y": 25,
-      "face_size": 8
+      "photo_left": 2,
+      "photo_top": 12,
+      "photo_width": 12,
+      "photo_height": 15
     },
     {
       "name": "Greer Morrison",
       "role": "Medical Educator",
-      "face_center_x": 35,
-      "face_center_y": 22,
-      "face_size": 7
+      "photo_left": 18,
+      "photo_top": 14,
+      "photo_width": 10,
+      "photo_height": 12
     }
   ]
 }
