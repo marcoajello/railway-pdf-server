@@ -858,7 +858,7 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       pageImages = [imgPath];
     }
     
-    console.log(`[Cast] ${pageImages.length} page(s) - processing`);
+    console.log(`[Cast] ${pageImages.length} page(s) - processing with AI vision`);
     
     const allCast = [];
     
@@ -866,53 +866,73 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       const imagePath = pageImages[i];
       const pageNum = i + 1;
       
-      console.log(`[Cast] Page ${pageNum}: detecting headshots...`);
+      console.log(`[Cast] Page ${pageNum}: AI analyzing entire page...`);
       
       const imageBuffer = await fs.readFile(imagePath);
+      const imgMeta = await sharp(imageBuffer).metadata();
       
-      // Detect rectangles (headshots)
-      const detected = await detectRectangles(imagePath);
-      const rectangles = detected.rectangles || [];
-      const images = detected.images || [];
+      // Use AI to find ALL headshots on the page with their names and face locations
+      const pageAnalysis = await analyzePageForCast(imageBuffer);
       
-      console.log(`[Cast] Page ${pageNum}: found ${rectangles.length} headshots, identifying each...`);
+      if (!pageAnalysis.people || pageAnalysis.people.length === 0) {
+        console.log(`[Cast] Page ${pageNum}: no people found`);
+        continue;
+      }
       
-      // For each detected headshot, ask AI to identify who it is
-      for (let j = 0; j < rectangles.length; j++) {
-        const rect = rectangles[j];
-        const headshot = images[j];
-        
-        if (!headshot) continue;
-        
-        // Extract region around headshot (include area below/beside for text)
-        const margin = 150; // pixels to include around headshot for context
-        const imgMeta = await sharp(imageBuffer).metadata();
-        
-        const extractX = Math.max(0, rect.x - margin);
-        const extractY = Math.max(0, rect.y - margin);
-        const extractW = Math.min(rect.width + margin * 2, imgMeta.width - extractX);
-        const extractH = Math.min(rect.height + margin * 3, imgMeta.height - extractY); // More margin below for text
-        
-        const regionBuffer = await sharp(imageBuffer)
-          .extract({ left: extractX, top: extractY, width: extractW, height: extractH })
-          .resize(800, 800, { fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 85 })
-          .toBuffer();
-        
+      console.log(`[Cast] Page ${pageNum}: found ${pageAnalysis.people.length} people`);
+      
+      // For each person, crop a face-centered headshot
+      for (const person of pageAnalysis.people) {
         try {
-          const castInfo = await identifyHeadshot(regionBuffer);
-          
-          if (castInfo.actorName) {
-            allCast.push({
-              actorName: castInfo.actorName || '',
-              characterName: castInfo.characterName || '',
-              role: castInfo.role || '',
-              image: headshot
-            });
-            console.log(`[Cast] Page ${pageNum}, headshot ${j + 1}: ${castInfo.actorName} - ${castInfo.role}`);
+          if (!person.face_center_x || !person.face_center_y) {
+            console.log(`[Cast] Skipping ${person.name}: no face location`);
+            continue;
           }
-        } catch (err) {
-          console.error(`[Cast] Page ${pageNum}, headshot ${j + 1}: identification failed -`, err.message);
+          
+          // Convert percentages to pixels
+          const faceCenterX = Math.round((person.face_center_x / 100) * imgMeta.width);
+          const faceCenterY = Math.round((person.face_center_y / 100) * imgMeta.height);
+          const faceSize = Math.round(((person.face_size || 8) / 100) * Math.min(imgMeta.width, imgMeta.height));
+          
+          // Calculate crop region centered on face
+          // Make it square and a bit larger than the face for good framing
+          const cropSize = Math.max(faceSize * 2.5, 150);
+          const halfCrop = Math.round(cropSize / 2);
+          
+          let cropX = Math.max(0, faceCenterX - halfCrop);
+          let cropY = Math.max(0, faceCenterY - halfCrop);
+          let cropW = Math.min(Math.round(cropSize), imgMeta.width - cropX);
+          let cropH = Math.min(Math.round(cropSize), imgMeta.height - cropY);
+          
+          // Make it square
+          const minDim = Math.min(cropW, cropH);
+          cropW = minDim;
+          cropH = minDim;
+          
+          // Re-center after squaring
+          cropX = Math.max(0, Math.min(cropX, imgMeta.width - cropW));
+          cropY = Math.max(0, Math.min(cropY, imgMeta.height - cropH));
+          
+          // Crop and encode
+          const croppedBuffer = await sharp(imageBuffer)
+            .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+            .resize(300, 300, { fit: 'cover' })
+            .jpeg({ quality: 85 })
+            .toBuffer();
+          
+          const headshot = croppedBuffer.toString('base64');
+          
+          allCast.push({
+            actorName: person.name || '',
+            characterName: '',
+            role: person.role || '',
+            image: headshot
+          });
+          
+          console.log(`[Cast] Page ${pageNum}: ${person.name} - ${person.role || 'no role'}`);
+          
+        } catch (cropErr) {
+          console.error(`[Cast] Failed to crop ${person.name}:`, cropErr.message);
         }
       }
     }
@@ -930,30 +950,62 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
   }
 });
 
-// AI function to identify a single headshot from its surrounding region
-async function identifyHeadshot(regionBuffer) {
+/**
+ * Analyze entire page to find all people with headshots
+ * Returns name, role, and face center location as percentages
+ */
+async function analyzePageForCast(imageBuffer) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not set');
   
+  // Resize for API
+  const resized = await sharp(imageBuffer)
+    .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 85 })
+    .toBuffer();
+  
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 256,
+    max_tokens: 2000,
     messages: [{
       role: 'user',
       content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: regionBuffer.toString('base64') } },
-        { type: 'text', text: `This image shows a headshot photo with a name/role label nearby (below, left, or right of the photo).
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
+        { type: 'text', text: `Analyze this casting/talent page. Find EVERY person with a headshot photo.
 
-Identify the person in this headshot by reading the text label closest to the photo.
+For EACH person, extract:
+1. Their NAME - look for text labels ABOVE, BELOW, or BESIDE each photo
+2. Their ROLE - job title, character name, or descriptor (e.g., "Medical Educator", "Electrician", "Mom")
+3. FACE CENTER - the center point of their face as X,Y percentages (0-100) from top-left
+4. FACE SIZE - approximate face width as percentage of image width
+
+IMPORTANT:
+- Names can appear ABOVE or BELOW the photo - check both
+- Some layouts are irregular - scan the entire page carefully
+- Include EVERYONE with a visible headshot photo
+- Ignore logos, product shots, or non-person images
 
 Return JSON only:
-{"actorName": "Their Name", "role": "THEIR ROLE", "characterName": ""}
+{
+  "people": [
+    {
+      "name": "Keith Cannon",
+      "role": "Electrician", 
+      "face_center_x": 15,
+      "face_center_y": 25,
+      "face_size": 8
+    },
+    {
+      "name": "Greer Morrison",
+      "role": "Medical Educator",
+      "face_center_x": 35,
+      "face_center_y": 22,
+      "face_size": 7
+    }
+  ]
+}
 
-- actorName: The person's real name
-- role: Their role like "BARTENDER", "MOM", etc.
-- characterName: Character name if different from role, otherwise empty
-
-If you cannot find a name label, return: {"actorName": "", "role": "", "characterName": ""}` }
+Find ALL people. Do not skip anyone with a visible headshot.` }
       ]
     }]
   });
@@ -961,9 +1013,10 @@ If you cannot find a name label, return: {"actorName": "", "role": "", "characte
   const text = response.content[0].text;
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   try {
-    return JSON.parse(jsonMatch ? jsonMatch[0] : '{}');
+    return JSON.parse(jsonMatch ? jsonMatch[0] : '{"people":[]}');
   } catch (e) {
-    return { actorName: '', role: '', characterName: '' };
+    console.error('[Cast] Page analysis parse error:', e.message);
+    return { people: [] };
   }
 }
 
