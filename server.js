@@ -1243,4 +1243,183 @@ app.listen(PORT, () => {
   console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Auto-tag batch: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Shot list import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+});
+
+// ============================================================================
+// SHOT LIST EXTRACTION
+// ============================================================================
+
+/**
+ * Extract shot list data from a page image using Claude Vision
+ */
+async function extractShotsFromImage(imageBase64, pageNumber, isFirstPage) {
+  const client = getAnthropicClient();
+  if (!client) throw new Error('ANTHROPIC_API_KEY not set');
+  
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4096,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/jpeg',
+              data: imageBase64
+            }
+          },
+          {
+            type: 'text',
+            text: `Extract the shot list from this document page.
+
+This is page ${pageNumber}${isFirstPage ? ' (first page - may have title/header)' : ''}.
+
+For each shot/scene entry, extract:
+- number: Shot number (e.g., "1", "1A", "SC 5", "SHOT 12"). If unnumbered, use null.
+- description: The action, staging, or visual description
+- scene: Scene/location name if mentioned (optional)
+- camera: Camera direction/movement if specified (optional) 
+- duration: Timing if specified (optional)
+- notes: Any additional notes (optional)
+
+Return JSON only:
+{
+  "documentTitle": "Title from header if visible, else null",
+  "shots": [
+    {
+      "number": "1",
+      "description": "Wide shot of exterior building at dawn",
+      "scene": "EXT. OFFICE - DAY",
+      "camera": "DOLLY IN",
+      "duration": "3s",
+      "notes": null
+    }
+  ]
+}
+
+RULES:
+- Include ALL shots visible on the page
+- Preserve original numbering exactly as written
+- If it's a title page with no shots, return empty shots array
+- If text is unclear, make best effort to transcribe
+- Keep descriptions concise but complete`
+          }
+        ]
+      }
+    ]
+  });
+  
+  const text = response.content[0].text;
+  
+  let jsonStr = text;
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (jsonMatch) {
+    jsonStr = jsonMatch[1];
+  }
+  
+  try {
+    return JSON.parse(jsonStr.trim());
+  } catch (e) {
+    console.error('[ShotList] Parse error page', pageNumber, e.message);
+    return { documentTitle: null, shots: [] };
+  }
+}
+
+app.post('/api/extract-shotlist', upload.single('pdf'), async (req, res) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'shotlist-'));
+  
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+    }
+    
+    const mimeType = req.file.mimetype;
+    const isPdf = mimeType === 'application/pdf';
+    const isImage = mimeType.startsWith('image/');
+    
+    if (!isPdf && !isImage) {
+      return res.status(400).json({ error: 'File must be PDF or image' });
+    }
+    
+    console.log('[ShotList] Processing:', req.file.originalname);
+    const startTime = Date.now();
+    
+    const imageDir = path.join(tempDir, 'images');
+    await fs.mkdir(imageDir, { recursive: true });
+    
+    let pageImages = [];
+    
+    if (isPdf) {
+      // Reuse pdfToImages from storyboard
+      pageImages = await pdfToImages(req.file.buffer, imageDir);
+      console.log(`[ShotList] ${pageImages.length} pages`);
+    } else {
+      // Single image
+      const ext = mimeType.includes('png') ? 'png' : 'jpg';
+      const imagePath = path.join(imageDir, `input.${ext}`);
+      await sharp(req.file.buffer).jpeg({ quality: 85 }).toFile(imagePath);
+      pageImages = [imagePath];
+    }
+    
+    const allShots = [];
+    let documentTitle = null;
+    
+    for (let i = 0; i < pageImages.length; i++) {
+      console.log(`[ShotList] Page ${i + 1}/${pageImages.length}`);
+      
+      const imageBuffer = await fs.readFile(pageImages[i]);
+      const imageBase64 = imageBuffer.toString('base64');
+      
+      const pageData = await extractShotsFromImage(imageBase64, i + 1, i === 0);
+      
+      // Capture title from first page if found
+      if (i === 0 && pageData.documentTitle) {
+        documentTitle = pageData.documentTitle;
+      }
+      
+      // Add page reference to each shot
+      for (const shot of (pageData.shots || [])) {
+        allShots.push({
+          ...shot,
+          page: i + 1
+        });
+      }
+      
+      console.log(`[ShotList] Page ${i + 1}: ${pageData.shots?.length || 0} shots`);
+    }
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[ShotList] Total: ${allShots.length} shots (${elapsed}s)`);
+    
+    // Auto-number if no numbers found
+    const hasNumbers = allShots.some(s => s.number);
+    if (!hasNumbers) {
+      allShots.forEach((shot, idx) => {
+        shot.number = String(idx + 1);
+        shot.autoNumbered = true;
+      });
+    }
+    
+    res.json({
+      documentTitle,
+      totalPages: pageImages.length,
+      shots: allShots
+    });
+    
+  } catch (error) {
+    console.error('[ShotList] Error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    try { 
+      await fs.rm(tempDir, { recursive: true, force: true }); 
+    } catch (e) {}
+  }
 });
