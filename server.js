@@ -858,7 +858,7 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       pageImages = [imgPath];
     }
     
-    console.log(`[Cast] ${pageImages.length} page(s) - processing with AI vision`);
+    console.log(`[Cast] ${pageImages.length} page(s) - processing`);
     
     const allCast = [];
     
@@ -866,78 +866,45 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       const imagePath = pageImages[i];
       const pageNum = i + 1;
       
-      console.log(`[Cast] Page ${pageNum}: AI analyzing entire page...`);
+      console.log(`[Cast] Page ${pageNum}: analyzing...`);
       
       const imageBuffer = await fs.readFile(imagePath);
-      const imgMeta = await sharp(imageBuffer).metadata();
       
-      // Use AI to find ALL headshots on the page with their names and face locations
-      const pageAnalysis = await analyzePageForCast(imageBuffer);
+      // Detect rectangles (headshots)
+      const detected = await detectRectangles(imagePath);
       
-      if (!pageAnalysis.people || pageAnalysis.people.length === 0) {
-        console.log(`[Cast] Page ${pageNum}: no people found`);
-        continue;
-      }
+      // Use AI to extract actor/character names
+      const castData = await extractCastText(imageBuffer);
       
-      console.log(`[Cast] Page ${pageNum}: found ${pageAnalysis.people.length} people`);
+      console.log(`[Cast] Page ${pageNum}: ${detected.count} images, ${castData.members?.length || 0} members`);
       
-      // For each person, crop their headshot photo
-      for (const person of pageAnalysis.people) {
-        try {
-          // Check for photo bounds
-          if (person.photo_left === undefined || person.photo_top === undefined) {
-            console.log(`[Cast] Skipping ${person.name}: no photo bounds`);
-            continue;
+      // Match images to cast members
+      const members = castData.members || [];
+      const images = detected.images || [];
+      
+      for (let j = 0; j < members.length; j++) {
+        const member = members[j];
+        let img = images[j] || null;
+        
+        // If we have an image, try to crop to the face
+        if (img) {
+          try {
+            const croppedImg = await cropToFace(img);
+            if (croppedImg) {
+              img = croppedImg;
+              console.log(`[Cast] Cropped face for ${member.actorName}`);
+            }
+          } catch (e) {
+            console.log(`[Cast] Face crop failed for ${member.actorName}:`, e.message);
           }
-          
-          // Convert percentages to pixels
-          const photoLeft = Math.round((person.photo_left / 100) * imgMeta.width);
-          const photoTop = Math.round((person.photo_top / 100) * imgMeta.height);
-          const photoWidth = Math.round(((person.photo_width || 10) / 100) * imgMeta.width);
-          const photoHeight = Math.round(((person.photo_height || 12) / 100) * imgMeta.height);
-          
-          // Validate and clamp bounds
-          let cropX = Math.max(0, photoLeft);
-          let cropY = Math.max(0, photoTop);
-          let cropW = Math.min(photoWidth, imgMeta.width - cropX);
-          let cropH = Math.min(photoHeight, imgMeta.height - cropY);
-          
-          // Ensure minimum size
-          cropW = Math.max(cropW, 50);
-          cropH = Math.max(cropH, 50);
-          
-          // Re-validate after size adjustments
-          cropW = Math.min(cropW, imgMeta.width - cropX);
-          cropH = Math.min(cropH, imgMeta.height - cropY);
-          
-          if (cropW < 20 || cropH < 20) {
-            console.log(`[Cast] Skipping ${person.name}: crop too small (${cropW}x${cropH})`);
-            continue;
-          }
-          
-          console.log(`[Cast] Cropping ${person.name}: ${cropX},${cropY} ${cropW}x${cropH}`);
-          
-          // Crop and encode - resize to square for headshot
-          const croppedBuffer = await sharp(imageBuffer)
-            .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
-            .resize(300, 300, { fit: 'cover', position: 'top' }) // 'top' to favor face area
-            .jpeg({ quality: 85 })
-            .toBuffer();
-          
-          const headshot = croppedBuffer.toString('base64');
-          
-          allCast.push({
-            actorName: person.name || '',
-            characterName: '',
-            role: person.role || '',
-            image: headshot
-          });
-          
-          console.log(`[Cast] Page ${pageNum}: ${person.name} - ${person.role || 'no role'}`);
-          
-        } catch (cropErr) {
-          console.error(`[Cast] Failed to crop ${person.name}:`, cropErr.message);
         }
+        
+        allCast.push({
+          actorName: member.actorName || '',
+          characterName: member.characterName || '',
+          role: member.role || '',
+          image: img
+        });
       }
     }
     
@@ -954,79 +921,133 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
   }
 });
 
-/**
- * Analyze entire page to find all people with headshots
- * Returns name, role, and photo bounding box as percentages
- */
-async function analyzePageForCast(imageBuffer) {
+// Crop image to face using Claude vision
+async function cropToFace(base64Image) {
+  const client = getAnthropicClient();
+  if (!client) return null;
+  
+  try {
+    // First, ask Claude where the face is
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
+          { type: 'text', text: `Find the headshot/face in this image. Return coordinates as percentages (0-100).
+
+Reply with ONLY JSON, no other text:
+{"x": 50, "y": 30, "size": 40}
+
+Where:
+- x: horizontal center of face (0=left edge, 100=right edge)
+- y: vertical center of face (0=top, 100=bottom)  
+- size: face width as percentage of image width
+
+If no face found, return {"x": 50, "y": 35, "size": 60}` }
+        ]
+      }]
+    });
+    
+    const text = response.content?.[0]?.text || '';
+    const jsonMatch = text.match(/\{[^}]+\}/);
+    if (!jsonMatch) return null;
+    
+    const coords = JSON.parse(jsonMatch[0]);
+    console.log(`[Cast] Face detected at: x=${coords.x}%, y=${coords.y}%, size=${coords.size}%`);
+    
+    // Decode the base64 image and crop to face
+    const imageBuffer = Buffer.from(base64Image, 'base64');
+    const metadata = await sharp(imageBuffer).metadata();
+    
+    const imgWidth = metadata.width;
+    const imgHeight = metadata.height;
+    
+    // Calculate crop box (centered on face, square)
+    const faceX = (coords.x / 100) * imgWidth;
+    const faceY = (coords.y / 100) * imgHeight;
+    const faceSize = (coords.size / 100) * imgWidth;
+    
+    // Make square crop around face with some margin
+    const cropSize = Math.min(Math.round(faceSize * 1.4), Math.min(imgWidth, imgHeight));
+    const cropX = Math.max(0, Math.round(faceX - cropSize / 2));
+    const cropY = Math.max(0, Math.round(faceY - cropSize / 2));
+    
+    // Ensure crop doesn't exceed image bounds
+    const finalX = Math.min(cropX, imgWidth - cropSize);
+    const finalY = Math.min(cropY, imgHeight - cropSize);
+    const finalSize = Math.min(cropSize, imgWidth - finalX, imgHeight - finalY);
+    
+    if (finalSize < 50) return null; // Too small
+    
+    // Crop and return as base64
+    const croppedBuffer = await sharp(imageBuffer)
+      .extract({ left: Math.max(0, finalX), top: Math.max(0, finalY), width: finalSize, height: finalSize })
+      .resize(300, 300, { fit: 'cover' })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+    
+    return croppedBuffer.toString('base64');
+    
+  } catch (e) {
+    console.error('[Cast] cropToFace error:', e.message);
+    return null;
+  }
+}
+
+// AI function to extract cast info from page
+async function extractCastText(imageBuffer) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not set');
   
-  // Resize for API
   const resized = await sharp(imageBuffer)
-    .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 85 })
     .toBuffer();
   
   const response = await client.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
+    max_tokens: 4096,
     messages: [{
       role: 'user',
       content: [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
-        { type: 'text', text: `Analyze this casting/talent page. Find EVERY person with a headshot photo.
+        { type: 'text', text: `Extract cast/talent information from this page.
 
-For EACH person, extract:
-1. NAME - look for text labels ABOVE, BELOW, or BESIDE each photo
-2. ROLE - job title, character name, or descriptor (e.g., "Medical Educator", "Electrician", "Mom")
-3. PHOTO BOUNDS - the bounding box of the PHOTO (not just the face) as percentages from top-left:
-   - photo_left: left edge X percentage (0-100)
-   - photo_top: top edge Y percentage (0-100)  
-   - photo_width: width as percentage of page width
-   - photo_height: height as percentage of page height
+For each headshot/photo, identify:
+1. ACTOR NAME - The real person's name
+2. CHARACTER NAME - The role they play (if shown)
+3. ROLE - Any role description (e.g., "BARTENDER", "GUY AT BAR")
 
-IMPORTANT:
-- Names can appear ABOVE or BELOW the photo - check both
-- Some layouts are irregular - scan the entire page carefully
-- Include EVERYONE with a visible headshot photo
-- Ignore logos, product shots, or non-person images
-- The photo bounds should cover just the photo/image, not the text labels
-
-Return JSON only:
+Return JSON:
 {
-  "people": [
+  "members": [
     {
-      "name": "Keith Cannon",
-      "role": "Electrician", 
-      "photo_left": 2,
-      "photo_top": 12,
-      "photo_width": 12,
-      "photo_height": 15
-    },
-    {
-      "name": "Greer Morrison",
-      "role": "Medical Educator",
-      "photo_left": 18,
-      "photo_top": 14,
-      "photo_width": 10,
-      "photo_height": 12
+      "actorName": "John Smith",
+      "characterName": "Detective Jones",
+      "role": "Lead"
     }
   ]
 }
 
-Find ALL people. Do not skip anyone with a visible headshot.` }
+RULES:
+- List members in reading order (left-to-right, top-to-bottom)
+- actorName: The talent/actor's real name
+- characterName: The character they play (may be same as role, or empty)
+- role: Description like "BARTENDER", "MOM", etc.
+- Skip any photos without names` }
       ]
     }]
   });
   
   const text = response.content[0].text;
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   try {
-    return JSON.parse(jsonMatch ? jsonMatch[0] : '{"people":[]}');
+    return JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
   } catch (e) {
-    console.error('[Cast] Page analysis parse error:', e.message);
-    return { people: [] };
+    console.error('[Cast] Text parse error');
+    return { members: [] };
   }
 }
 
@@ -1300,189 +1321,96 @@ VALIDATION:
   }
 });
 
+// Face detection endpoint - uses Claude vision to find face position in image
+app.post('/api/detect-face', async (req, res) => {
+  try {
+    const { image } = req.body; // base64 image
+    
+    if (!image) {
+      return res.status(400).json({ error: 'Image required' });
+    }
+    
+    if (!process.env.ANTHROPIC_API_KEY) {
+      // Return smart defaults if no API key
+      return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+    }
+    
+    console.log('[FaceDetect] Analyzing image...');
+    
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/jpeg',
+                data: image
+              }
+            },
+            {
+              type: 'text',
+              text: `Look at this image and find the main person's face. Return the face center position as x,y coordinates where 0,0 is top-left and 1,1 is bottom-right.
+
+Reply with ONLY a JSON object in this exact format, no other text:
+{"x": 0.5, "y": 0.3, "radius": 0.35}
+
+Where:
+- x: horizontal center of face (0-1, 0.5 = center)
+- y: vertical center of face (0-1, 0.3 = upper third)
+- radius: suggested crop radius (0.25-0.5)
+
+If no face found, return {"x": 0.5, "y": 0.35, "radius": 0.4}`
+            }
+          ]
+        }]
+      })
+    });
+    
+    if (!response.ok) {
+      console.error('[FaceDetect] API error:', response.status);
+      return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+    }
+    
+    const data = await response.json();
+    const text = data.content?.[0]?.text || '';
+    
+    try {
+      // Extract JSON from response
+      const jsonMatch = text.match(/\{[^}]+\}/);
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        console.log('[FaceDetect] Found face at:', result);
+        return res.json({ ...result, method: 'claude' });
+      }
+    } catch (e) {
+      console.error('[FaceDetect] Parse error:', e);
+    }
+    
+    // Fallback
+    return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+    
+  } catch (error) {
+    console.error('[FaceDetect] Error:', error.message);
+    return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server on port ${PORT}`);
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
   console.log(`Auto-tag batch: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Shot list import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-});
-
-// ============================================================================
-// SHOT LIST EXTRACTION
-// ============================================================================
-
-/**
- * Extract shot list data from a page image using Claude Vision
- */
-async function extractShotsFromImage(imageBase64, pageNumber, isFirstPage) {
-  const client = getAnthropicClient();
-  if (!client) throw new Error('ANTHROPIC_API_KEY not set');
-  
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 4096,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: 'image/jpeg',
-              data: imageBase64
-            }
-          },
-          {
-            type: 'text',
-            text: `Extract the shot list from this document page.
-
-This is page ${pageNumber}${isFirstPage ? ' (first page - may have title/header)' : ''}.
-
-For each shot/scene entry, extract:
-- number: Shot number (e.g., "1", "1A", "SC 5", "SHOT 12"). If unnumbered, use null.
-- description: The action, staging, or visual description
-- scene: Scene/location name if mentioned (optional)
-- camera: Camera direction/movement if specified (optional) 
-- duration: Timing if specified (optional)
-- notes: Any additional notes (optional)
-
-Return JSON only:
-{
-  "documentTitle": "Title from header if visible, else null",
-  "shots": [
-    {
-      "number": "1",
-      "description": "Wide shot of exterior building at dawn",
-      "scene": "EXT. OFFICE - DAY",
-      "camera": "DOLLY IN",
-      "duration": "3s",
-      "notes": null
-    }
-  ]
-}
-
-RULES:
-- Include ALL shots visible on the page
-- Preserve original numbering exactly as written
-- If it's a title page with no shots, return empty shots array
-- If text is unclear, make best effort to transcribe
-- Keep descriptions concise but complete`
-          }
-        ]
-      }
-    ]
-  });
-  
-  const text = response.content[0].text;
-  
-  let jsonStr = text;
-  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1];
-  }
-  
-  try {
-    return JSON.parse(jsonStr.trim());
-  } catch (e) {
-    console.error('[ShotList] Parse error page', pageNumber, e.message);
-    return { documentTitle: null, shots: [] };
-  }
-}
-
-app.post('/api/extract-shotlist', upload.single('pdf'), async (req, res) => {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'shotlist-'));
-  
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-    
-    if (!process.env.ANTHROPIC_API_KEY) {
-      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
-    }
-    
-    const mimeType = req.file.mimetype;
-    const isPdf = mimeType === 'application/pdf';
-    const isImage = mimeType.startsWith('image/');
-    
-    if (!isPdf && !isImage) {
-      return res.status(400).json({ error: 'File must be PDF or image' });
-    }
-    
-    console.log('[ShotList] Processing:', req.file.originalname);
-    const startTime = Date.now();
-    
-    const imageDir = path.join(tempDir, 'images');
-    await fs.mkdir(imageDir, { recursive: true });
-    
-    let pageImages = [];
-    
-    if (isPdf) {
-      // Reuse pdfToImages from storyboard
-      pageImages = await pdfToImages(req.file.buffer, imageDir);
-      console.log(`[ShotList] ${pageImages.length} pages`);
-    } else {
-      // Single image
-      const ext = mimeType.includes('png') ? 'png' : 'jpg';
-      const imagePath = path.join(imageDir, `input.${ext}`);
-      await sharp(req.file.buffer).jpeg({ quality: 85 }).toFile(imagePath);
-      pageImages = [imagePath];
-    }
-    
-    const allShots = [];
-    let documentTitle = null;
-    
-    for (let i = 0; i < pageImages.length; i++) {
-      console.log(`[ShotList] Page ${i + 1}/${pageImages.length}`);
-      
-      const imageBuffer = await fs.readFile(pageImages[i]);
-      const imageBase64 = imageBuffer.toString('base64');
-      
-      const pageData = await extractShotsFromImage(imageBase64, i + 1, i === 0);
-      
-      // Capture title from first page if found
-      if (i === 0 && pageData.documentTitle) {
-        documentTitle = pageData.documentTitle;
-      }
-      
-      // Add page reference to each shot
-      for (const shot of (pageData.shots || [])) {
-        allShots.push({
-          ...shot,
-          page: i + 1
-        });
-      }
-      
-      console.log(`[ShotList] Page ${i + 1}: ${pageData.shots?.length || 0} shots`);
-    }
-    
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[ShotList] Total: ${allShots.length} shots (${elapsed}s)`);
-    
-    // Auto-number if no numbers found
-    const hasNumbers = allShots.some(s => s.number);
-    if (!hasNumbers) {
-      allShots.forEach((shot, idx) => {
-        shot.number = String(idx + 1);
-        shot.autoNumbered = true;
-      });
-    }
-    
-    res.json({
-      documentTitle,
-      totalPages: pageImages.length,
-      shots: allShots
-    });
-    
-  } catch (error) {
-    console.error('[ShotList] Error:', error);
-    res.status(500).json({ error: error.message });
-  } finally {
-    try { 
-      await fs.rm(tempDir, { recursive: true, force: true }); 
-    } catch (e) {}
-  }
+  console.log(`Face detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
 });
