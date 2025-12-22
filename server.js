@@ -886,16 +886,16 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
         const member = members[j];
         let img = images[j] || null;
         
-        // If we have an image, try to crop to the face
+        // If we have an image, extract photo and find face
+        let faceData = null;
         if (img) {
           try {
-            const croppedImg = await cropToFace(img);
-            if (croppedImg) {
-              img = croppedImg;
-              console.log(`[Cast] Cropped face for ${member.actorName}`);
+            faceData = await extractFaceFromCell(img);
+            if (faceData) {
+              console.log(`[Cast] Face for ${member.actorName}: x=${faceData.faceX}, y=${faceData.faceY}`);
             }
           } catch (e) {
-            console.log(`[Cast] Face crop failed for ${member.actorName}:`, e.message);
+            console.log(`[Cast] Face extraction failed for ${member.actorName}:`, e.message);
           }
         }
         
@@ -903,7 +903,9 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
           actorName: member.actorName || '',
           characterName: member.characterName || '',
           role: member.role || '',
-          image: img
+          image: faceData?.image || img,
+          faceX: faceData?.faceX ?? 0.5,
+          faceY: faceData?.faceY ?? 0.5
         });
       }
     }
@@ -921,8 +923,8 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
   }
 });
 
-// Extract headshot from cell image, then crop to face
-async function cropToFace(base64Image) {
+// Extract photo from cell, find face, return image + coordinates
+async function extractFaceFromCell(base64Image) {
   const client = getAnthropicClient();
   if (!client) return null;
   
@@ -932,9 +934,9 @@ async function cropToFace(base64Image) {
     const imgWidth = metadata.width;
     const imgHeight = metadata.height;
     
-    console.log(`[Cast] Processing cell image: ${imgWidth}x${imgHeight}`);
+    console.log(`[Cast] Processing cell: ${imgWidth}x${imgHeight}`);
     
-    // STEP 1: Ask Claude to find the headshot photo BOUNDS within the cell
+    // STEP 1: Find photo bounds within the cell (excluding text/labels)
     const boundsResponse = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 300,
@@ -942,25 +944,14 @@ async function cropToFace(base64Image) {
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-          { type: 'text', text: `This is a casting sheet cell that contains a headshot photo and text labels.
+          { type: 'text', text: `This cell contains a headshot photo and possibly text labels.
 
-Find the PHOTO/HEADSHOT boundaries - I need to extract JUST the photo, excluding any text, labels, names, or annotations around it.
+Find the PHOTO boundaries - exclude any text, names, or labels.
 
-Return the photo bounds as percentages (0-100) of the image dimensions:
-
-Reply with ONLY JSON:
+Return percentages (0-100):
 {"left": 5, "top": 5, "right": 95, "bottom": 70}
 
-Where:
-- left: percentage from left edge where photo starts
-- top: percentage from top where photo starts  
-- right: percentage from left edge where photo ends
-- bottom: percentage from top where photo ends
-
-Example: If the photo takes the top 2/3 of the cell with small margins:
-{"left": 3, "top": 3, "right": 97, "bottom": 65}
-
-IMPORTANT: Find the actual photo edges, not the whole cell.` }
+Where left/top/right/bottom are the photo edges as percentages of image size.` }
         ]
       }]
     });
@@ -969,21 +960,21 @@ IMPORTANT: Find the actual photo edges, not the whole cell.` }
     const boundsMatch = boundsText.match(/\{[^}]+\}/);
     
     let extractedImage = imageBuffer;
+    let extractWidth = imgWidth;
+    let extractHeight = imgHeight;
     
     if (boundsMatch) {
       const bounds = JSON.parse(boundsMatch[0]);
-      console.log(`[Cast] Photo bounds: left=${bounds.left}%, top=${bounds.top}%, right=${bounds.right}%, bottom=${bounds.bottom}%`);
+      console.log(`[Cast] Photo bounds: L=${bounds.left}% T=${bounds.top}% R=${bounds.right}% B=${bounds.bottom}%`);
       
-      // Calculate pixel coordinates
       const left = Math.round((bounds.left / 100) * imgWidth);
       const top = Math.round((bounds.top / 100) * imgHeight);
       const right = Math.round((bounds.right / 100) * imgWidth);
       const bottom = Math.round((bounds.bottom / 100) * imgHeight);
       
-      const extractWidth = Math.max(50, right - left);
-      const extractHeight = Math.max(50, bottom - top);
+      extractWidth = Math.max(50, right - left);
+      extractHeight = Math.max(50, bottom - top);
       
-      // Extract just the photo region
       if (extractWidth > 50 && extractHeight > 50) {
         extractedImage = await sharp(imageBuffer)
           .extract({ 
@@ -993,15 +984,16 @@ IMPORTANT: Find the actual photo edges, not the whole cell.` }
             height: Math.min(extractHeight, imgHeight - top)
           })
           .toBuffer();
+        
+        const extMeta = await sharp(extractedImage).metadata();
+        extractWidth = extMeta.width;
+        extractHeight = extMeta.height;
         console.log(`[Cast] Extracted photo: ${extractWidth}x${extractHeight}`);
       }
-    } else {
-      console.log('[Cast] Could not parse photo bounds, using full image');
     }
     
-    // STEP 2: Now find the face center within the extracted photo
+    // STEP 2: Find face center within extracted photo
     const extractedBase64 = extractedImage.toString('base64');
-    const extractedMeta = await sharp(extractedImage).metadata();
     
     const faceResponse = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -1010,16 +1002,12 @@ IMPORTANT: Find the actual photo edges, not the whole cell.` }
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: extractedBase64 } },
-          { type: 'text', text: `Find the person's face CENTER (nose/septum area) for a circular crop.
+          { type: 'text', text: `Find the face CENTER (nose/septum) in this headshot.
 
-Return coordinates as percentages (0-100):
-
-Reply with ONLY JSON:
+Return percentages (0-100):
 {"x": 50, "y": 45}
 
-Where:
-- x: horizontal position of face center (0=left, 100=right)
-- y: vertical position of face center/nose (0=top, 100=bottom)` }
+Where x=horizontal position, y=vertical position of the nose.` }
         ]
       }]
     });
@@ -1027,51 +1015,23 @@ Where:
     const faceText = faceResponse.content?.[0]?.text || '';
     const faceMatch = faceText.match(/\{[^}]+\}/);
     
-    let centerX = 50, centerY = 45;
+    let faceX = 0.5, faceY = 0.5;
     if (faceMatch) {
       const face = JSON.parse(faceMatch[0]);
-      centerX = face.x;
-      centerY = face.y;
-      console.log(`[Cast] Face center: x=${centerX}%, y=${centerY}%`);
+      faceX = face.x / 100;
+      faceY = face.y / 100;
+      console.log(`[Cast] Face center: x=${(faceX*100).toFixed(0)}%, y=${(faceY*100).toFixed(0)}%`);
     }
     
-    // STEP 3: Create square crop centered on face
-    const extWidth = extractedMeta.width;
-    const extHeight = extractedMeta.height;
-    
-    const facePxX = (centerX / 100) * extWidth;
-    const facePxY = (centerY / 100) * extHeight;
-    
-    // Make the largest square possible centered on face
-    const maxSize = Math.min(extWidth, extHeight);
-    const cropSize = Math.round(maxSize * 0.9);
-    
-    let cropX = Math.round(facePxX - cropSize / 2);
-    let cropY = Math.round(facePxY - cropSize / 2);
-    
-    // Clamp to image bounds
-    cropX = Math.max(0, Math.min(cropX, extWidth - cropSize));
-    cropY = Math.max(0, Math.min(cropY, extHeight - cropSize));
-    
-    const finalSize = Math.min(cropSize, extWidth - cropX, extHeight - cropY);
-    
-    if (finalSize < 50) {
-      console.log('[Cast] Crop too small, returning extracted image');
-      return extractedBase64;
-    }
-    
-    // Final crop and resize
-    const croppedBuffer = await sharp(extractedImage)
-      .extract({ left: cropX, top: cropY, width: finalSize, height: finalSize })
-      .resize(300, 300, { fit: 'cover' })
-      .jpeg({ quality: 90 })
-      .toBuffer();
-    
-    console.log(`[Cast] Final headshot: 300x300 centered on face`);
-    return croppedBuffer.toString('base64');
+    // Return extracted photo + face coordinates
+    return {
+      image: extractedBase64,
+      faceX: faceX,
+      faceY: faceY
+    };
     
   } catch (e) {
-    console.error('[Cast] cropToFace error:', e.message);
+    console.error('[Cast] extractFaceFromCell error:', e.message);
     return null;
   }
 }
