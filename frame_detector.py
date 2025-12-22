@@ -64,10 +64,11 @@ def detect_rectangles(image_path):
         })
     
     # Sort: top to bottom, then left to right (reading order)
-    rectangles.sort(key=lambda r: (r['y'] // 80, r['x']))
+    # Use adaptive row threshold based on image height (10% of image height)
+    row_threshold = max(150, height // 10)
+    rectangles.sort(key=lambda r: (r['y'] // row_threshold, r['x']))
     
     return rectangles
-
 
 def crop_rectangles(image_path, rectangles):
     """Crop and return base64 images for each rectangle."""
@@ -91,7 +92,6 @@ def crop_rectangles(image_path, rectangles):
         images.append(base64.b64encode(buffer).decode('utf-8'))
     
     return images
-
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
