@@ -972,27 +972,32 @@ Where:
     
     const imgWidth = metadata.width;
     const imgHeight = metadata.height;
+    console.log(`[Cast] Image size: ${imgWidth}x${imgHeight}`);
     
     // Calculate crop box (centered on face, square)
     const faceX = (coords.x / 100) * imgWidth;
     const faceY = (coords.y / 100) * imgHeight;
     const faceSize = (coords.size / 100) * imgWidth;
+    console.log(`[Cast] Face pixel pos: x=${faceX.toFixed(0)}, y=${faceY.toFixed(0)}, size=${faceSize.toFixed(0)}`);
     
     // Make square crop around face center
     const cropSize = Math.min(Math.round(faceSize * 1.8), Math.min(imgWidth, imgHeight));
     const cropX = Math.max(0, Math.round(faceX - cropSize / 2));
     const cropY = Math.max(0, Math.round(faceY - cropSize / 2));
+    console.log(`[Cast] Initial crop box: x=${cropX}, y=${cropY}, size=${cropSize}`);
     
     // Ensure crop doesn't exceed image bounds
     const finalX = Math.min(cropX, imgWidth - cropSize);
     const finalY = Math.min(cropY, imgHeight - cropSize);
     const finalSize = Math.min(cropSize, imgWidth - finalX, imgHeight - finalY);
+    console.log(`[Cast] Final crop box: x=${finalX}, y=${finalY}, size=${finalSize}`);
     
     if (finalSize < 50) return null; // Too small
     
     // Calculate where the face center is in the CROPPED image (0-1 range)
     const faceXInCrop = (faceX - finalX) / finalSize;
     const faceYInCrop = (faceY - finalY) / finalSize;
+    console.log(`[Cast] Face in crop: x=${faceXInCrop.toFixed(2)}, y=${faceYInCrop.toFixed(2)}`);
     
     // Crop and resize
     const croppedBuffer = await sharp(imageBuffer)
