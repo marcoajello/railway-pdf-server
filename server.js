@@ -885,14 +885,18 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       for (let j = 0; j < members.length; j++) {
         const member = members[j];
         let img = images[j] || null;
+        let faceX = 0.5;
+        let faceY = 0.5;
         
         // If we have an image, try to crop to the face
         if (img) {
           try {
-            const croppedImg = await cropToFace(img);
-            if (croppedImg) {
-              img = croppedImg;
-              console.log(`[Cast] Cropped face for ${member.actorName}`);
+            const cropResult = await cropToFace(img);
+            if (cropResult) {
+              img = cropResult.image;
+              faceX = cropResult.faceX;
+              faceY = cropResult.faceY;
+              console.log(`[Cast] Cropped face for ${member.actorName} at x=${(faceX*100).toFixed(0)}%, y=${(faceY*100).toFixed(0)}%`);
             }
           } catch (e) {
             console.log(`[Cast] Face crop failed for ${member.actorName}:`, e.message);
@@ -903,7 +907,9 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
           actorName: member.actorName || '',
           characterName: member.characterName || '',
           role: member.role || '',
-          image: img
+          image: img,
+          faceX: faceX,
+          faceY: faceY
         });
       }
     }
@@ -922,6 +928,7 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
 });
 
 // Crop image to face using Claude vision
+// Returns { image: base64, faceX: 0-1, faceY: 0-1 } or null
 async function cropToFace(base64Image) {
   const client = getAnthropicClient();
   if (!client) return null;
@@ -937,19 +944,17 @@ async function cropToFace(base64Image) {
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
           { type: 'text', text: `Find the person's FACE in this image for a headshot crop.
 
-IMPORTANT: I need the position of the EYES (not the whole head or body). The crop should be centered on eye-level so the final circular crop shows forehead, eyes, nose, and mouth.
+I need the CENTER of the face (nose bridge area) for the crop circle center.
 
 Return coordinates as percentages (0-100).
 
 Reply with ONLY JSON, no other text:
-{"x": 50, "y": 25, "size": 35}
+{"x": 50, "y": 40, "size": 40}
 
 Where:
-- x: horizontal center of the face/eyes (0=left edge, 100=right edge)
-- y: vertical position of the EYES (0=top, 100=bottom) - typically 20-35 for headshots
-- size: face width as percentage of image width (typically 30-50)
-
-Example: A centered headshot with eyes in upper quarter: {"x": 50, "y": 25, "size": 40}` }
+- x: horizontal center of the face (0=left, 100=right)
+- y: vertical center of face at NOSE BRIDGE level (0=top, 100=bottom)
+- size: face width as percentage of image width` }
         ]
       }]
     });
@@ -973,11 +978,10 @@ Example: A centered headshot with eyes in upper quarter: {"x": 50, "y": 25, "siz
     const faceY = (coords.y / 100) * imgHeight;
     const faceSize = (coords.size / 100) * imgWidth;
     
-    // Make square crop around face - position eyes in upper third of crop
-    const cropSize = Math.min(Math.round(faceSize * 1.6), Math.min(imgWidth, imgHeight));
+    // Make square crop around face center
+    const cropSize = Math.min(Math.round(faceSize * 1.8), Math.min(imgWidth, imgHeight));
     const cropX = Math.max(0, Math.round(faceX - cropSize / 2));
-    // Offset Y so eyes are in upper third (not center) of final crop
-    const cropY = Math.max(0, Math.round(faceY - cropSize * 0.35));
+    const cropY = Math.max(0, Math.round(faceY - cropSize / 2));
     
     // Ensure crop doesn't exceed image bounds
     const finalX = Math.min(cropX, imgWidth - cropSize);
@@ -986,14 +990,22 @@ Example: A centered headshot with eyes in upper quarter: {"x": 50, "y": 25, "siz
     
     if (finalSize < 50) return null; // Too small
     
-    // Crop and return as base64
+    // Calculate where the face center is in the CROPPED image (0-1 range)
+    const faceXInCrop = (faceX - finalX) / finalSize;
+    const faceYInCrop = (faceY - finalY) / finalSize;
+    
+    // Crop and resize
     const croppedBuffer = await sharp(imageBuffer)
       .extract({ left: Math.max(0, finalX), top: Math.max(0, finalY), width: finalSize, height: finalSize })
       .resize(300, 300, { fit: 'cover' })
       .jpeg({ quality: 90 })
       .toBuffer();
     
-    return croppedBuffer.toString('base64');
+    return {
+      image: croppedBuffer.toString('base64'),
+      faceX: Math.max(0, Math.min(1, faceXInCrop)),
+      faceY: Math.max(0, Math.min(1, faceYInCrop))
+    };
     
   } catch (e) {
     console.error('[Cast] cropToFace error:', e.message);
@@ -1338,7 +1350,7 @@ app.post('/api/detect-face', async (req, res) => {
     const client = getAnthropicClient();
     if (!client) {
       console.log('[FaceDetect] No API key, using heuristic');
-      return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
+      return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: "heuristic" });
     }
     
     console.log('[FaceDetect] Analyzing image with Claude SDK...');
@@ -1352,17 +1364,17 @@ app.post('/api/detect-face', async (req, res) => {
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
           { type: 'text', text: `Find the person's FACE in this image for a circular headshot crop.
 
-I need the CENTER of the face (nose bridge area) so the circular crop captures forehead, eyes, nose, chin, and ears.
+I need the CENTER of the face (nose bridge area). The circle should be large enough to include forehead, chin, and some background padding.
 
 Return coordinates where 0,0 is top-left and 1,1 is bottom-right.
 
 Reply with ONLY JSON:
-{"x": 0.5, "y": 0.4, "radius": 0.35}
+{"x": 0.5, "y": 0.45, "radius": 0.45}
 
 Where:
 - x: horizontal center of face (0-1)
-- y: vertical center of face at nose bridge (0-1), typically 0.35-0.5
-- radius: face size relative to image (0.25-0.5)` }
+- y: vertical center of face at nose bridge (0-1)
+- radius: should be GENEROUS (0.4-0.5) to avoid cutting off hair/chin` }
         ]
       }]
     });
@@ -1377,11 +1389,11 @@ Where:
     }
     
     console.log('[FaceDetect] No JSON in response, using heuristic');
-    return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
+    return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: "heuristic" });
     
   } catch (error) {
     console.error('[FaceDetect] Error:', error.message);
-    return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
+    return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: "heuristic" });
   }
 });
 
