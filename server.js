@@ -921,73 +921,153 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
   }
 });
 
-// Crop image to face using Claude vision
+// Extract headshot from cell image, then crop to face
 async function cropToFace(base64Image) {
   const client = getAnthropicClient();
   if (!client) return null;
   
   try {
-    // Ask Claude where the nose/center of face is
-    const response = await client.messages.create({
+    const imageBuffer = Buffer.from(base64Image, 'base64');
+    const metadata = await sharp(imageBuffer).metadata();
+    const imgWidth = metadata.width;
+    const imgHeight = metadata.height;
+    
+    console.log(`[Cast] Processing cell image: ${imgWidth}x${imgHeight}`);
+    
+    // STEP 1: Ask Claude to find the headshot photo BOUNDS within the cell
+    const boundsResponse = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
+          { type: 'text', text: `This is a casting sheet cell that contains a headshot photo and text labels.
+
+Find the PHOTO/HEADSHOT boundaries - I need to extract JUST the photo, excluding any text, labels, names, or annotations around it.
+
+Return the photo bounds as percentages (0-100) of the image dimensions:
+
+Reply with ONLY JSON:
+{"left": 5, "top": 5, "right": 95, "bottom": 70}
+
+Where:
+- left: percentage from left edge where photo starts
+- top: percentage from top where photo starts  
+- right: percentage from left edge where photo ends
+- bottom: percentage from top where photo ends
+
+Example: If the photo takes the top 2/3 of the cell with small margins:
+{"left": 3, "top": 3, "right": 97, "bottom": 65}
+
+IMPORTANT: Find the actual photo edges, not the whole cell.` }
+        ]
+      }]
+    });
+    
+    const boundsText = boundsResponse.content?.[0]?.text || '';
+    const boundsMatch = boundsText.match(/\{[^}]+\}/);
+    
+    let extractedImage = imageBuffer;
+    
+    if (boundsMatch) {
+      const bounds = JSON.parse(boundsMatch[0]);
+      console.log(`[Cast] Photo bounds: left=${bounds.left}%, top=${bounds.top}%, right=${bounds.right}%, bottom=${bounds.bottom}%`);
+      
+      // Calculate pixel coordinates
+      const left = Math.round((bounds.left / 100) * imgWidth);
+      const top = Math.round((bounds.top / 100) * imgHeight);
+      const right = Math.round((bounds.right / 100) * imgWidth);
+      const bottom = Math.round((bounds.bottom / 100) * imgHeight);
+      
+      const extractWidth = Math.max(50, right - left);
+      const extractHeight = Math.max(50, bottom - top);
+      
+      // Extract just the photo region
+      if (extractWidth > 50 && extractHeight > 50) {
+        extractedImage = await sharp(imageBuffer)
+          .extract({ 
+            left: Math.max(0, left), 
+            top: Math.max(0, top), 
+            width: Math.min(extractWidth, imgWidth - left),
+            height: Math.min(extractHeight, imgHeight - top)
+          })
+          .toBuffer();
+        console.log(`[Cast] Extracted photo: ${extractWidth}x${extractHeight}`);
+      }
+    } else {
+      console.log('[Cast] Could not parse photo bounds, using full image');
+    }
+    
+    // STEP 2: Now find the face center within the extracted photo
+    const extractedBase64 = extractedImage.toString('base64');
+    const extractedMeta = await sharp(extractedImage).metadata();
+    
+    const faceResponse = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 200,
       messages: [{
         role: 'user',
         content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-          { type: 'text', text: `Find the person's NOSE in this image for cropping a headshot.
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: extractedBase64 } },
+          { type: 'text', text: `Find the person's face CENTER (nose/septum area) for a circular crop.
 
-I need the CENTER OF THE FACE - the NOSE/SEPTUM position. Return coordinates as percentages (0-100).
+Return coordinates as percentages (0-100):
 
 Reply with ONLY JSON:
-{"x": 50, "y": 40, "size": 35}
+{"x": 50, "y": 45}
 
 Where:
-- x: horizontal position of nose (0=left, 100=right)
-- y: vertical position of nose (0=top, 100=bottom) - typically 35-50
-- size: face width as percentage of image width (30-50)` }
+- x: horizontal position of face center (0=left, 100=right)
+- y: vertical position of face center/nose (0=top, 100=bottom)` }
         ]
       }]
     });
     
-    const text = response.content?.[0]?.text || '';
-    const jsonMatch = text.match(/\{[^}]+\}/);
-    if (!jsonMatch) return null;
+    const faceText = faceResponse.content?.[0]?.text || '';
+    const faceMatch = faceText.match(/\{[^}]+\}/);
     
-    const coords = JSON.parse(jsonMatch[0]);
-    console.log(`[Cast] Face center (nose) at: x=${coords.x}%, y=${coords.y}%, size=${coords.size}%`);
+    let centerX = 50, centerY = 45;
+    if (faceMatch) {
+      const face = JSON.parse(faceMatch[0]);
+      centerX = face.x;
+      centerY = face.y;
+      console.log(`[Cast] Face center: x=${centerX}%, y=${centerY}%`);
+    }
     
-    // Decode the base64 image and crop to face
-    const imageBuffer = Buffer.from(base64Image, 'base64');
-    const metadata = await sharp(imageBuffer).metadata();
+    // STEP 3: Create square crop centered on face
+    const extWidth = extractedMeta.width;
+    const extHeight = extractedMeta.height;
     
-    const imgWidth = metadata.width;
-    const imgHeight = metadata.height;
+    const facePxX = (centerX / 100) * extWidth;
+    const facePxY = (centerY / 100) * extHeight;
     
-    // Calculate crop box centered on nose
-    const noseX = (coords.x / 100) * imgWidth;
-    const noseY = (coords.y / 100) * imgHeight;
-    const faceSize = (coords.size / 100) * imgWidth;
+    // Make the largest square possible centered on face
+    const maxSize = Math.min(extWidth, extHeight);
+    const cropSize = Math.round(maxSize * 0.9);
     
-    // Make square crop around face center
-    const cropSize = Math.min(Math.round(faceSize * 1.8), Math.min(imgWidth, imgHeight));
-    const cropX = Math.max(0, Math.round(noseX - cropSize / 2));
-    const cropY = Math.max(0, Math.round(noseY - cropSize / 2));
+    let cropX = Math.round(facePxX - cropSize / 2);
+    let cropY = Math.round(facePxY - cropSize / 2);
     
-    // Ensure crop doesn't exceed image bounds
-    const finalX = Math.min(cropX, imgWidth - cropSize);
-    const finalY = Math.min(cropY, imgHeight - cropSize);
-    const finalSize = Math.min(cropSize, imgWidth - finalX, imgHeight - finalY);
+    // Clamp to image bounds
+    cropX = Math.max(0, Math.min(cropX, extWidth - cropSize));
+    cropY = Math.max(0, Math.min(cropY, extHeight - cropSize));
     
-    if (finalSize < 50) return null; // Too small
+    const finalSize = Math.min(cropSize, extWidth - cropX, extHeight - cropY);
     
-    // Crop and return as base64
-    const croppedBuffer = await sharp(imageBuffer)
-      .extract({ left: Math.max(0, finalX), top: Math.max(0, finalY), width: finalSize, height: finalSize })
+    if (finalSize < 50) {
+      console.log('[Cast] Crop too small, returning extracted image');
+      return extractedBase64;
+    }
+    
+    // Final crop and resize
+    const croppedBuffer = await sharp(extractedImage)
+      .extract({ left: cropX, top: cropY, width: finalSize, height: finalSize })
       .resize(300, 300, { fit: 'cover' })
       .jpeg({ quality: 90 })
       .toBuffer();
     
+    console.log(`[Cast] Final headshot: 300x300 centered on face`);
     return croppedBuffer.toString('base64');
     
   } catch (e) {
@@ -1331,82 +1411,108 @@ app.post('/api/detect-face', async (req, res) => {
     }
     
     if (!process.env.ANTHROPIC_API_KEY) {
-      // Return smart defaults if no API key
-      return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
+      return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
     }
     
-    console.log('[FaceDetect] Analyzing image...');
+    console.log('[FaceDetect] Analyzing image with two-step extraction...');
     
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 200,
-        messages: [{
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: 'image/jpeg',
-                data: image
-              }
-            },
-            {
-              type: 'text',
-              text: `Find the person's NOSE in this image for a circular headshot crop.
+    const client = getAnthropicClient();
+    
+    // STEP 1: Check if image has text/labels and find photo bounds
+    const boundsResponse = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
+          { type: 'text', text: `Analyze this image. Does it contain text labels, names, or annotations around a photo?
 
-I need the CENTER OF THE FACE - specifically the NOSE/SEPTUM position. This will be the center point of a circular crop.
+If YES (there's text around a photo): Find the PHOTO boundaries, excluding text.
+If NO (it's just a headshot): Return bounds for the whole image.
 
-Coordinates: 0,0 is top-left, 1,1 is bottom-right.
+Return as percentages (0-100):
 
 Reply with ONLY JSON:
-{"x": 0.5, "y": 0.4, "radius": 0.35}
+{"hasText": true, "left": 5, "top": 5, "right": 95, "bottom": 70}
 
-Where:
-- x: horizontal position of nose (0-1)
-- y: vertical position of nose (0-1) - typically 0.35-0.5 for headshots
-- radius: how much of the image to include (0.3-0.45)
-
-The crop circle will be centered exactly on these coordinates.`
-            }
-          ]
-        }]
-      })
+or for a clean headshot:
+{"hasText": false, "left": 0, "top": 0, "right": 100, "bottom": 100}` }
+        ]
+      }]
     });
     
-    if (!response.ok) {
-      console.error('[FaceDetect] API error:', response.status);
-      return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
-    }
+    const boundsText = boundsResponse.content?.[0]?.text || '';
+    const boundsMatch = boundsText.match(/\{[^}]+\}/);
     
-    const data = await response.json();
-    const text = data.content?.[0]?.text || '';
-    
-    try {
-      // Extract JSON from response
-      const jsonMatch = text.match(/\{[^}]+\}/);
-      if (jsonMatch) {
-        const result = JSON.parse(jsonMatch[0]);
-        console.log('[FaceDetect] Found face at:', result);
-        return res.json({ ...result, method: 'claude' });
+    let photoBounds = { left: 0, top: 0, right: 100, bottom: 100 };
+    if (boundsMatch) {
+      const parsed = JSON.parse(boundsMatch[0]);
+      if (parsed.hasText) {
+        photoBounds = parsed;
+        console.log(`[FaceDetect] Found text labels, photo bounds: ${JSON.stringify(photoBounds)}`);
       }
-    } catch (e) {
-      console.error('[FaceDetect] Parse error:', e);
     }
     
-    // Fallback
-    return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
+    // Calculate normalized coordinates within photo bounds
+    const photoWidth = photoBounds.right - photoBounds.left;
+    const photoHeight = photoBounds.bottom - photoBounds.top;
+    
+    // STEP 2: Find face center
+    const faceResponse = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
+          { type: 'text', text: `Find the person's face CENTER (nose area) in this image.
+
+Return coordinates as percentages (0-100) of the FULL image:
+
+Reply with ONLY JSON:
+{"x": 50, "y": 40}
+
+Where:
+- x: horizontal position of nose (0=left edge, 100=right edge)
+- y: vertical position of nose (0=top edge, 100=bottom edge)` }
+        ]
+      }]
+    });
+    
+    const faceText = faceResponse.content?.[0]?.text || '';
+    const faceMatch = faceText.match(/\{[^}]+\}/);
+    
+    let result = { x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' };
+    
+    if (faceMatch) {
+      const face = JSON.parse(faceMatch[0]);
+      
+      // Convert to 0-1 range
+      const faceX = face.x / 100;
+      const faceY = face.y / 100;
+      
+      // Calculate radius based on photo bounds (smaller if there's text to exclude)
+      const radiusX = (photoWidth / 100) * 0.45;
+      const radiusY = (photoHeight / 100) * 0.45;
+      const radius = Math.min(radiusX, radiusY, 0.45);
+      
+      result = {
+        x: faceX,
+        y: faceY,
+        radius: Math.max(0.25, radius),
+        method: 'claude',
+        hasText: photoBounds.left > 0 || photoBounds.top > 0
+      };
+      
+      console.log(`[FaceDetect] Face at x=${result.x.toFixed(2)}, y=${result.y.toFixed(2)}, radius=${result.radius.toFixed(2)}`);
+    }
+    
+    return res.json(result);
     
   } catch (error) {
     console.error('[FaceDetect] Error:', error.message);
-    return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
+    return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
   }
 });
 
