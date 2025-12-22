@@ -935,17 +935,21 @@ async function cropToFace(base64Image) {
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-          { type: 'text', text: `Find the headshot/face in this image. Return coordinates as percentages (0-100).
+          { type: 'text', text: `Find the person's FACE in this image for a headshot crop.
+
+IMPORTANT: I need the position of the EYES (not the whole head or body). The crop should be centered on eye-level so the final circular crop shows forehead, eyes, nose, and mouth.
+
+Return coordinates as percentages (0-100).
 
 Reply with ONLY JSON, no other text:
-{"x": 50, "y": 30, "size": 40}
+{"x": 50, "y": 25, "size": 35}
 
 Where:
-- x: horizontal center of face (0=left edge, 100=right edge)
-- y: vertical center of face (0=top, 100=bottom)  
-- size: face width as percentage of image width
+- x: horizontal center of the face/eyes (0=left edge, 100=right edge)
+- y: vertical position of the EYES (0=top, 100=bottom) - typically 20-35 for headshots
+- size: face width as percentage of image width (typically 30-50)
 
-If no face found, return {"x": 50, "y": 35, "size": 60}` }
+Example: A centered headshot with eyes in upper quarter: {"x": 50, "y": 25, "size": 40}` }
         ]
       }]
     });
@@ -969,10 +973,11 @@ If no face found, return {"x": 50, "y": 35, "size": 60}` }
     const faceY = (coords.y / 100) * imgHeight;
     const faceSize = (coords.size / 100) * imgWidth;
     
-    // Make square crop around face with some margin
-    const cropSize = Math.min(Math.round(faceSize * 1.4), Math.min(imgWidth, imgHeight));
+    // Make square crop around face - position eyes in upper third of crop
+    const cropSize = Math.min(Math.round(faceSize * 1.6), Math.min(imgWidth, imgHeight));
     const cropX = Math.max(0, Math.round(faceX - cropSize / 2));
-    const cropY = Math.max(0, Math.round(faceY - cropSize / 2));
+    // Offset Y so eyes are in upper third (not center) of final crop
+    const cropY = Math.max(0, Math.round(faceY - cropSize * 0.35));
     
     // Ensure crop doesn't exceed image bounds
     const finalX = Math.min(cropX, imgWidth - cropSize);
@@ -1332,7 +1337,7 @@ app.post('/api/detect-face', async (req, res) => {
     
     if (!process.env.ANTHROPIC_API_KEY) {
       // Return smart defaults if no API key
-      return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+      return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
     }
     
     console.log('[FaceDetect] Analyzing image...');
@@ -1360,17 +1365,21 @@ app.post('/api/detect-face', async (req, res) => {
             },
             {
               type: 'text',
-              text: `Look at this image and find the main person's face. Return the face center position as x,y coordinates where 0,0 is top-left and 1,1 is bottom-right.
+              text: `Find the person's FACE in this image for a circular headshot crop.
 
-Reply with ONLY a JSON object in this exact format, no other text:
-{"x": 0.5, "y": 0.3, "radius": 0.35}
+IMPORTANT: Find the EYE LEVEL position, not the center of the head. The crop circle should be positioned so it captures forehead, eyes, nose, and mouth - with eyes in the upper portion of the circle.
+
+Return coordinates where 0,0 is top-left and 1,1 is bottom-right.
+
+Reply with ONLY JSON, no other text:
+{"x": 0.5, "y": 0.25, "radius": 0.35}
 
 Where:
-- x: horizontal center of face (0-1, 0.5 = center)
-- y: vertical center of face (0-1, 0.3 = upper third)
-- radius: suggested crop radius (0.25-0.5)
+- x: horizontal center of face (0-1, typically 0.4-0.6)
+- y: vertical position of EYES (0-1, typically 0.2-0.35 for headshots)
+- radius: crop radius (0.3-0.45 works well)
 
-If no face found, return {"x": 0.5, "y": 0.35, "radius": 0.4}`
+The y value should be where the EYES are, not the center of the head.`
             }
           ]
         }]
@@ -1379,7 +1388,7 @@ If no face found, return {"x": 0.5, "y": 0.35, "radius": 0.4}`
     
     if (!response.ok) {
       console.error('[FaceDetect] API error:', response.status);
-      return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+      return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
     }
     
     const data = await response.json();
@@ -1398,11 +1407,11 @@ If no face found, return {"x": 0.5, "y": 0.35, "radius": 0.4}`
     }
     
     // Fallback
-    return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+    return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
     
   } catch (error) {
     console.error('[FaceDetect] Error:', error.message);
-    return res.json({ x: 0.5, y: 0.35, radius: 0.4, method: 'heuristic' });
+    return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
   }
 });
 
