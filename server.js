@@ -1096,28 +1096,31 @@ async function extractCastText(imageBuffer) {
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
         { type: 'text', text: `Extract cast/talent information from this page.
 
-For each headshot/photo, identify:
-1. ACTOR NAME - The real person's name
-2. CHARACTER NAME - The role they play (if shown)
-3. ROLE - Any role description (e.g., "BARTENDER", "GUY AT BAR")
+This is a cast sheet with headshot photos and names. Each name is positioned DIRECTLY BELOW its corresponding photo.
 
-Return JSON:
+For each headshot/photo, identify:
+1. NAME - The name directly below the photo (this is usually the character name or role)
+2. Any additional info shown
+
+Return JSON in EXACT visual order - go row by row, left to right:
 {
   "members": [
     {
-      "actorName": "John Smith",
-      "characterName": "Detective Jones",
-      "role": "Lead"
+      "actorName": "",
+      "characterName": "NINA",
+      "role": ""
     }
   ]
 }
 
 RULES:
-- List members in reading order (left-to-right, top-to-bottom)
-- actorName: The talent/actor's real name
-- characterName: The character they play (may be same as role, or empty)
-- role: Description like "BARTENDER", "MOM", etc.
-- Skip any photos without names` }
+- Go row by row, left to right (top row first, then next row, etc.)
+- The name BELOW each photo is typically the character name
+- If only one name is shown, put it in characterName
+- actorName: Real person's name (if shown separately)
+- characterName: Character/role name shown below photo
+- role: Additional description if any
+- Count must match number of photos exactly` }
       ]
     }]
   });
@@ -1471,11 +1474,27 @@ async function detectFaceWithFaceApi(base64Image) {
   
   try {
     const canvas = await import('canvas');
-    const { Canvas, Image, loadImage } = canvas.default || canvas;
+    const { Canvas, Image, loadImage, createCanvas } = canvas.default || canvas;
     
     // Load image from base64
     const imgBuffer = Buffer.from(base64Image, 'base64');
-    const img = await loadImage(imgBuffer);
+    let img = await loadImage(imgBuffer);
+    
+    console.log(`[FaceAPI] Input image size: ${img.width}x${img.height}`);
+    
+    // Upscale small images for better detection (face-api needs ~100px minimum face size)
+    const minDimension = Math.min(img.width, img.height);
+    if (minDimension < 400) {
+      const scale = 400 / minDimension;
+      const newWidth = Math.round(img.width * scale);
+      const newHeight = Math.round(img.height * scale);
+      
+      const upscaleCanvas = createCanvas(newWidth, newHeight);
+      const ctx = upscaleCanvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, newWidth, newHeight);
+      img = upscaleCanvas;
+      console.log(`[FaceAPI] Upscaled to: ${newWidth}x${newHeight}`);
+    }
     
     // Detect face with landmarks
     const detection = await faceapi
