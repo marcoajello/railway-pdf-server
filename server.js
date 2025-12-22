@@ -11,6 +11,52 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 
+// Face-API.js setup
+let faceapi = null;
+let faceApiReady = false;
+
+async function initFaceApi() {
+  try {
+    // Dynamic import for face-api
+    const faceapiModule = await import('@vladmandic/face-api');
+    faceapi = faceapiModule.default || faceapiModule;
+    
+    // Setup canvas environment for Node.js
+    const canvas = await import('canvas');
+    const { Canvas, Image, ImageData } = canvas.default || canvas;
+    faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
+    
+    // Load models from local directory
+    const modelsPath = path.join(__dirname, 'models');
+    
+    // Check if models exist, if not use CDN path
+    let modelUri = modelsPath;
+    try {
+      await fs.access(modelsPath);
+      console.log('[FaceAPI] Loading models from local path:', modelsPath);
+    } catch {
+      // Models not found locally - they need to be downloaded
+      console.log('[FaceAPI] Models directory not found at:', modelsPath);
+      console.log('[FaceAPI] Please download models from https://github.com/vladmandic/face-api/tree/master/model');
+      return false;
+    }
+    
+    await faceapi.nets.tinyFaceDetector.loadFromDisk(modelUri);
+    await faceapi.nets.faceLandmark68TinyNet.loadFromDisk(modelUri);
+    
+    faceApiReady = true;
+    console.log('[FaceAPI] Models loaded successfully');
+    return true;
+  } catch (err) {
+    console.error('[FaceAPI] Init error:', err.message);
+    faceApiReady = false;
+    return false;
+  }
+}
+
+// Initialize face-api on startup
+initFaceApi();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -927,77 +973,90 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
   }
 });
 
-// Crop image to face using Claude vision
+// Crop image to face using face-api.js (primary) or Claude (fallback)
 // Returns { image: base64, faceX: 0-1, faceY: 0-1 } or null
 async function cropToFace(base64Image) {
-  const client = getAnthropicClient();
-  if (!client) return null;
+  let faceCoords = null;
+  
+  // Try face-api.js first
+  if (faceApiReady && faceapi) {
+    try {
+      const result = await detectFaceWithFaceApi(base64Image);
+      if (result) {
+        faceCoords = {
+          x: result.x * 100,
+          y: result.y * 100,
+          size: result.radius * 100 * 2 // Convert radius to diameter percentage
+        };
+        console.log(`[Cast] face-api.js detected: x=${faceCoords.x.toFixed(0)}%, y=${faceCoords.y.toFixed(0)}%`);
+      }
+    } catch (err) {
+      console.log('[Cast] face-api.js error:', err.message);
+    }
+  }
+  
+  // Fallback to Claude if face-api.js didn't work
+  if (!faceCoords) {
+    const client = getAnthropicClient();
+    if (!client) return null;
+    
+    try {
+      const response = await client.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
+            { type: 'text', text: `Find the face. Return nose bridge position (0-100).
+JSON only: {"x": 50, "y": 35, "size": 40}` }
+          ]
+        }]
+      });
+      
+      const text = response.content?.[0]?.text || '';
+      const jsonMatch = text.match(/\{[^}]+\}/);
+      if (jsonMatch) {
+        faceCoords = JSON.parse(jsonMatch[0]);
+        console.log(`[Cast] Claude detected: x=${faceCoords.x}%, y=${faceCoords.y}%`);
+      }
+    } catch (err) {
+      console.log('[Cast] Claude error:', err.message);
+    }
+  }
+  
+  if (!faceCoords) return null;
   
   try {
-    // First, ask Claude where the face is
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 200,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-          { type: 'text', text: `Find the person's FACE in this image for a headshot crop.
-
-I need the CENTER of the face (nose bridge area) for the crop circle center.
-
-Return coordinates as percentages (0-100).
-
-Reply with ONLY JSON, no other text:
-{"x": 50, "y": 40, "size": 40}
-
-Where:
-- x: horizontal center of the face (0=left, 100=right)
-- y: vertical center of face at NOSE BRIDGE level (0=top, 100=bottom)
-- size: face width as percentage of image width` }
-        ]
-      }]
-    });
-    
-    const text = response.content?.[0]?.text || '';
-    const jsonMatch = text.match(/\{[^}]+\}/);
-    if (!jsonMatch) return null;
-    
-    const coords = JSON.parse(jsonMatch[0]);
-    console.log(`[Cast] Face detected at: x=${coords.x}%, y=${coords.y}%, size=${coords.size}%`);
-    
     // Decode the base64 image and crop to face
     const imageBuffer = Buffer.from(base64Image, 'base64');
     const metadata = await sharp(imageBuffer).metadata();
     
     const imgWidth = metadata.width;
     const imgHeight = metadata.height;
-    console.log(`[Cast] Image size: ${imgWidth}x${imgHeight}`);
     
-    // Calculate crop box (centered on face, square)
-    const faceX = (coords.x / 100) * imgWidth;
-    const faceY = (coords.y / 100) * imgHeight;
-    const faceSize = (coords.size / 100) * imgWidth;
-    console.log(`[Cast] Face pixel pos: x=${faceX.toFixed(0)}, y=${faceY.toFixed(0)}, size=${faceSize.toFixed(0)}`);
+    // Calculate face position in pixels
+    const faceX = (faceCoords.x / 100) * imgWidth;
+    const faceY = (faceCoords.y / 100) * imgHeight;
+    const faceSize = (faceCoords.size / 100) * imgWidth;
     
     // Make square crop around face center
     const cropSize = Math.min(Math.round(faceSize * 1.8), Math.min(imgWidth, imgHeight));
     const cropX = Math.max(0, Math.round(faceX - cropSize / 2));
     const cropY = Math.max(0, Math.round(faceY - cropSize / 2));
-    console.log(`[Cast] Initial crop box: x=${cropX}, y=${cropY}, size=${cropSize}`);
     
     // Ensure crop doesn't exceed image bounds
     const finalX = Math.min(cropX, imgWidth - cropSize);
     const finalY = Math.min(cropY, imgHeight - cropSize);
     const finalSize = Math.min(cropSize, imgWidth - finalX, imgHeight - finalY);
-    console.log(`[Cast] Final crop box: x=${finalX}, y=${finalY}, size=${finalSize}`);
     
-    if (finalSize < 50) return null; // Too small
+    if (finalSize < 50) return null;
     
-    // Calculate where the face center is in the CROPPED image (0-1 range)
+    // Calculate where the face center is in the CROPPED image
     const faceXInCrop = (faceX - finalX) / finalSize;
     const faceYInCrop = (faceY - finalY) / finalSize;
-    console.log(`[Cast] Face in crop: x=${faceXInCrop.toFixed(2)}, y=${faceYInCrop.toFixed(2)}`);
+    
+    console.log(`[Cast] Cropping: face in crop at x=${(faceXInCrop*100).toFixed(0)}%, y=${(faceYInCrop*100).toFixed(0)}%`);
     
     // Crop and resize
     const croppedBuffer = await sharp(imageBuffer)
@@ -1343,7 +1402,7 @@ VALIDATION:
   }
 });
 
-// Face detection endpoint - uses Claude vision to find face position in image
+// Face detection endpoint - uses face-api.js for accurate landmark detection
 app.post('/api/detect-face', async (req, res) => {
   try {
     const { image } = req.body; // base64 image
@@ -1352,61 +1411,135 @@ app.post('/api/detect-face', async (req, res) => {
       return res.status(400).json({ error: 'Image required' });
     }
     
+    // Try face-api.js first (most accurate)
+    if (faceApiReady && faceapi) {
+      try {
+        const result = await detectFaceWithFaceApi(image);
+        if (result) {
+          console.log('[FaceDetect] face-api.js detected:', result);
+          return res.json({ ...result, method: 'faceapi' });
+        }
+      } catch (err) {
+        console.log('[FaceDetect] face-api.js error:', err.message);
+      }
+    }
+    
+    // Fallback to Claude
     const client = getAnthropicClient();
-    if (!client) {
-      console.log('[FaceDetect] No API key, using heuristic');
-      return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: "heuristic" });
+    if (client) {
+      try {
+        console.log('[FaceDetect] Falling back to Claude...');
+        const response = await client.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 200,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
+              { type: 'text', text: `Find the person's face. Return the nose bridge position (center of face).
+Coordinates 0-1 where 0,0=top-left.
+Reply ONLY with JSON: {"x": 0.5, "y": 0.35, "radius": 0.4}` }
+            ]
+          }]
+        });
+        
+        const text = response.content?.[0]?.text || '';
+        const jsonMatch = text.match(/\{[^}]+\}/);
+        if (jsonMatch) {
+          const result = JSON.parse(jsonMatch[0]);
+          console.log('[FaceDetect] Claude detected:', result);
+          return res.json({ ...result, method: 'claude' });
+        }
+      } catch (err) {
+        console.log('[FaceDetect] Claude error:', err.message);
+      }
     }
     
-    console.log('[FaceDetect] Analyzing image with Claude SDK...');
-    
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 200,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
-          { type: 'text', text: `Find the person's FACE in this image for a circular headshot crop.
-
-I need the CENTER of the face (nose bridge area). The circle should be large enough to include forehead, chin, and some background padding.
-
-Return coordinates where 0,0 is top-left and 1,1 is bottom-right.
-
-Reply with ONLY JSON:
-{"x": 0.5, "y": 0.45, "radius": 0.45}
-
-Where:
-- x: horizontal center of face (0-1)
-- y: vertical center of face at nose bridge (0-1)
-- radius: should be GENEROUS (0.4-0.5) to avoid cutting off hair/chin` }
-        ]
-      }]
-    });
-    
-    const text = response.content?.[0]?.text || '';
-    const jsonMatch = text.match(/\{[^}]+\}/);
-    
-    if (jsonMatch) {
-      const result = JSON.parse(jsonMatch[0]);
-      console.log('[FaceDetect] Face found at:', result);
-      return res.json({ ...result, method: 'claude' });
-    }
-    
-    console.log('[FaceDetect] No JSON in response, using heuristic');
-    return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: "heuristic" });
+    // Final fallback
+    console.log('[FaceDetect] Using heuristic fallback');
+    return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: 'heuristic' });
     
   } catch (error) {
     console.error('[FaceDetect] Error:', error.message);
-    return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: "heuristic" });
+    return res.json({ x: 0.5, y: 0.4, radius: 0.45, method: 'heuristic' });
   }
 });
+
+// Face detection using face-api.js with 68-point landmarks
+async function detectFaceWithFaceApi(base64Image) {
+  if (!faceApiReady || !faceapi) return null;
+  
+  try {
+    const canvas = await import('canvas');
+    const { Canvas, Image, loadImage } = canvas.default || canvas;
+    
+    // Load image from base64
+    const imgBuffer = Buffer.from(base64Image, 'base64');
+    const img = await loadImage(imgBuffer);
+    
+    // Detect face with landmarks
+    const detection = await faceapi
+      .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
+      .withFaceLandmarks(true); // true = use tiny model
+    
+    if (!detection) {
+      console.log('[FaceAPI] No face detected');
+      return null;
+    }
+    
+    const landmarks = detection.landmarks;
+    const imgWidth = img.width;
+    const imgHeight = img.height;
+    
+    // Get nose position (points 27-30 are the nose bridge)
+    const noseBridge = landmarks.getNose();
+    // Point 30 is the tip of the nose, we want higher up
+    // Use average of points 27-28 for nose bridge
+    const noseTop = noseBridge[0]; // Top of nose bridge
+    
+    // Get eye positions for better centering
+    const leftEye = landmarks.getLeftEye();
+    const rightEye = landmarks.getRightEye();
+    
+    // Calculate eye center
+    const leftEyeCenter = {
+      x: leftEye.reduce((sum, p) => sum + p.x, 0) / leftEye.length,
+      y: leftEye.reduce((sum, p) => sum + p.y, 0) / leftEye.length
+    };
+    const rightEyeCenter = {
+      x: rightEye.reduce((sum, p) => sum + p.x, 0) / rightEye.length,
+      y: rightEye.reduce((sum, p) => sum + p.y, 0) / rightEye.length
+    };
+    
+    // Face center X is between the eyes
+    const faceCenterX = (leftEyeCenter.x + rightEyeCenter.x) / 2;
+    
+    // Face center Y is slightly below eyes (at nose bridge level)
+    // Use a point between eyes and nose tip
+    const faceCenterY = (leftEyeCenter.y + rightEyeCenter.y) / 2 + 
+                        (noseTop.y - (leftEyeCenter.y + rightEyeCenter.y) / 2) * 0.3;
+    
+    // Calculate face size based on bounding box
+    const box = detection.detection.box;
+    const faceSize = Math.max(box.width, box.height);
+    const radius = (faceSize / Math.min(imgWidth, imgHeight)) * 0.6;
+    
+    console.log(`[FaceAPI] Landmarks: eyes at y=${((leftEyeCenter.y + rightEyeCenter.y) / 2 / imgHeight * 100).toFixed(0)}%, nose at y=${(noseTop.y / imgHeight * 100).toFixed(0)}%`);
+    
+    return {
+      x: faceCenterX / imgWidth,
+      y: faceCenterY / imgHeight,
+      radius: Math.min(0.5, Math.max(0.3, radius))
+    };
+    
+  } catch (err) {
+    console.error('[FaceAPI] Detection error:', err.message);
+    return null;
+  }
+}
 
 app.listen(PORT, () => {
   console.log(`Server on port ${PORT}`);
   console.log(`Storyboard: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Hanging chad detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Cast import: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Auto-tag batch: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
-  console.log(`Face detection: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'disabled'}`);
+  console.log(`Face detection: ${faceApiReady ? 'face-api.js' : (process.env.ANTHROPIC_API_KEY ? 'claude' : 'disabled')}`);
 });
