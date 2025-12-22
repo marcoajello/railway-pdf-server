@@ -1520,16 +1520,17 @@ async function detectFaceWithFaceApi(base64Image) {
                         (noseTop.y - (leftEyeCenter.y + rightEyeCenter.y) / 2) * 0.3;
     
     // Calculate face size based on bounding box
+    // Tighter radius so face fills ~60% of the circle
     const box = detection.detection.box;
     const faceSize = Math.max(box.width, box.height);
-    const radius = (faceSize / Math.min(imgWidth, imgHeight)) * 0.6;
+    const radius = (faceSize / Math.min(imgWidth, imgHeight)) * 0.45;
     
     console.log(`[FaceAPI] Landmarks: eyes at y=${((leftEyeCenter.y + rightEyeCenter.y) / 2 / imgHeight * 100).toFixed(0)}%, nose at y=${(noseTop.y / imgHeight * 100).toFixed(0)}%`);
     
     return {
       x: faceCenterX / imgWidth,
       y: faceCenterY / imgHeight,
-      radius: Math.min(0.5, Math.max(0.3, radius))
+      radius: Math.min(0.45, Math.max(0.25, radius))
     };
     
   } catch (err) {
