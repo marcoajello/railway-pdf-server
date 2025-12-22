@@ -927,7 +927,7 @@ async function cropToFace(base64Image) {
   if (!client) return null;
   
   try {
-    // First, ask Claude where the face is
+    // Ask Claude where the nose/center of face is
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 200,
@@ -935,21 +935,17 @@ async function cropToFace(base64Image) {
         role: 'user',
         content: [
           { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-          { type: 'text', text: `Find the person's FACE in this image for a headshot crop.
+          { type: 'text', text: `Find the person's NOSE in this image for cropping a headshot.
 
-IMPORTANT: I need the position of the EYES (not the whole head or body). The crop should be centered on eye-level so the final circular crop shows forehead, eyes, nose, and mouth.
+I need the CENTER OF THE FACE - the NOSE/SEPTUM position. Return coordinates as percentages (0-100).
 
-Return coordinates as percentages (0-100).
-
-Reply with ONLY JSON, no other text:
-{"x": 50, "y": 25, "size": 35}
+Reply with ONLY JSON:
+{"x": 50, "y": 40, "size": 35}
 
 Where:
-- x: horizontal center of the face/eyes (0=left edge, 100=right edge)
-- y: vertical position of the EYES (0=top, 100=bottom) - typically 20-35 for headshots
-- size: face width as percentage of image width (typically 30-50)
-
-Example: A centered headshot with eyes in upper quarter: {"x": 50, "y": 25, "size": 40}` }
+- x: horizontal position of nose (0=left, 100=right)
+- y: vertical position of nose (0=top, 100=bottom) - typically 35-50
+- size: face width as percentage of image width (30-50)` }
         ]
       }]
     });
@@ -959,7 +955,7 @@ Example: A centered headshot with eyes in upper quarter: {"x": 50, "y": 25, "siz
     if (!jsonMatch) return null;
     
     const coords = JSON.parse(jsonMatch[0]);
-    console.log(`[Cast] Face detected at: x=${coords.x}%, y=${coords.y}%, size=${coords.size}%`);
+    console.log(`[Cast] Face center (nose) at: x=${coords.x}%, y=${coords.y}%, size=${coords.size}%`);
     
     // Decode the base64 image and crop to face
     const imageBuffer = Buffer.from(base64Image, 'base64');
@@ -968,16 +964,15 @@ Example: A centered headshot with eyes in upper quarter: {"x": 50, "y": 25, "siz
     const imgWidth = metadata.width;
     const imgHeight = metadata.height;
     
-    // Calculate crop box (centered on face, square)
-    const faceX = (coords.x / 100) * imgWidth;
-    const faceY = (coords.y / 100) * imgHeight;
+    // Calculate crop box centered on nose
+    const noseX = (coords.x / 100) * imgWidth;
+    const noseY = (coords.y / 100) * imgHeight;
     const faceSize = (coords.size / 100) * imgWidth;
     
-    // Make square crop around face - position eyes in upper third of crop
-    const cropSize = Math.min(Math.round(faceSize * 1.6), Math.min(imgWidth, imgHeight));
-    const cropX = Math.max(0, Math.round(faceX - cropSize / 2));
-    // Offset Y so eyes are in upper third (not center) of final crop
-    const cropY = Math.max(0, Math.round(faceY - cropSize * 0.35));
+    // Make square crop around face center
+    const cropSize = Math.min(Math.round(faceSize * 1.8), Math.min(imgWidth, imgHeight));
+    const cropX = Math.max(0, Math.round(noseX - cropSize / 2));
+    const cropY = Math.max(0, Math.round(noseY - cropSize / 2));
     
     // Ensure crop doesn't exceed image bounds
     const finalX = Math.min(cropX, imgWidth - cropSize);
@@ -1365,21 +1360,21 @@ app.post('/api/detect-face', async (req, res) => {
             },
             {
               type: 'text',
-              text: `Find the person's FACE in this image for a circular headshot crop.
+              text: `Find the person's NOSE in this image for a circular headshot crop.
 
-IMPORTANT: Find the EYE LEVEL position, not the center of the head. The crop circle should be positioned so it captures forehead, eyes, nose, and mouth - with eyes in the upper portion of the circle.
+I need the CENTER OF THE FACE - specifically the NOSE/SEPTUM position. This will be the center point of a circular crop.
 
-Return coordinates where 0,0 is top-left and 1,1 is bottom-right.
+Coordinates: 0,0 is top-left, 1,1 is bottom-right.
 
-Reply with ONLY JSON, no other text:
-{"x": 0.5, "y": 0.25, "radius": 0.35}
+Reply with ONLY JSON:
+{"x": 0.5, "y": 0.4, "radius": 0.35}
 
 Where:
-- x: horizontal center of face (0-1, typically 0.4-0.6)
-- y: vertical position of EYES (0-1, typically 0.2-0.35 for headshots)
-- radius: crop radius (0.3-0.45 works well)
+- x: horizontal position of nose (0-1)
+- y: vertical position of nose (0-1) - typically 0.35-0.5 for headshots
+- radius: how much of the image to include (0.3-0.45)
 
-The y value should be where the EYES are, not the center of the head.`
+The crop circle will be centered exactly on these coordinates.`
             }
           ]
         }]
