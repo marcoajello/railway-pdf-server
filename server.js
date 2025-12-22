@@ -1335,83 +1335,53 @@ app.post('/api/detect-face', async (req, res) => {
       return res.status(400).json({ error: 'Image required' });
     }
     
-    if (!process.env.ANTHROPIC_API_KEY) {
-      // Return smart defaults if no API key
-      return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
+    const client = getAnthropicClient();
+    if (!client) {
+      console.log('[FaceDetect] No API key, using heuristic');
+      return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
     }
     
-    console.log('[FaceDetect] Analyzing image...');
+    console.log('[FaceDetect] Analyzing image with Claude SDK...');
     
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 200,
-        messages: [{
-          role: 'user',
-          content: [
-            {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: 'image/jpeg',
-                data: image
-              }
-            },
-            {
-              type: 'text',
-              text: `Find the person's FACE in this image for a circular headshot crop.
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
+          { type: 'text', text: `Find the person's FACE in this image for a circular headshot crop.
 
-IMPORTANT: Find the CENTER of the face - around the NOSE BRIDGE area. This ensures the circular crop captures the entire face: forehead at top, chin at bottom, both ears on the sides.
+I need the CENTER of the face (nose bridge area) so the circular crop captures forehead, eyes, nose, chin, and ears.
 
 Return coordinates where 0,0 is top-left and 1,1 is bottom-right.
 
-Reply with ONLY JSON, no other text:
+Reply with ONLY JSON:
 {"x": 0.5, "y": 0.4, "radius": 0.35}
 
 Where:
-- x: horizontal center of the face (0-1)
-- y: vertical center of the face, at nose bridge level (0-1)
-- radius: how much of the image the face occupies (0.25-0.5)
-
-The y value should be the VERTICAL CENTER of the face (nose bridge), NOT the eyes.`
-            }
-          ]
-        }]
-      })
+- x: horizontal center of face (0-1)
+- y: vertical center of face at nose bridge (0-1), typically 0.35-0.5
+- radius: face size relative to image (0.25-0.5)` }
+        ]
+      }]
     });
     
-    if (!response.ok) {
-      console.error('[FaceDetect] API error:', response.status);
-      return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
+    const text = response.content?.[0]?.text || '';
+    const jsonMatch = text.match(/\{[^}]+\}/);
+    
+    if (jsonMatch) {
+      const result = JSON.parse(jsonMatch[0]);
+      console.log('[FaceDetect] Face found at:', result);
+      return res.json({ ...result, method: 'claude' });
     }
     
-    const data = await response.json();
-    const text = data.content?.[0]?.text || '';
-    
-    try {
-      // Extract JSON from response
-      const jsonMatch = text.match(/\{[^}]+\}/);
-      if (jsonMatch) {
-        const result = JSON.parse(jsonMatch[0]);
-        console.log('[FaceDetect] Found face at:', result);
-        return res.json({ ...result, method: 'claude' });
-      }
-    } catch (e) {
-      console.error('[FaceDetect] Parse error:', e);
-    }
-    
-    // Fallback
-    return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
+    console.log('[FaceDetect] No JSON in response, using heuristic');
+    return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
     
   } catch (error) {
     console.error('[FaceDetect] Error:', error.message);
-    return res.json({ x: 0.5, y: 0.3, radius: 0.4, method: 'heuristic' });
+    return res.json({ x: 0.5, y: 0.4, radius: 0.4, method: 'heuristic' });
   }
 });
 
