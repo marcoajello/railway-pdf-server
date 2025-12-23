@@ -562,9 +562,11 @@ async function extractText(imageBuffer) {
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
         { type: 'text', text: `Extract storyboard data from this page.
 
-STEP 1 - SPOT NAME:
-Look for the COMMERCIAL/PROJECT TITLE at the top of the page (e.g., "BRAND - PRODUCT :30").
-This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within the commercial.
+STEP 1 - SPOT/SCRIPT NAME (CRITICAL):
+Look for a BOLD TITLE near the top of the page - this is the commercial/spot name.
+These titles indicate DIFFERENT COMMERCIALS/SPOTS in the same PDF.
+Always extract the title exactly as written - even if it's just a number.
+This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within a commercial.
 
 STEP 2 - GRID LAYOUT:
 Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
@@ -576,7 +578,7 @@ STEP 3 - FRAME NUMBERS:
 STEP 4 - EXTRACT:
 Return JSON:
 {
-  "spotName": "BRAND - PRODUCT :30" or null,
+  "spotName": "EXACT TITLE FROM PAGE" or null,
   "gridLayout": "2x3",
   "hasVisibleNumbers": true/false,
   "frames": [
@@ -589,7 +591,7 @@ Return JSON:
 }
 
 RULES:
-- spotName: Commercial title only, NOT scene headers
+- spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
 - Skip empty frames` }
