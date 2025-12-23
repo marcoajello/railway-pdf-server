@@ -662,6 +662,8 @@ function groupIntoShots(frames) {
     shotNumber: g.shotNumber,
     frames: g.frames,
     images: g.images,
+    descriptions: g.descriptions,  // Keep per-frame arrays for drag/drop
+    dialogs: g.dialogs,            // Keep per-frame arrays for drag/drop
     description: g.descriptions.join('\n'),
     dialog: g.dialogs.join('\n'),
     combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n')
