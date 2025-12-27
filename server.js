@@ -1012,8 +1012,9 @@ async function cropToFace(base64Image) {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-            { type: 'text', text: `Find the face. Return nose bridge position (0-100).
-JSON only: {"x": 50, "y": 35, "size": 40}` }
+            { type: 'text', text: `Find the face center for a circular crop. The crop MUST show both eyes and the mouth clearly visible.
+Coordinates 0-100 where 0,0=top-left. Size should be large enough to see the full face.
+JSON only: {"x": 50, "y": 40, "size": 50}` }
           ]
         }]
       });
@@ -1443,9 +1444,9 @@ app.post('/api/detect-face', async (req, res) => {
             role: 'user',
             content: [
               { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
-              { type: 'text', text: `Find the person's face. Return the nose bridge position (center of face).
-Coordinates 0-1 where 0,0=top-left.
-Reply ONLY with JSON: {"x": 0.5, "y": 0.35, "radius": 0.4}` }
+              { type: 'text', text: `Find the face center for a circular crop. The crop MUST show both eyes and the mouth clearly visible.
+Coordinates 0-1 where 0,0=top-left. Radius should be large enough to see the full face.
+Reply ONLY with JSON: {"x": 0.5, "y": 0.4, "radius": 0.45}` }
             ]
           }]
         });
@@ -1516,9 +1517,6 @@ async function detectFaceWithFaceApi(base64Image) {
     
     // Get nose position (points 27-30 are the nose bridge)
     const noseBridge = landmarks.getNose();
-    // Point 30 is the tip of the nose, we want higher up
-    // Use average of points 27-28 for nose bridge
-    const noseTop = noseBridge[0]; // Top of nose bridge
     
     // Get eye positions for better centering
     const leftEye = landmarks.getLeftEye();
@@ -1537,23 +1535,23 @@ async function detectFaceWithFaceApi(base64Image) {
     // Face center X is between the eyes
     const faceCenterX = (leftEyeCenter.x + rightEyeCenter.x) / 2;
     
-    // Face center Y is slightly below eyes (at nose bridge level)
-    // Use a point between eyes and nose tip
-    const faceCenterY = (leftEyeCenter.y + rightEyeCenter.y) / 2 + 
-                        (noseTop.y - (leftEyeCenter.y + rightEyeCenter.y) / 2) * 0.3;
+    // Face center Y should be at eye level for good headshot framing
+    // Eyes are typically in the upper third of a good headshot
+    const eyeLevel = (leftEyeCenter.y + rightEyeCenter.y) / 2;
+    const faceCenterY = eyeLevel;
     
     // Calculate face size based on bounding box
-    // Tighter radius so face fills ~60% of the circle
+    // Use larger radius to show full head + some shoulders
     const box = detection.detection.box;
     const faceSize = Math.max(box.width, box.height);
-    const radius = (faceSize / Math.min(imgWidth, imgHeight)) * 0.45;
+    const radius = (faceSize / Math.min(imgWidth, imgHeight)) * 0.6;
     
-    console.log(`[FaceAPI] Landmarks: eyes at y=${((leftEyeCenter.y + rightEyeCenter.y) / 2 / imgHeight * 100).toFixed(0)}%, nose at y=${(noseTop.y / imgHeight * 100).toFixed(0)}%`);
+    console.log(`[FaceAPI] Landmarks: eyes at y=${(eyeLevel / imgHeight * 100).toFixed(0)}%`);
     
     return {
       x: faceCenterX / imgWidth,
       y: faceCenterY / imgHeight,
-      radius: Math.min(0.45, Math.max(0.25, radius))
+      radius: Math.min(0.5, Math.max(0.3, radius))
     };
     
   } catch (err) {
