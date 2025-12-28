@@ -80,6 +80,89 @@ function getAnthropicClient() {
 app.use(cors());
 app.use(express.json({ limit: '150mb' }));
 
+// Auth callback endpoint - handles email confirmation redirect
+// Supabase redirects here with tokens, we pass them to the Electron app
+app.get('/auth/callback', (req, res) => {
+  // Supabase sends tokens as hash fragments, but for email confirmation
+  // it sends them as query params when using PKCE or as hash
+  // We'll serve a page that extracts the hash and redirects to the app
+  
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Signing you in...</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a1a;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .container { text-align: center; }
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid #333;
+      border-top-color: #4a90d9;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin: 0 auto 20px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    a { color: #4a90d9; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="spinner"></div>
+    <p id="status">Opening Skeduler...</p>
+    <p id="fallback" style="display:none; margin-top: 20px;">
+      <a href="#" id="manualLink">Click here to open Skeduler</a><br><br>
+      <span style="color: #666; font-size: 13px;">If the app doesn't open, launch it manually and sign in.</span>
+    </p>
+  </div>
+  <script>
+    // Get tokens from URL hash (Supabase sends them as hash fragments)
+    const hash = window.location.hash.substring(1);
+    const params = new URLSearchParams(hash);
+    
+    const accessToken = params.get('access_token');
+    const refreshToken = params.get('refresh_token');
+    const error = params.get('error');
+    const errorDesc = params.get('error_description');
+    
+    if (error) {
+      document.getElementById('status').textContent = errorDesc || error;
+      document.getElementById('status').style.color = '#ff6b6b';
+    } else if (accessToken) {
+      // Build deep link with tokens
+      const deepLink = 'skeduler://auth?access_token=' + encodeURIComponent(accessToken) + 
+                       '&refresh_token=' + encodeURIComponent(refreshToken || '');
+      
+      // Try to open the app
+      window.location.href = deepLink;
+      
+      // Show fallback after 2 seconds
+      setTimeout(() => {
+        document.getElementById('status').textContent = 'Waiting for app to open...';
+        document.getElementById('fallback').style.display = 'block';
+        document.getElementById('manualLink').href = deepLink;
+      }, 2000);
+    } else {
+      document.getElementById('status').textContent = 'No authentication token found.';
+      document.getElementById('status').style.color = '#ff6b6b';
+    }
+  </script>
+</body>
+</html>
+  `);
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', version: '3.0.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
 });
@@ -1012,8 +1095,8 @@ async function cropToFace(base64Image) {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64Image } },
-            { type: 'text', text: `Find the face center for a circular crop. The crop MUST show both eyes and the mouth clearly visible.
-Coordinates 0-100 where 0,0=top-left. Size should be large enough to see the full face.
+            { type: 'text', text: `Find the face for a headshot crop. Return the CENTER point for cropping that shows the full head (forehead to chin). Position should be at eye level or slightly above, NOT on the nose.
+Coordinates 0-100 where 0,0=top-left.
 JSON only: {"x": 50, "y": 40, "size": 50}` }
           ]
         }]
@@ -1444,9 +1527,9 @@ app.post('/api/detect-face', async (req, res) => {
             role: 'user',
             content: [
               { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
-              { type: 'text', text: `Find the face center for a circular crop. The crop MUST show both eyes and the mouth clearly visible.
-Coordinates 0-1 where 0,0=top-left. Radius should be large enough to see the full face.
-Reply ONLY with JSON: {"x": 0.5, "y": 0.4, "radius": 0.45}` }
+              { type: 'text', text: `Find the person's face. Return the nose bridge position (center of face).
+Coordinates 0-1 where 0,0=top-left.
+Reply ONLY with JSON: {"x": 0.5, "y": 0.35, "radius": 0.4}` }
             ]
           }]
         });
