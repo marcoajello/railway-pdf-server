@@ -1,4 +1,4 @@
-// Version 3.5.0 - Fast PDF conversion with pdf-to-png-converter
+// Version 3.5.1 - Parallel PDF and sharp processing
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -479,8 +479,6 @@ async function detectRectangles(imagePath) {
  * Convert PDF to page images using pdf-to-png-converter (fast, no Puppeteer)
  */
 async function pdfToImages(pdfBuffer, outputDir) {
-  const images = [];
-  
   try {
     const { pdfToPng } = await import('pdf-to-png-converter');
     
@@ -491,13 +489,16 @@ async function pdfToImages(pdfBuffer, outputDir) {
       viewportScale: 2.0,
       disableFontFace: true,
       useSystemFonts: false,
-      returnPageContent: true
+      returnPageContent: true,
+      processPagesInParallel: true  // Enable parallel page processing
     });
     
-    console.log(`[Storyboard] PDF: ${pngPages.length} pages (converted in ${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
+    const pdfTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Storyboard] PDF rendered: ${pngPages.length} pages in ${pdfTime}s`);
     
-    // Process each page with sharp to resize and convert to jpg
-    for (const page of pngPages) {
+    // Process all pages with sharp in parallel
+    const sharpStart = Date.now();
+    const imagePromises = pngPages.map(async (page) => {
       const imgPath = path.join(outputDir, `page-${page.pageNumber}.jpg`);
       
       await sharp(page.content)
@@ -505,8 +506,12 @@ async function pdfToImages(pdfBuffer, outputDir) {
         .jpeg({ quality: 40, progressive: true })
         .toFile(imgPath);
       
-      images.push(imgPath);
-    }
+      return imgPath;
+    });
+    
+    const images = await Promise.all(imagePromises);
+    const sharpTime = ((Date.now() - sharpStart) / 1000).toFixed(1);
+    console.log(`[Storyboard] Sharp processing: ${sharpTime}s`);
     
     return images;
   } catch (error) {
