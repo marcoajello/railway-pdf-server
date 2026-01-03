@@ -1,4 +1,4 @@
-// Version 3.5.1 - Parallel PDF and sharp processing
+// Version 3.5.2 - Visual face/back test for grouping
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -651,8 +651,7 @@ function groupIntoShots(frames) {
   }));
 }
 
-// Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
-// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.2)
+// Pass 2: AI-powered shot grouping analysis - VISUAL TEST (v3.5.2)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -708,37 +707,34 @@ async function analyzeGroupings(frames) {
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `Analyze these ${frameCount} storyboard frames and group them into camera setups.
+          { type: 'text', text: `Group these ${frameCount} storyboard frames into camera setups.
 
-=== CRITICAL: HOW TO DETERMINE SAME vs DIFF ===
+=== THE ONE TEST THAT MATTERS ===
 
-Ask yourself: "Is the camera in the SAME PHYSICAL POSITION?"
+For each transition, ask: "Can I see the SAME SIDE of the main character?"
 
-DIFF (different setup) if ANY of these are true:
-- Character facing camera in one frame, back to camera in other = DIFF
-- Can see character's face in one, can't see it in other = DIFF  
-- Wide shot vs close-up = DIFF
-- Different background/wall visible = DIFF
-- Camera on opposite side of the action = DIFF
+- If I see their FACE in both frames → could be SAME
+- If I see their BACK in both frames → could be SAME  
+- If I see their FACE in one and BACK in the other → ALWAYS DIFF (camera moved 180°)
 
-SAME (same setup) ONLY if ALL of these are true:
-- Camera is filming from exact same position
-- Same background elements visible
-- Same shot size (both wide, both medium, or both close-up)
-- Same characters visible from same angle
+This is the #1 most important test. A character turning around while the camera stays still is rare in storyboards - usually when we see a different side of someone, the CAMERA moved.
 
-=== IMPORTANT ===
-"Same room" does NOT mean "same setup"!
-A kitchen scene can have 10 different camera setups.
-Focus on WHERE THE CAMERA IS, not where the characters are.
+=== OTHER DIFF TRIGGERS ===
+- Shot size changed dramatically (wide ↔ close-up)
+- Completely different background visible
+- Insert shot (product, object, hands only)
 
-=== TASK: FILL IN ALL ${transitionCount} TRANSITIONS ===
+=== SAME REQUIRES ===
+- Same side of character visible (both face OR both back)
+- Similar shot size
+- Similar background elements
+
+=== TASK ===
+For each transition, write SAME or DIFF:
 
 ${transitionList.join('\n')}
 
-=== OUTPUT ===
-1. Fill in SAME or DIFF for each transition above
-2. End with JSON array: [[1,2],[3],[4,5,6]]` }
+Then output the final JSON grouping: [[1,2],[3],[4,5,6]]` }
         ]
       }]
     });
