@@ -1,4 +1,4 @@
-// Version 3.4.1 - Force all transitions with template
+// Version 3.4.2 - Explicit face/back distinction
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -756,7 +756,7 @@ function groupIntoShots(frames) {
 }
 
 // Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
-// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.1)
+// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.2)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -814,28 +814,35 @@ async function analyzeGroupings(frames) {
           ...imageContents,
           { type: 'text', text: `Analyze these ${frameCount} storyboard frames and group them into camera setups.
 
-=== TASK: ANALYZE ALL ${transitionCount} TRANSITIONS ===
+=== CRITICAL: HOW TO DETERMINE SAME vs DIFF ===
 
-For each transition, write SAME or DIFF:
-- SAME = camera stayed in same position (same background, same shot size, same angle)
-- DIFF = camera moved (different background, different shot size, or different angle)
+Ask yourself: "Is the camera in the SAME PHYSICAL POSITION?"
 
-Key things that make it DIFFERENT:
-- Seeing character's BACK vs FRONT = different setup
-- Wide shot vs close-up = different setup  
-- Different wall/background visible = different setup
+DIFF (different setup) if ANY of these are true:
+- Character facing camera in one frame, back to camera in other = DIFF
+- Can see character's face in one, can't see it in other = DIFF  
+- Wide shot vs close-up = DIFF
+- Different background/wall visible = DIFF
+- Camera on opposite side of the action = DIFF
 
-You MUST analyze ALL ${transitionCount} transitions. Here is the template:
+SAME (same setup) ONLY if ALL of these are true:
+- Camera is filming from exact same position
+- Same background elements visible
+- Same shot size (both wide, both medium, or both close-up)
+- Same characters visible from same angle
+
+=== IMPORTANT ===
+"Same room" does NOT mean "same setup"!
+A kitchen scene can have 10 different camera setups.
+Focus on WHERE THE CAMERA IS, not where the characters are.
+
+=== TASK: FILL IN ALL ${transitionCount} TRANSITIONS ===
 
 ${transitionList.join('\n')}
 
-Fill in SAME or DIFF for each one above, then provide the final JSON grouping.
-
-=== OUTPUT FORMAT ===
-1. List all ${transitionCount} transitions with SAME or DIFF
-2. Final line: JSON array like [[1,2],[3],[4,5,6]]
-
-START WITH TRANSITION 1→2 AND GO ALL THE WAY TO ${frameCount-1}→${frameCount}.` }
+=== OUTPUT ===
+1. Fill in SAME or DIFF for each transition above
+2. End with JSON array: [[1,2],[3],[4,5,6]]` }
         ]
       }]
     });
