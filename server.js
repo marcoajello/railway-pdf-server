@@ -1,4 +1,4 @@
-// Version 3.0.0 - AI-powered border fix detection (context-aware)
+// Version 3.1.0 - Improved shot grouping logic
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -164,7 +164,7 @@ app.get('/auth/callback', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '3.0.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
+  res.json({ status: 'ok', version: '3.1.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
 });
 
 // PDF generation endpoint
@@ -755,7 +755,7 @@ function groupIntoShots(frames) {
   }));
 }
 
-// Pass 2: AI-powered shot grouping analysis
+// Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -798,24 +798,43 @@ async function analyzeGroupings(frames) {
           ...imageContents,
           { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
 
-Group them into SHOTS. Frames belong to the SAME SHOT if:
+Your task: Group consecutive frames that belong to the SAME CAMERA SETUP (same shot).
 
-1. SAME BACKGROUND ARCHITECTURE - Same room, same distinctive elements (range hood, cabinets, windows) visible from same angle
-2. SAME CHARACTER ARRANGEMENT - Characters in similar positions relative to each other  
-3. SAME CAMERA ANGLE - Shooting from same general direction
-4. CONTINUOUS ACTION - Action flows naturally across frames
+=== SAME SHOT (group together) ===
+Frames are the SAME SHOT if the camera stays in roughly the same position:
+- Character enters or exits frame (camera doesn't move, character does)
+- Character turns, gestures, or changes expression
+- Character picks up or interacts with objects
+- Multiple characters in continuous conversation from same angle
+- Action progresses naturally (reach → grab → pull)
+- Same background/environment visible from same angle
 
-IMPORTANT: Storyboard artists are inconsistent with scale. Focus on BACKGROUND ELEMENTS and ENVIRONMENT - if the same room/architecture is visible from the same angle, it's likely one continuous shot even if character positions shift slightly.
+=== NEW SHOT (separate) ===
+A NEW SHOT means the camera has moved to a different setup:
+- ANGLE CHANGE: Camera moves to opposite side or significantly different position
+- FRAMING CHANGE: Wide shot cuts to close-up, or close-up cuts to wide
+- SUBJECT CHANGE: Cut to different character as the focus
+- INSERT: Cut to product, object, or detail shot
+- LOCATION CHANGE: Different room or environment
 
-Frames are DIFFERENT SHOTS if:
-- Completely different location or background
-- Camera clearly on opposite side of characters
-- Cut to different subject entirely (insert, new scene)
+=== KEY PRINCIPLE ===
+Think like a director: "Would I need to stop rolling, move the camera, and set up again?"
+- If NO → same shot (group together)
+- If YES → new shot (separate)
 
-BIAS TOWARD GROUPING consecutive frames in the same environment.
+Characters moving WITHIN frame = SAME shot
+Camera moving to NEW position = DIFFERENT shot
 
-Return ONLY a JSON array:
-[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` }
+=== EXAMPLES ===
+- Frame shows Rick alone, next frame Rick + Tanya together from same angle = SAME SHOT (she walked in)
+- Frame shows wide shot of kitchen, next frame is close-up of hands = DIFFERENT SHOT (camera moved)
+- Frame shows character reaching, next shows them grabbing = SAME SHOT (continuous action)
+- Frame shows front of character, next shows their back = DIFFERENT SHOT (camera repositioned)
+
+Return ONLY a JSON array of shot groups:
+[[1, 2], [3, 4, 5], [6], [7, 8]]
+
+Where each inner array contains frame numbers belonging to one continuous camera setup.` }
         ]
       }]
     });
@@ -825,7 +844,7 @@ Return ONLY a JSON array:
     
     if (jsonMatch) {
       const groups = JSON.parse(jsonMatch[0]);
-      console.log(`[Storyboard] Pass 2: AI grouped into ${groups.length} shots`);
+      console.log(`[Storyboard] Pass 2: AI grouped into ${groups.length} shots:`, JSON.stringify(groups));
       
       // Apply groupings to frames
       groups.forEach((group, shotIdx) => {
