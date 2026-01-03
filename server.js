@@ -1,4 +1,4 @@
-// Version 3.5.2 - Visual face/back test for grouping
+// Version 3.5.3 - Describe then decide approach
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -651,7 +651,7 @@ function groupIntoShots(frames) {
   }));
 }
 
-// Pass 2: AI-powered shot grouping analysis - VISUAL TEST (v3.5.2)
+// Pass 2: AI-powered shot grouping analysis - DESCRIBE THEN DECIDE (v3.5.3)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -692,55 +692,41 @@ async function analyzeGroupings(frames) {
     const frameCount = framesWithImages.length;
     const transitionCount = frameCount - 1;
     
-    // Build the list of required transitions
-    const transitionList = [];
-    for (let i = 1; i < frameCount; i++) {
-      transitionList.push(`${i}→${i+1}: [SAME/DIFF]`);
-    }
-    
     console.log(`[Storyboard] Pass 2: Analyzing ${frameCount} frames for shot grouping`);
     
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 3000,
+      max_tokens: 4000,
       messages: [{
         role: 'user',
         content: [
           ...imageContents,
           { type: 'text', text: `Group these ${frameCount} storyboard frames into camera setups.
 
-=== THE ONE TEST THAT MATTERS ===
-
-For each transition, ask: "Can I see the SAME SIDE of the main character?"
-
-- If I see their FACE in both frames → could be SAME
-- If I see their BACK in both frames → could be SAME  
-- If I see their FACE in one and BACK in the other → ALWAYS DIFF (camera moved 180°)
-
-This is the #1 most important test. A character turning around while the camera stays still is rare in storyboards - usually when we see a different side of someone, the CAMERA moved.
-
-=== OTHER DIFF TRIGGERS ===
-- Shot size changed dramatically (wide ↔ close-up)
-- Completely different background visible
-- Insert shot (product, object, hands only)
-
-=== SAME REQUIRES ===
-- Same side of character visible (both face OR both back)
-- Similar shot size
-- Similar background elements
-
 === TASK ===
-For each transition, write SAME or DIFF:
+For each transition, you MUST:
+1. Describe what you SEE in the first frame (who, facing which way, shot size)
+2. Describe what you SEE in the second frame (who, facing which way, shot size)
+3. Then decide SAME or DIFF
 
-${transitionList.join('\n')}
+=== FORMAT (required) ===
+1→2: [Frame 1: describe] → [Frame 2: describe] = SAME/DIFF
+2→3: [Frame 2: describe] → [Frame 3: describe] = SAME/DIFF
+...and so on for all ${transitionCount} transitions
 
-Then output the final JSON grouping: [[1,2],[3],[4,5,6]]` }
+=== THE KEY TEST ===
+If you see a character's FACE in one frame and their BACK in the next (or vice versa), that's ALWAYS DIFF - the camera moved 180°.
+
+=== AFTER ALL TRANSITIONS ===
+Output the final JSON grouping array: [[1,2],[3],[4,5,6]]
+
+START NOW - describe each frame visually before deciding.` }
         ]
       }]
     });
     
     const text = response.content[0].text;
-    console.log(`[Storyboard] Pass 2 response (first 1000 chars):`, text.substring(0, 1000));
+    console.log(`[Storyboard] Pass 2 response (first 1500 chars):`, text.substring(0, 1500));
     
     const jsonMatch = text.match(/\[\s*\[[\s\S]*\]\s*\]/);
     
