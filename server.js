@@ -1,4 +1,4 @@
-// Version 3.4.2 - Explicit face/back distinction
+// Version 3.5.0 - Fast PDF conversion with pdf-to-png-converter
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -476,151 +476,42 @@ async function detectRectangles(imagePath) {
 }
 
 /**
- * Convert PDF to page images with retry logic for CDN reliability
+ * Convert PDF to page images using pdf-to-png-converter (fast, no Puppeteer)
  */
-async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
-  const MAX_RETRIES = 2;
-  let browser = null;
+async function pdfToImages(pdfBuffer, outputDir) {
   const images = [];
   
   try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+    const { pdfToPng } = await import('pdf-to-png-converter');
+    
+    console.log(`[Storyboard] Converting PDF to images...`);
+    const startTime = Date.now();
+    
+    const pngPages = await pdfToPng(pdfBuffer, {
+      viewportScale: 2.0,
+      disableFontFace: true,
+      useSystemFonts: false,
+      returnPageContent: true
     });
     
-    const page = await browser.newPage();
-    page.setDefaultNavigationTimeout(180000);
-    page.setDefaultTimeout(180000);
-    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 2 });
+    console.log(`[Storyboard] PDF: ${pngPages.length} pages (converted in ${((Date.now() - startTime) / 1000).toFixed(1)}s)`);
     
-    const base64Pdf = pdfBuffer.toString('base64');
-    
-    // Inline PDF.js to avoid CDN dependency issues
-    // We fetch it once and embed it directly
-    const html = `<!DOCTYPE html><html><head>
-      <style>body{margin:0;background:white}canvas{display:block}#status{position:fixed;top:10px;left:10px;font-family:sans-serif;}</style>
-    </head><body>
-      <div id="status">Loading PDF.js...</div>
-      <canvas id="canvas"></canvas>
-      <script>
-        window.pdfError = null;
-        window.pdfReady = false;
-        
-        // Load PDF.js with error handling
-        function loadScript(url, callback) {
-          var script = document.createElement('script');
-          script.type = 'text/javascript';
-          script.onload = callback;
-          script.onerror = function() {
-            window.pdfError = 'Failed to load: ' + url;
-            document.getElementById('status').textContent = window.pdfError;
-          };
-          script.src = url;
-          document.head.appendChild(script);
-        }
-        
-        loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js', function() {
-          document.getElementById('status').textContent = 'PDF.js loaded, configuring...';
-          pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-          window.pdfReady = true;
-          document.getElementById('status').textContent = 'Ready';
-        });
-        
-        window.renderPage = async function(n) {
-          const d = atob('${base64Pdf}');
-          const a = new Uint8Array(d.length);
-          for (let i = 0; i < d.length; i++) a[i] = d.charCodeAt(i);
-          const pdf = await pdfjsLib.getDocument({data: a}).promise;
-          if (n > pdf.numPages) return null;
-          const pg = await pdf.getPage(n);
-          const vp = pg.getViewport({scale: 2});
-          const c = document.getElementById('canvas');
-          c.width = vp.width;
-          c.height = vp.height;
-          await pg.render({canvasContext: c.getContext('2d'), viewport: vp}).promise;
-          return {w: c.width, h: c.height};
-        };
-        
-        window.getPageCount = async function() {
-          const d = atob('${base64Pdf}');
-          const a = new Uint8Array(d.length);
-          for (let i = 0; i < d.length; i++) a[i] = d.charCodeAt(i);
-          return (await pdfjsLib.getDocument({data: a}).promise).numPages;
-        };
-      </script>
-    </body></html>`;
-    
-    // Use 'load' instead of 'networkidle0' to be more tolerant
-    await page.setContent(html, { waitUntil: 'load', timeout: 60000 });
-    
-    // Wait for PDF.js with polling (more reliable than waitForFunction with CDN)
-    let waitAttempts = 0;
-    const maxWaitAttempts = 60; // 60 seconds max
-    while (waitAttempts < maxWaitAttempts) {
-      const status = await page.evaluate(() => ({ ready: window.pdfReady, error: window.pdfError }));
-      if (status.error) {
-        throw new Error(status.error);
-      }
-      if (status.ready) {
-        break;
-      }
-      await new Promise(r => setTimeout(r, 1000));
-      waitAttempts++;
-    }
-    
-    if (waitAttempts >= maxWaitAttempts) {
-      throw new Error('PDF.js load timeout after 60 seconds');
-    }
-    
-    console.log(`[Storyboard] PDF.js loaded after ${waitAttempts}s`);
-    
-    const pageCount = await page.evaluate('getPageCount()');
-    console.log(`[Storyboard] PDF: ${pageCount} pages`);
-    
-    for (let i = 1; i <= pageCount; i++) {
-      await page.evaluate(`renderPage(${i})`);
-      await new Promise(r => setTimeout(r, 400));
-      const canvas = await page.$('#canvas');
-      const tempPath = path.join(outputDir, `page-${i}-temp.png`);
-      const imgPath = path.join(outputDir, `page-${i}.jpg`);
+    // Process each page with sharp to resize and convert to jpg
+    for (const page of pngPages) {
+      const imgPath = path.join(outputDir, `page-${page.pageNumber}.jpg`);
       
-      await canvas.screenshot({ path: tempPath, type: 'png' });
-      
-      await sharp(tempPath)
+      await sharp(page.content)
         .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
         .jpeg({ quality: 40, progressive: true })
         .toFile(imgPath);
-      
-      await fs.unlink(tempPath);
       
       images.push(imgPath);
     }
     
     return images;
   } catch (error) {
-    console.error(`[Storyboard] pdfToImages error (attempt ${retryCount + 1}):`, error.message);
-    
-    if (browser) {
-      await browser.close();
-      browser = null;
-    }
-    
-    // Retry on CDN/timeout errors
-    if (retryCount < MAX_RETRIES && (
-      error.message.includes('timeout') || 
-      error.message.includes('Timeout') ||
-      error.message.includes('Failed to load') ||
-      error.message.includes('net::')
-    )) {
-      console.log(`[Storyboard] Retrying... (${retryCount + 1}/${MAX_RETRIES})`);
-      await new Promise(r => setTimeout(r, 2000 * (retryCount + 1))); // Exponential backoff
-      return pdfToImages(pdfBuffer, outputDir, retryCount + 1);
-    }
-    
+    console.error(`[Storyboard] pdfToImages error:`, error.message);
     throw error;
-  } finally {
-    if (browser) await browser.close();
   }
 }
 
