@@ -1,4 +1,4 @@
-// Version 3.2.0 - Background-first shot grouping
+// Version 3.3.0 - Background + framing shot grouping
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -756,7 +756,7 @@ function groupIntoShots(frames) {
 }
 
 // Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
-// Pass 2: AI-powered shot grouping analysis - BACKGROUND-FIRST APPROACH (v3.2.0)
+// Pass 2: AI-powered shot grouping analysis - BACKGROUND + FRAMING (v3.3.0)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -784,7 +784,7 @@ async function analyzeGroupings(frames) {
           source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') }
         });
         
-        // Add the description/copy for this frame (helps detect camera movement keywords)
+        // Add the description/copy for this frame
         imageContents.push({
           type: 'text',
           text: `Frame ${i + 1}: ${f.description || '(no description)'}`
@@ -792,7 +792,7 @@ async function analyzeGroupings(frames) {
       }
     }
     
-    if (imageContents.length < 4) return frames; // Need at least 2 frames with descriptions
+    if (imageContents.length < 4) return frames;
     
     console.log(`[Storyboard] Pass 2: Analyzing ${framesWithImages.length} frames for shot grouping`);
     
@@ -803,46 +803,42 @@ async function analyzeGroupings(frames) {
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `Group these ${framesWithImages.length} storyboard frames into CAMERA SETUPS (shots).
+          { type: 'text', text: `Group these ${framesWithImages.length} storyboard frames into CAMERA SETUPS.
 
-=== STEP 1: GROUP BY BACKGROUND (PRIMARY SIGNAL) ===
-The most important grouping signal is BACKGROUND SIMILARITY.
+A CAMERA SETUP means the camera is in ONE PHYSICAL POSITION. Multiple scenes can happen in the same room but from DIFFERENT setups.
 
-Frames with the SAME or SIMILAR background belong to the SAME SETUP:
-- Same room/environment visible
-- Same architectural elements (walls, windows, cabinets, furniture, ceiling beams)
-- Same camera angle on the space
-- Characters may enter, exit, move, or change - that doesn't matter
+=== SAME SETUP (group together) ===
+Frames belong to the SAME SETUP if ALL of these match:
+1. SAME SPECIFIC BACKGROUND ELEMENTS - Not just "same room", but same specific walls/objects visible
+2. SAME CAMERA HEIGHT - Eye level vs high angle vs low angle
+3. SAME SHOT SIZE - Wide vs medium vs close-up
+4. SAME CAMERA SIDE - Which direction camera is facing
 
-FOCUS ON THE ENVIRONMENT, not the characters. If you're looking at the same room from the same angle, it's the same setup regardless of what the characters are doing.
+Example: Two wide shots showing the same back wall with the same window = SAME SETUP
+Example: Close-up of face vs wide shot of room = DIFFERENT SETUP (even if same room)
 
-=== STEP 2: CHECK FOR CAMERA MOVEMENT ===
-After grouping by background, check if adjacent frames might connect via camera movement.
+=== DIFFERENT SETUP (separate) ===
+Start a NEW group when you see:
+- Different background elements visible (different wall, different objects behind characters)
+- Different shot size (wide → close-up, or close-up → wide)
+- Different camera angle (high → eye level, front → side)
+- Insert shot (product, clock, object detail)
+- Clear change in which characters are the focus
 
-CAMERA MOVEMENT KEYWORDS in descriptions:
-pan, tilt, push in, pull out, zoom, track, dolly, boom, crane, follow, reveal
+=== CAMERA MOVEMENT (may connect setups) ===
+Check descriptions for: pan, tilt, push, pull, zoom, track, dolly, boom, crane, follow, reveal
+If movement keywords present AND visuals show continuous space, group them.
 
-If the copy mentions camera movement AND the visual shows a natural extension of the previous frame's space (continuous visual field), group them together.
+=== ANALYZE EACH TRANSITION ===
+Go frame by frame. At each transition ask:
+"Is the camera in the SAME POSITION or did it MOVE?"
+- Same position = same setup (group)
+- Camera moved = new setup (separate)
 
-Signs of camera movement (NOT a cut):
-- Elements from previous frame visible at edge of new frame
-- Space extends naturally (like sliding a window across a panorama)
-- Same lighting, same depth, same general environment
+Return ONLY a JSON array:
+[[1, 2], [3], [4, 5, 6], [7], [8, 9]]
 
-=== STEP 3: WHAT IS A NEW SETUP ===
-Start a NEW group only when:
-- Background/environment CLEARLY changes (different room, different location)
-- Camera is obviously in a completely different position
-- Insert shot of object/product with neutral/different background
-- Establishing shot of entirely new location
-
-=== OUTPUT ===
-Return ONLY a JSON array of shot groups:
-[[1, 2, 3, 4], [5, 6], [7], [8, 9, 10]]
-
-Where each inner array contains frame numbers that share the same background/camera setup.
-
-IMPORTANT: BIAS TOWARD GROUPING frames with similar backgrounds. Same room = same setup. When in doubt, GROUP THEM TOGETHER.` }
+Each inner array = frames shot from one camera position.` }
         ]
       }]
     });
