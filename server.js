@@ -1,4 +1,4 @@
-// Version 3.1.0 - Improved shot grouping logic
+// Version 3.2.0 - Background-first shot grouping
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -756,6 +756,7 @@ function groupIntoShots(frames) {
 }
 
 // Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
+// Pass 2: AI-powered shot grouping analysis - BACKGROUND-FIRST APPROACH (v3.2.0)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -769,7 +770,7 @@ async function analyzeGroupings(frames) {
     // Build a grid of thumbnails for the AI to analyze
     const imageContents = [];
     
-    // Create smaller thumbnails for pass 2
+    // Create smaller thumbnails for pass 2, include descriptions
     for (let i = 0; i < Math.min(framesWithImages.length, 24); i++) {
       const f = framesWithImages[i];
       if (f.image) {
@@ -782,12 +783,18 @@ async function analyzeGroupings(frames) {
           type: 'image',
           source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') }
         });
+        
+        // Add the description/copy for this frame (helps detect camera movement keywords)
+        imageContents.push({
+          type: 'text',
+          text: `Frame ${i + 1}: ${f.description || '(no description)'}`
+        });
       }
     }
     
-    if (imageContents.length < 2) return frames;
+    if (imageContents.length < 4) return frames; // Need at least 2 frames with descriptions
     
-    console.log(`[Storyboard] Pass 2: Analyzing ${imageContents.length} frames for shot grouping`);
+    console.log(`[Storyboard] Pass 2: Analyzing ${framesWithImages.length} frames for shot grouping`);
     
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
@@ -796,45 +803,46 @@ async function analyzeGroupings(frames) {
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
+          { type: 'text', text: `Group these ${framesWithImages.length} storyboard frames into CAMERA SETUPS (shots).
 
-Your task: Group consecutive frames that belong to the SAME CAMERA SETUP (same shot).
+=== STEP 1: GROUP BY BACKGROUND (PRIMARY SIGNAL) ===
+The most important grouping signal is BACKGROUND SIMILARITY.
 
-=== SAME SHOT (group together) ===
-Frames are the SAME SHOT if the camera stays in roughly the same position:
-- Character enters or exits frame (camera doesn't move, character does)
-- Character turns, gestures, or changes expression
-- Character picks up or interacts with objects
-- Multiple characters in continuous conversation from same angle
-- Action progresses naturally (reach → grab → pull)
-- Same background/environment visible from same angle
+Frames with the SAME or SIMILAR background belong to the SAME SETUP:
+- Same room/environment visible
+- Same architectural elements (walls, windows, cabinets, furniture, ceiling beams)
+- Same camera angle on the space
+- Characters may enter, exit, move, or change - that doesn't matter
 
-=== NEW SHOT (separate) ===
-A NEW SHOT means the camera has moved to a different setup:
-- ANGLE CHANGE: Camera moves to opposite side or significantly different position
-- FRAMING CHANGE: Wide shot cuts to close-up, or close-up cuts to wide
-- SUBJECT CHANGE: Cut to different character as the focus
-- INSERT: Cut to product, object, or detail shot
-- LOCATION CHANGE: Different room or environment
+FOCUS ON THE ENVIRONMENT, not the characters. If you're looking at the same room from the same angle, it's the same setup regardless of what the characters are doing.
 
-=== KEY PRINCIPLE ===
-Think like a director: "Would I need to stop rolling, move the camera, and set up again?"
-- If NO → same shot (group together)
-- If YES → new shot (separate)
+=== STEP 2: CHECK FOR CAMERA MOVEMENT ===
+After grouping by background, check if adjacent frames might connect via camera movement.
 
-Characters moving WITHIN frame = SAME shot
-Camera moving to NEW position = DIFFERENT shot
+CAMERA MOVEMENT KEYWORDS in descriptions:
+pan, tilt, push in, pull out, zoom, track, dolly, boom, crane, follow, reveal
 
-=== EXAMPLES ===
-- Frame shows Rick alone, next frame Rick + Tanya together from same angle = SAME SHOT (she walked in)
-- Frame shows wide shot of kitchen, next frame is close-up of hands = DIFFERENT SHOT (camera moved)
-- Frame shows character reaching, next shows them grabbing = SAME SHOT (continuous action)
-- Frame shows front of character, next shows their back = DIFFERENT SHOT (camera repositioned)
+If the copy mentions camera movement AND the visual shows a natural extension of the previous frame's space (continuous visual field), group them together.
 
+Signs of camera movement (NOT a cut):
+- Elements from previous frame visible at edge of new frame
+- Space extends naturally (like sliding a window across a panorama)
+- Same lighting, same depth, same general environment
+
+=== STEP 3: WHAT IS A NEW SETUP ===
+Start a NEW group only when:
+- Background/environment CLEARLY changes (different room, different location)
+- Camera is obviously in a completely different position
+- Insert shot of object/product with neutral/different background
+- Establishing shot of entirely new location
+
+=== OUTPUT ===
 Return ONLY a JSON array of shot groups:
-[[1, 2], [3, 4, 5], [6], [7, 8]]
+[[1, 2, 3, 4], [5, 6], [7], [8, 9, 10]]
 
-Where each inner array contains frame numbers belonging to one continuous camera setup.` }
+Where each inner array contains frame numbers that share the same background/camera setup.
+
+IMPORTANT: BIAS TOWARD GROUPING frames with similar backgrounds. Same room = same setup. When in doubt, GROUP THEM TOGETHER.` }
         ]
       }]
     });
@@ -863,6 +871,7 @@ Where each inner array contains frame numbers belonging to one continuous camera
   
   return frames;
 }
+
 
 app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'storyboard-'));
