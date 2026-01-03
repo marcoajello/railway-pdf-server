@@ -1,4 +1,4 @@
-// Version 3.4.0 - Step-by-step transition analysis
+// Version 3.4.1 - Force all transitions with template
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -756,7 +756,7 @@ function groupIntoShots(frames) {
 }
 
 // Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
-// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.0)
+// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.1)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -795,59 +795,55 @@ async function analyzeGroupings(frames) {
     if (imageContents.length < 4) return frames;
     
     const frameCount = framesWithImages.length;
+    const transitionCount = frameCount - 1;
+    
+    // Build the list of required transitions
+    const transitionList = [];
+    for (let i = 1; i < frameCount; i++) {
+      transitionList.push(`${i}→${i+1}: [SAME/DIFF]`);
+    }
+    
     console.log(`[Storyboard] Pass 2: Analyzing ${frameCount} frames for shot grouping`);
     
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 2048,
+      max_tokens: 3000,
       messages: [{
         role: 'user',
         content: [
           ...imageContents,
           { type: 'text', text: `Analyze these ${frameCount} storyboard frames and group them into camera setups.
 
-IMPORTANT: You must analyze EVERY transition. Do not rush or skip frames at the end.
+=== TASK: ANALYZE ALL ${transitionCount} TRANSITIONS ===
 
-=== STEP 1: ANALYZE EACH TRANSITION ===
-For EACH pair of consecutive frames, determine: SAME setup or DIFFERENT setup?
+For each transition, write SAME or DIFF:
+- SAME = camera stayed in same position (same background, same shot size, same angle)
+- DIFF = camera moved (different background, different shot size, or different angle)
 
-SAME SETUP if:
-- Same specific background elements visible (same wall, same objects)
-- Same shot size (both wide, both medium, or both close-up)
-- Same camera angle/height
+Key things that make it DIFFERENT:
+- Seeing character's BACK vs FRONT = different setup
+- Wide shot vs close-up = different setup  
+- Different wall/background visible = different setup
 
-DIFFERENT SETUP if:
-- Different background elements visible
-- Shot size changed (wide → close, close → wide)
-- Camera angle changed significantly
-- Insert shot (product, object, clock)
+You MUST analyze ALL ${transitionCount} transitions. Here is the template:
 
-Write out your analysis for EVERY transition:
-- 1→2: [SAME/DIFFERENT] because [reason]
-- 2→3: [SAME/DIFFERENT] because [reason]
-- 3→4: [SAME/DIFFERENT] because [reason]
-... continue for ALL ${frameCount - 1} transitions ...
+${transitionList.join('\n')}
 
-=== STEP 2: BUILD GROUPS ===
-Based on your transition analysis, build the groups:
-- Start group 1 with frame 1
-- Each time you marked DIFFERENT, start a new group
-- Each time you marked SAME, add to current group
+Fill in SAME or DIFF for each one above, then provide the final JSON grouping.
 
 === OUTPUT FORMAT ===
-First show your transition analysis (brief, one line each).
-Then on the final line, output ONLY the JSON array:
-[[1, 2], [3, 4, 5], [6], [7, 8, 9]]
+1. List all ${transitionCount} transitions with SAME or DIFF
+2. Final line: JSON array like [[1,2],[3],[4,5,6]]
 
-You MUST analyze all ${frameCount - 1} transitions before giving the final grouping.` }
+START WITH TRANSITION 1→2 AND GO ALL THE WAY TO ${frameCount-1}→${frameCount}.` }
         ]
       }]
     });
     
     const text = response.content[0].text;
-    console.log(`[Storyboard] Pass 2 response:`, text.substring(0, 500));
+    console.log(`[Storyboard] Pass 2 response (first 1000 chars):`, text.substring(0, 1000));
     
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    const jsonMatch = text.match(/\[\s*\[[\s\S]*\]\s*\]/);
     
     if (jsonMatch) {
       const groups = JSON.parse(jsonMatch[0]);
