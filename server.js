@@ -1,4 +1,4 @@
-// Version 3.3.0 - Background + framing shot grouping
+// Version 3.4.0 - Step-by-step transition analysis
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -756,7 +756,7 @@ function groupIntoShots(frames) {
 }
 
 // Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
-// Pass 2: AI-powered shot grouping analysis - BACKGROUND + FRAMING (v3.3.0)
+// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.0)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -794,56 +794,59 @@ async function analyzeGroupings(frames) {
     
     if (imageContents.length < 4) return frames;
     
-    console.log(`[Storyboard] Pass 2: Analyzing ${framesWithImages.length} frames for shot grouping`);
+    const frameCount = framesWithImages.length;
+    console.log(`[Storyboard] Pass 2: Analyzing ${frameCount} frames for shot grouping`);
     
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
+      max_tokens: 2048,
       messages: [{
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `Group these ${framesWithImages.length} storyboard frames into CAMERA SETUPS.
+          { type: 'text', text: `Analyze these ${frameCount} storyboard frames and group them into camera setups.
 
-A CAMERA SETUP means the camera is in ONE PHYSICAL POSITION. Multiple scenes can happen in the same room but from DIFFERENT setups.
+IMPORTANT: You must analyze EVERY transition. Do not rush or skip frames at the end.
 
-=== SAME SETUP (group together) ===
-Frames belong to the SAME SETUP if ALL of these match:
-1. SAME SPECIFIC BACKGROUND ELEMENTS - Not just "same room", but same specific walls/objects visible
-2. SAME CAMERA HEIGHT - Eye level vs high angle vs low angle
-3. SAME SHOT SIZE - Wide vs medium vs close-up
-4. SAME CAMERA SIDE - Which direction camera is facing
+=== STEP 1: ANALYZE EACH TRANSITION ===
+For EACH pair of consecutive frames, determine: SAME setup or DIFFERENT setup?
 
-Example: Two wide shots showing the same back wall with the same window = SAME SETUP
-Example: Close-up of face vs wide shot of room = DIFFERENT SETUP (even if same room)
+SAME SETUP if:
+- Same specific background elements visible (same wall, same objects)
+- Same shot size (both wide, both medium, or both close-up)
+- Same camera angle/height
 
-=== DIFFERENT SETUP (separate) ===
-Start a NEW group when you see:
-- Different background elements visible (different wall, different objects behind characters)
-- Different shot size (wide → close-up, or close-up → wide)
-- Different camera angle (high → eye level, front → side)
-- Insert shot (product, clock, object detail)
-- Clear change in which characters are the focus
+DIFFERENT SETUP if:
+- Different background elements visible
+- Shot size changed (wide → close, close → wide)
+- Camera angle changed significantly
+- Insert shot (product, object, clock)
 
-=== CAMERA MOVEMENT (may connect setups) ===
-Check descriptions for: pan, tilt, push, pull, zoom, track, dolly, boom, crane, follow, reveal
-If movement keywords present AND visuals show continuous space, group them.
+Write out your analysis for EVERY transition:
+- 1→2: [SAME/DIFFERENT] because [reason]
+- 2→3: [SAME/DIFFERENT] because [reason]
+- 3→4: [SAME/DIFFERENT] because [reason]
+... continue for ALL ${frameCount - 1} transitions ...
 
-=== ANALYZE EACH TRANSITION ===
-Go frame by frame. At each transition ask:
-"Is the camera in the SAME POSITION or did it MOVE?"
-- Same position = same setup (group)
-- Camera moved = new setup (separate)
+=== STEP 2: BUILD GROUPS ===
+Based on your transition analysis, build the groups:
+- Start group 1 with frame 1
+- Each time you marked DIFFERENT, start a new group
+- Each time you marked SAME, add to current group
 
-Return ONLY a JSON array:
-[[1, 2], [3], [4, 5, 6], [7], [8, 9]]
+=== OUTPUT FORMAT ===
+First show your transition analysis (brief, one line each).
+Then on the final line, output ONLY the JSON array:
+[[1, 2], [3, 4, 5], [6], [7, 8, 9]]
 
-Each inner array = frames shot from one camera position.` }
+You MUST analyze all ${frameCount - 1} transitions before giving the final grouping.` }
         ]
       }]
     });
     
     const text = response.content[0].text;
+    console.log(`[Storyboard] Pass 2 response:`, text.substring(0, 500));
+    
     const jsonMatch = text.match(/\[[\s\S]*\]/);
     
     if (jsonMatch) {
