@@ -1,4 +1,4 @@
-// Version 3.5.3 - Describe then decide approach
+// Version 3.5.4 - Camera-relative face/back description
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -651,7 +651,7 @@ function groupIntoShots(frames) {
   }));
 }
 
-// Pass 2: AI-powered shot grouping analysis - DESCRIBE THEN DECIDE (v3.5.3)
+// Pass 2: AI-powered shot grouping analysis - CAMERA RELATIVE (v3.5.4)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -704,23 +704,28 @@ async function analyzeGroupings(frames) {
           { type: 'text', text: `Group these ${frameCount} storyboard frames into camera setups.
 
 === TASK ===
-For each transition, you MUST:
-1. Describe what you SEE in the first frame (who, facing which way, shot size)
-2. Describe what you SEE in the second frame (who, facing which way, shot size)
-3. Then decide SAME or DIFF
+For each transition, describe what YOU (the viewer) can see:
+- Can you see the character's FACE or their BACK?
+- What's the shot size (wide/medium/close-up)?
 
 === FORMAT (required) ===
-1→2: [Frame 1: describe] → [Frame 2: describe] = SAME/DIFF
-2→3: [Frame 2: describe] → [Frame 3: describe] = SAME/DIFF
-...and so on for all ${transitionCount} transitions
+For each transition write:
+X→Y: [Frame X: face/back visible, shot size] → [Frame Y: face/back visible, shot size] = SAME/DIFF
 
-=== THE KEY TEST ===
-If you see a character's FACE in one frame and their BACK in the next (or vice versa), that's ALWAYS DIFF - the camera moved 180°.
+Example:
+7→8: [Frame 7: man's BACK visible, medium shot] → [Frame 8: man's FACE visible, medium shot] = DIFF
 
-=== AFTER ALL TRANSITIONS ===
-Output the final JSON grouping array: [[1,2],[3],[4,5,6]]
+=== THE RULE ===
+If you can see someone's FACE in one frame and their BACK in the next = DIFF (camera moved)
+If you see the same view (both FACE or both BACK) with same shot size = could be SAME
 
-START NOW - describe each frame visually before deciding.` }
+=== DO ALL ${transitionCount} TRANSITIONS ===
+1→2: ...
+2→3: ...
+(continue through ${transitionCount - 1}→${transitionCount})
+
+=== THEN OUTPUT ===
+Final JSON grouping: [[1,2],[3],[4,5,6]]` }
         ]
       }]
     });
