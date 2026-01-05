@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simple rectangle detector for storyboard frames.
-Finds black-bordered rectangles. That's it.
+Rectangle detector for storyboard frames.
+Detects frames with black OR gray borders using multiple strategies.
 """
 import cv2
 import numpy as np
@@ -10,7 +10,7 @@ import sys
 import base64
 
 def detect_rectangles(image_path):
-    """Find black rectangles in the image, even if borders are slightly broken."""
+    """Find rectangles in the image using multiple detection strategies."""
     
     img = cv2.imread(image_path)
     if img is None:
@@ -19,19 +19,50 @@ def detect_rectangles(image_path):
     height, width = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Threshold to get black lines (invert so lines are white)
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    all_rectangles = []
     
-    # Light dilation to connect slightly broken lines - but not enough to bridge to text
+    # Strategy 1: Black borders (original method)
+    _, thresh1 = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
     kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(thresh, kernel, iterations=1)
+    dilated1 = cv2.dilate(thresh1, kernel, iterations=1)
+    rects1 = find_rectangles_in_mask(dilated1, width, height)
+    all_rectangles.extend(rects1)
     
-    # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Strategy 2: Gray borders (lighter threshold)
+    _, thresh2 = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    dilated2 = cv2.dilate(thresh2, kernel, iterations=2)
+    rects2 = find_rectangles_in_mask(dilated2, width, height)
+    all_rectangles.extend(rects2)
+    
+    # Strategy 3: Edge detection (Canny) for any border color
+    edges = cv2.Canny(gray, 50, 150)
+    dilated3 = cv2.dilate(edges, kernel, iterations=2)
+    rects3 = find_rectangles_in_mask(dilated3, width, height)
+    all_rectangles.extend(rects3)
+    
+    # Strategy 4: Adaptive threshold for varying lighting
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                      cv2.THRESH_BINARY_INV, 11, 2)
+    dilated4 = cv2.dilate(adaptive, kernel, iterations=1)
+    rects4 = find_rectangles_in_mask(dilated4, width, height)
+    all_rectangles.extend(rects4)
+    
+    # Deduplicate overlapping rectangles
+    rectangles = deduplicate_rectangles(all_rectangles)
+    
+    # Sort: top to bottom, then left to right (reading order)
+    row_threshold = max(150, height // 10)
+    rectangles.sort(key=lambda r: (r['y'] // row_threshold, r['x']))
+    
+    return rectangles
+
+def find_rectangles_in_mask(mask, img_width, img_height):
+    """Find valid rectangles in a binary mask."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     rectangles = []
-    min_area = (width * height) * 0.01   # At least 1% of image
-    max_area = (width * height) * 0.5    # At most 50% of image
+    min_area = (img_width * img_height) * 0.01   # At least 1% of image
+    max_area = (img_width * img_height) * 0.5    # At most 50% of image
     
     for contour in contours:
         area = cv2.contourArea(contour)
@@ -63,12 +94,47 @@ def detect_rectangles(image_path):
             'height': int(h)
         })
     
-    # Sort: top to bottom, then left to right (reading order)
-    # Use adaptive row threshold based on image height (10% of image height)
-    row_threshold = max(150, height // 10)
-    rectangles.sort(key=lambda r: (r['y'] // row_threshold, r['x']))
-    
     return rectangles
+
+def deduplicate_rectangles(rectangles):
+    """Remove overlapping rectangles, keeping the largest one."""
+    if not rectangles:
+        return []
+    
+    # Sort by area (largest first)
+    rectangles.sort(key=lambda r: r['width'] * r['height'], reverse=True)
+    
+    kept = []
+    for rect in rectangles:
+        # Check if this rectangle overlaps significantly with any kept rectangle
+        dominated = False
+        for kept_rect in kept:
+            overlap = compute_overlap(rect, kept_rect)
+            if overlap > 0.5:  # More than 50% overlap
+                dominated = True
+                break
+        
+        if not dominated:
+            kept.append(rect)
+    
+    return kept
+
+def compute_overlap(r1, r2):
+    """Compute overlap ratio between two rectangles."""
+    x1 = max(r1['x'], r2['x'])
+    y1 = max(r1['y'], r2['y'])
+    x2 = min(r1['x'] + r1['width'], r2['x'] + r2['width'])
+    y2 = min(r1['y'] + r1['height'], r2['y'] + r2['height'])
+    
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    
+    intersection = (x2 - x1) * (y2 - y1)
+    area1 = r1['width'] * r1['height']
+    area2 = r2['width'] * r2['height']
+    
+    # Return overlap as fraction of smaller rectangle
+    return intersection / min(area1, area2)
 
 def crop_rectangles(image_path, rectangles):
     """Crop and return base64 images for each rectangle."""
