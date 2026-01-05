@@ -1,4 +1,4 @@
-// Version 3.5.3 - Describe then decide approach
+// Version 3.7.0 - AI fallback for frame detection when Python/OpenCV fails
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -424,9 +424,133 @@ This tells me: Page 1 has rows 1-7, Page 2 has rows 8-11.`
 // ============================================
 
 /**
- * Detect rectangles using Python/OpenCV
+ * Detect frame boundaries using AI (Claude) - fallback when OpenCV fails
+ * Returns coordinates for each frame on the page
+ */
+async function detectFramesWithAI(imagePath) {
+  const client = getAnthropicClient();
+  if (!client) return null;
+  
+  try {
+    const imageBuffer = await fs.readFile(imagePath);
+    const base64 = imageBuffer.toString('base64');
+    
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/jpeg', data: base64 }
+          },
+          {
+            type: 'text',
+            text: `This is a storyboard page. Identify all the frame/panel boundaries.
+
+For each frame, provide the bounding box as percentage of image dimensions:
+- x: left edge (0-100)
+- y: top edge (0-100)  
+- w: width (0-100)
+- h: height (0-100)
+
+Return ONLY a JSON array, nothing else:
+[{"x": 5, "y": 5, "w": 30, "h": 28}, {"x": 36, "y": 5, "w": 30, "h": 28}, ...]
+
+List frames in reading order (left to right, top to bottom).
+Include ALL frames, even if they contain text/UI mockups/logos.
+Do NOT include the caption/dialog text areas below frames.`
+          }
+        ]
+      }]
+    });
+    
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    
+    if (jsonMatch) {
+      const frames = JSON.parse(jsonMatch[0]);
+      console.log(`[Storyboard] AI detected ${frames.length} frames`);
+      return frames;
+    }
+  } catch (e) {
+    console.error('[Storyboard] AI frame detection error:', e.message);
+  }
+  
+  return null;
+}
+
+/**
+ * Crop frames from image using AI-detected boundaries (percentages)
+ */
+async function cropAIDetectedFrames(imagePath, aiFrames) {
+  const metadata = await sharp(imagePath).metadata();
+  const { width, height } = metadata;
+  
+  const rectangles = [];
+  const images = [];
+  
+  for (const frame of aiFrames) {
+    // Convert percentages to pixels
+    const x = Math.floor((frame.x / 100) * width);
+    const y = Math.floor((frame.y / 100) * height);
+    const w = Math.floor((frame.w / 100) * width);
+    const h = Math.floor((frame.h / 100) * height);
+    
+    // Clamp to image bounds
+    const cropX = Math.max(0, x);
+    const cropY = Math.max(0, y);
+    const cropW = Math.min(w, width - cropX);
+    const cropH = Math.min(h, height - cropY);
+    
+    if (cropW < 50 || cropH < 50) continue; // Skip tiny frames
+    
+    try {
+      const frameBuffer = await sharp(imagePath)
+        .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      
+      rectangles.push({ x: cropX, y: cropY, width: cropW, height: cropH });
+      images.push(frameBuffer.toString('base64'));
+    } catch (e) {
+      console.error(`[Storyboard] Frame crop error:`, e.message);
+    }
+  }
+  
+  return { count: rectangles.length, rectangles, images };
+}
+
+/**
+ * Detect rectangles using Python/OpenCV, with AI fallback
  */
 async function detectRectangles(imagePath) {
+  // First try Python/OpenCV
+  const pythonResult = await detectRectanglesPython(imagePath);
+  
+  // If Python found frames, use them
+  if (pythonResult.count > 0) {
+    return pythonResult;
+  }
+  
+  // Fallback to AI detection
+  console.log('[Storyboard] Python found no frames, trying AI detection...');
+  const aiFrames = await detectFramesWithAI(imagePath);
+  
+  if (aiFrames && aiFrames.length > 0) {
+    return await cropAIDetectedFrames(imagePath, aiFrames);
+  }
+  
+  // Both failed
+  console.log('[Storyboard] AI detection also found no frames');
+  return { count: 0, rectangles: [], images: [] };
+}
+
+/**
+ * Detect rectangles using Python/OpenCV
+ */
+async function detectRectanglesPython(imagePath) {
   return new Promise((resolve) => {
     const script = path.join(__dirname, 'frame_detector.py');
     
@@ -490,7 +614,7 @@ async function pdfToImages(pdfBuffer, outputDir) {
       disableFontFace: true,
       useSystemFonts: false,
       returnPageContent: true,
-      processPagesInParallel: true  // Enable parallel page processing
+      processPagesInParallel: true
     });
     
     const pdfTime = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -651,7 +775,8 @@ function groupIntoShots(frames) {
   }));
 }
 
-// Pass 2: AI-powered shot grouping analysis - DESCRIBE THEN DECIDE (v3.5.3)
+// Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
+// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.2)
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -692,41 +817,58 @@ async function analyzeGroupings(frames) {
     const frameCount = framesWithImages.length;
     const transitionCount = frameCount - 1;
     
+    // Build the list of required transitions
+    const transitionList = [];
+    for (let i = 1; i < frameCount; i++) {
+      transitionList.push(`${i}→${i+1}: [SAME/DIFF]`);
+    }
+    
     console.log(`[Storyboard] Pass 2: Analyzing ${frameCount} frames for shot grouping`);
     
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
+      max_tokens: 3000,
       messages: [{
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `Group these ${frameCount} storyboard frames into camera setups.
+          { type: 'text', text: `Analyze these ${frameCount} storyboard frames and group them into camera setups.
 
-=== TASK ===
-For each transition, you MUST:
-1. Describe what you SEE in the first frame (who, facing which way, shot size)
-2. Describe what you SEE in the second frame (who, facing which way, shot size)
-3. Then decide SAME or DIFF
+=== CRITICAL: HOW TO DETERMINE SAME vs DIFF ===
 
-=== FORMAT (required) ===
-1→2: [Frame 1: describe] → [Frame 2: describe] = SAME/DIFF
-2→3: [Frame 2: describe] → [Frame 3: describe] = SAME/DIFF
-...and so on for all ${transitionCount} transitions
+Ask yourself: "Is the camera in the SAME PHYSICAL POSITION?"
 
-=== THE KEY TEST ===
-If you see a character's FACE in one frame and their BACK in the next (or vice versa), that's ALWAYS DIFF - the camera moved 180°.
+DIFF (different setup) if ANY of these are true:
+- Character facing camera in one frame, back to camera in other = DIFF
+- Can see character's face in one, can't see it in other = DIFF  
+- Wide shot vs close-up = DIFF
+- Different background/wall visible = DIFF
+- Camera on opposite side of the action = DIFF
 
-=== AFTER ALL TRANSITIONS ===
-Output the final JSON grouping array: [[1,2],[3],[4,5,6]]
+SAME (same setup) ONLY if ALL of these are true:
+- Camera is filming from exact same position
+- Same background elements visible
+- Same shot size (both wide, both medium, or both close-up)
+- Same characters visible from same angle
 
-START NOW - describe each frame visually before deciding.` }
+=== IMPORTANT ===
+"Same room" does NOT mean "same setup"!
+A kitchen scene can have 10 different camera setups.
+Focus on WHERE THE CAMERA IS, not where the characters are.
+
+=== TASK: FILL IN ALL ${transitionCount} TRANSITIONS ===
+
+${transitionList.join('\n')}
+
+=== OUTPUT ===
+1. Fill in SAME or DIFF for each transition above
+2. End with JSON array: [[1,2],[3],[4,5,6]]` }
         ]
       }]
     });
     
     const text = response.content[0].text;
-    console.log(`[Storyboard] Pass 2 response (first 1500 chars):`, text.substring(0, 1500));
+    console.log(`[Storyboard] Pass 2 response (first 1000 chars):`, text.substring(0, 1000));
     
     const jsonMatch = text.match(/\[\s*\[[\s\S]*\]\s*\]/);
     
