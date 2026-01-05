@@ -1,4 +1,4 @@
-// Version 3.6.0 - Grid-based frame extraction option
+// Version 3.7.0 - AI-based frame detection fallback
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -424,9 +424,132 @@ This tells me: Page 1 has rows 1-7, Page 2 has rows 8-11.`
 // ============================================
 
 /**
- * Detect rectangles using Python/OpenCV
+ * Detect frame boundaries using AI (Claude) - fallback when OpenCV fails
+ * Returns coordinates for each frame on the page
+ */
+async function detectFramesWithAI(imageBuffer) {
+  const client = getAnthropicClient();
+  if (!client) return null;
+  
+  try {
+    const base64 = imageBuffer.toString('base64');
+    
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/jpeg', data: base64 }
+          },
+          {
+            type: 'text',
+            text: `This is a storyboard page. Identify all the frame/panel boundaries.
+
+For each frame, provide the bounding box as percentage of image dimensions:
+- x: left edge (0-100)
+- y: top edge (0-100)  
+- w: width (0-100)
+- h: height (0-100)
+
+Return ONLY a JSON array, nothing else:
+[{"x": 5, "y": 5, "w": 30, "h": 28}, {"x": 36, "y": 5, "w": 30, "h": 28}, ...]
+
+List frames in reading order (left to right, top to bottom).
+Include ALL frames, even if they contain text/UI mockups/logos.
+Do NOT include the caption/dialog text areas below frames.`
+          }
+        ]
+      }]
+    });
+    
+    const text = response.content[0].text;
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    
+    if (jsonMatch) {
+      const frames = JSON.parse(jsonMatch[0]);
+      console.log(`[Storyboard] AI detected ${frames.length} frames`);
+      return frames;
+    }
+  } catch (e) {
+    console.error('[Storyboard] AI frame detection error:', e.message);
+  }
+  
+  return null;
+}
+
+/**
+ * Crop frames from image using AI-detected boundaries (percentages)
+ */
+async function cropAIDetectedFrames(imagePath, aiFrames) {
+  const metadata = await sharp(imagePath).metadata();
+  const { width, height } = metadata;
+  
+  const rectangles = [];
+  const images = [];
+  
+  for (const frame of aiFrames) {
+    // Convert percentages to pixels
+    const x = Math.floor((frame.x / 100) * width);
+    const y = Math.floor((frame.y / 100) * height);
+    const w = Math.floor((frame.w / 100) * width);
+    const h = Math.floor((frame.h / 100) * height);
+    
+    // Clamp to image bounds
+    const cropX = Math.max(0, x);
+    const cropY = Math.max(0, y);
+    const cropW = Math.min(w, width - cropX);
+    const cropH = Math.min(h, height - cropY);
+    
+    if (cropW < 50 || cropH < 50) continue; // Skip tiny frames
+    
+    try {
+      const frameBuffer = await sharp(imagePath)
+        .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      
+      rectangles.push({ x: cropX, y: cropY, width: cropW, height: cropH });
+      images.push(frameBuffer.toString('base64'));
+    } catch (e) {
+      console.error(`[Storyboard] Frame crop error:`, e.message);
+    }
+  }
+  
+  return { count: rectangles.length, rectangles, images };
+}
+
+/**
+ * Detect rectangles using Python/OpenCV, with AI fallback
  */
 async function detectRectangles(imagePath, expectedCount = null) {
+  // First try Python/OpenCV
+  const pythonResult = await detectRectanglesPython(imagePath, expectedCount);
+  
+  // If Python found frames, use them
+  if (pythonResult.count > 0) {
+    return pythonResult;
+  }
+  
+  // Fallback to AI detection
+  console.log('[Storyboard] Python found no frames, trying AI detection...');
+  const imageBuffer = await fs.readFile(imagePath);
+  const aiFrames = await detectFramesWithAI(imageBuffer);
+  
+  if (aiFrames && aiFrames.length > 0) {
+    return await cropAIDetectedFrames(imagePath, aiFrames);
+  }
+  
+  // Both failed
+  return { count: 0, rectangles: [], images: [] };
+}
+
+/**
+ * Detect rectangles using Python/OpenCV
+ */
+async function detectRectanglesPython(imagePath, expectedCount = null) {
   return new Promise((resolve) => {
     const script = path.join(__dirname, 'frame_detector.py');
     
