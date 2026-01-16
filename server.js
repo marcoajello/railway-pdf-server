@@ -1,4 +1,4 @@
-// Version 3.7.0 - AI fallback for frame detection when Python/OpenCV fails
+// Version 3.0.0 - AI-powered border fix detection (context-aware)
 
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -164,7 +164,7 @@ app.get('/auth/callback', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '3.1.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
+  res.json({ status: 'ok', version: '3.0.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
 });
 
 // PDF generation endpoint
@@ -424,133 +424,9 @@ This tells me: Page 1 has rows 1-7, Page 2 has rows 8-11.`
 // ============================================
 
 /**
- * Detect frame boundaries using AI (Claude) - fallback when OpenCV fails
- * Returns coordinates for each frame on the page
- */
-async function detectFramesWithAI(imagePath) {
-  const client = getAnthropicClient();
-  if (!client) return null;
-  
-  try {
-    const imageBuffer = await fs.readFile(imagePath);
-    const base64 = imageBuffer.toString('base64');
-    
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1500,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: { type: 'base64', media_type: 'image/jpeg', data: base64 }
-          },
-          {
-            type: 'text',
-            text: `This is a storyboard page. Identify all the frame/panel boundaries.
-
-For each frame, provide the bounding box as percentage of image dimensions:
-- x: left edge (0-100)
-- y: top edge (0-100)  
-- w: width (0-100)
-- h: height (0-100)
-
-Return ONLY a JSON array, nothing else:
-[{"x": 5, "y": 5, "w": 30, "h": 28}, {"x": 36, "y": 5, "w": 30, "h": 28}, ...]
-
-List frames in reading order (left to right, top to bottom).
-Include ALL frames, even if they contain text/UI mockups/logos.
-Do NOT include the caption/dialog text areas below frames.`
-          }
-        ]
-      }]
-    });
-    
-    const text = response.content[0].text;
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    
-    if (jsonMatch) {
-      const frames = JSON.parse(jsonMatch[0]);
-      console.log(`[Storyboard] AI detected ${frames.length} frames`);
-      return frames;
-    }
-  } catch (e) {
-    console.error('[Storyboard] AI frame detection error:', e.message);
-  }
-  
-  return null;
-}
-
-/**
- * Crop frames from image using AI-detected boundaries (percentages)
- */
-async function cropAIDetectedFrames(imagePath, aiFrames) {
-  const metadata = await sharp(imagePath).metadata();
-  const { width, height } = metadata;
-  
-  const rectangles = [];
-  const images = [];
-  
-  for (const frame of aiFrames) {
-    // Convert percentages to pixels
-    const x = Math.floor((frame.x / 100) * width);
-    const y = Math.floor((frame.y / 100) * height);
-    const w = Math.floor((frame.w / 100) * width);
-    const h = Math.floor((frame.h / 100) * height);
-    
-    // Clamp to image bounds
-    const cropX = Math.max(0, x);
-    const cropY = Math.max(0, y);
-    const cropW = Math.min(w, width - cropX);
-    const cropH = Math.min(h, height - cropY);
-    
-    if (cropW < 50 || cropH < 50) continue; // Skip tiny frames
-    
-    try {
-      const frameBuffer = await sharp(imagePath)
-        .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
-        .jpeg({ quality: 85 })
-        .toBuffer();
-      
-      rectangles.push({ x: cropX, y: cropY, width: cropW, height: cropH });
-      images.push(frameBuffer.toString('base64'));
-    } catch (e) {
-      console.error(`[Storyboard] Frame crop error:`, e.message);
-    }
-  }
-  
-  return { count: rectangles.length, rectangles, images };
-}
-
-/**
- * Detect rectangles using Python/OpenCV, with AI fallback
- */
-async function detectRectangles(imagePath) {
-  // First try Python/OpenCV
-  const pythonResult = await detectRectanglesPython(imagePath);
-  
-  // If Python found frames, use them
-  if (pythonResult.count > 0) {
-    return pythonResult;
-  }
-  
-  // Fallback to AI detection
-  console.log('[Storyboard] Python found no frames, trying AI detection...');
-  const aiFrames = await detectFramesWithAI(imagePath);
-  
-  if (aiFrames && aiFrames.length > 0) {
-    return await cropAIDetectedFrames(imagePath, aiFrames);
-  }
-  
-  // Both failed
-  console.log('[Storyboard] AI detection also found no frames');
-  return { count: 0, rectangles: [], images: [] };
-}
-
-/**
  * Detect rectangles using Python/OpenCV
  */
-async function detectRectanglesPython(imagePath) {
+async function detectRectangles(imagePath) {
   return new Promise((resolve) => {
     const script = path.join(__dirname, 'frame_detector.py');
     
@@ -600,47 +476,151 @@ async function detectRectanglesPython(imagePath) {
 }
 
 /**
- * Convert PDF to page images using pdf-to-png-converter (fast, no Puppeteer)
+ * Convert PDF to page images with retry logic for CDN reliability
  */
-async function pdfToImages(pdfBuffer, outputDir) {
+async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
+  const MAX_RETRIES = 2;
+  let browser = null;
+  const images = [];
+  
   try {
-    const { pdfToPng } = await import('pdf-to-png-converter');
-    
-    console.log(`[Storyboard] Converting PDF to images...`);
-    const startTime = Date.now();
-    
-    const pngPages = await pdfToPng(pdfBuffer, {
-      viewportScale: 2.0,
-      disableFontFace: true,
-      useSystemFonts: false,
-      returnPageContent: true,
-      processPagesInParallel: true
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
     });
     
-    const pdfTime = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[Storyboard] PDF rendered: ${pngPages.length} pages in ${pdfTime}s`);
+    const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(180000);
+    page.setDefaultTimeout(180000);
+    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 2 });
     
-    // Process all pages with sharp in parallel
-    const sharpStart = Date.now();
-    const imagePromises = pngPages.map(async (page) => {
-      const imgPath = path.join(outputDir, `page-${page.pageNumber}.jpg`);
+    const base64Pdf = pdfBuffer.toString('base64');
+    
+    // Inline PDF.js to avoid CDN dependency issues
+    // We fetch it once and embed it directly
+    const html = `<!DOCTYPE html><html><head>
+      <style>body{margin:0;background:white}canvas{display:block}#status{position:fixed;top:10px;left:10px;font-family:sans-serif;}</style>
+    </head><body>
+      <div id="status">Loading PDF.js...</div>
+      <canvas id="canvas"></canvas>
+      <script>
+        window.pdfError = null;
+        window.pdfReady = false;
+        
+        // Load PDF.js with error handling
+        function loadScript(url, callback) {
+          var script = document.createElement('script');
+          script.type = 'text/javascript';
+          script.onload = callback;
+          script.onerror = function() {
+            window.pdfError = 'Failed to load: ' + url;
+            document.getElementById('status').textContent = window.pdfError;
+          };
+          script.src = url;
+          document.head.appendChild(script);
+        }
+        
+        loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js', function() {
+          document.getElementById('status').textContent = 'PDF.js loaded, configuring...';
+          pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+          window.pdfReady = true;
+          document.getElementById('status').textContent = 'Ready';
+        });
+        
+        window.renderPage = async function(n) {
+          const d = atob('${base64Pdf}');
+          const a = new Uint8Array(d.length);
+          for (let i = 0; i < d.length; i++) a[i] = d.charCodeAt(i);
+          const pdf = await pdfjsLib.getDocument({data: a}).promise;
+          if (n > pdf.numPages) return null;
+          const pg = await pdf.getPage(n);
+          const vp = pg.getViewport({scale: 2});
+          const c = document.getElementById('canvas');
+          c.width = vp.width;
+          c.height = vp.height;
+          await pg.render({canvasContext: c.getContext('2d'), viewport: vp}).promise;
+          return {w: c.width, h: c.height};
+        };
+        
+        window.getPageCount = async function() {
+          const d = atob('${base64Pdf}');
+          const a = new Uint8Array(d.length);
+          for (let i = 0; i < d.length; i++) a[i] = d.charCodeAt(i);
+          return (await pdfjsLib.getDocument({data: a}).promise).numPages;
+        };
+      </script>
+    </body></html>`;
+    
+    // Use 'load' instead of 'networkidle0' to be more tolerant
+    await page.setContent(html, { waitUntil: 'load', timeout: 60000 });
+    
+    // Wait for PDF.js with polling (more reliable than waitForFunction with CDN)
+    let waitAttempts = 0;
+    const maxWaitAttempts = 60; // 60 seconds max
+    while (waitAttempts < maxWaitAttempts) {
+      const status = await page.evaluate(() => ({ ready: window.pdfReady, error: window.pdfError }));
+      if (status.error) {
+        throw new Error(status.error);
+      }
+      if (status.ready) {
+        break;
+      }
+      await new Promise(r => setTimeout(r, 1000));
+      waitAttempts++;
+    }
+    
+    if (waitAttempts >= maxWaitAttempts) {
+      throw new Error('PDF.js load timeout after 60 seconds');
+    }
+    
+    console.log(`[Storyboard] PDF.js loaded after ${waitAttempts}s`);
+    
+    const pageCount = await page.evaluate('getPageCount()');
+    console.log(`[Storyboard] PDF: ${pageCount} pages`);
+    
+    for (let i = 1; i <= pageCount; i++) {
+      await page.evaluate(`renderPage(${i})`);
+      await new Promise(r => setTimeout(r, 400));
+      const canvas = await page.$('#canvas');
+      const tempPath = path.join(outputDir, `page-${i}-temp.png`);
+      const imgPath = path.join(outputDir, `page-${i}.jpg`);
       
-      await sharp(page.content)
+      await canvas.screenshot({ path: tempPath, type: 'png' });
+      
+      await sharp(tempPath)
         .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
         .jpeg({ quality: 40, progressive: true })
         .toFile(imgPath);
       
-      return imgPath;
-    });
-    
-    const images = await Promise.all(imagePromises);
-    const sharpTime = ((Date.now() - sharpStart) / 1000).toFixed(1);
-    console.log(`[Storyboard] Sharp processing: ${sharpTime}s`);
+      await fs.unlink(tempPath);
+      
+      images.push(imgPath);
+    }
     
     return images;
   } catch (error) {
-    console.error(`[Storyboard] pdfToImages error:`, error.message);
+    console.error(`[Storyboard] pdfToImages error (attempt ${retryCount + 1}):`, error.message);
+    
+    if (browser) {
+      await browser.close();
+      browser = null;
+    }
+    
+    // Retry on CDN/timeout errors
+    if (retryCount < MAX_RETRIES && (
+      error.message.includes('timeout') || 
+      error.message.includes('Timeout') ||
+      error.message.includes('Failed to load') ||
+      error.message.includes('net::')
+    )) {
+      console.log(`[Storyboard] Retrying... (${retryCount + 1}/${MAX_RETRIES})`);
+      await new Promise(r => setTimeout(r, 2000 * (retryCount + 1))); // Exponential backoff
+      return pdfToImages(pdfBuffer, outputDir, retryCount + 1);
+    }
+    
     throw error;
+  } finally {
+    if (browser) await browser.close();
   }
 }
 
@@ -775,8 +755,7 @@ function groupIntoShots(frames) {
   }));
 }
 
-// Pass 2: AI-powered shot grouping analysis (IMPROVED v3.1.0)
-// Pass 2: AI-powered shot grouping analysis - STEP BY STEP (v3.4.2)
+// Pass 2: AI-powered shot grouping analysis
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
@@ -790,7 +769,7 @@ async function analyzeGroupings(frames) {
     // Build a grid of thumbnails for the AI to analyze
     const imageContents = [];
     
-    // Create smaller thumbnails for pass 2, include descriptions
+    // Create smaller thumbnails for pass 2
     for (let i = 0; i < Math.min(framesWithImages.length, 24); i++) {
       const f = framesWithImages[i];
       if (f.image) {
@@ -803,78 +782,50 @@ async function analyzeGroupings(frames) {
           type: 'image',
           source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') }
         });
-        
-        // Add the description/copy for this frame
-        imageContents.push({
-          type: 'text',
-          text: `Frame ${i + 1}: ${f.description || '(no description)'}`
-        });
       }
     }
     
-    if (imageContents.length < 4) return frames;
+    if (imageContents.length < 2) return frames;
     
-    const frameCount = framesWithImages.length;
-    const transitionCount = frameCount - 1;
-    
-    // Build the list of required transitions
-    const transitionList = [];
-    for (let i = 1; i < frameCount; i++) {
-      transitionList.push(`${i}→${i+1}: [SAME/DIFF]`);
-    }
-    
-    console.log(`[Storyboard] Pass 2: Analyzing ${frameCount} frames for shot grouping`);
+    console.log(`[Storyboard] Pass 2: Analyzing ${imageContents.length} frames for shot grouping`);
     
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 3000,
+      max_tokens: 1024,
       messages: [{
         role: 'user',
         content: [
           ...imageContents,
-          { type: 'text', text: `Analyze these ${frameCount} storyboard frames and group them into camera setups.
+          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
 
-=== CRITICAL: HOW TO DETERMINE SAME vs DIFF ===
+Group them into SHOTS. Frames belong to the SAME SHOT if:
 
-Ask yourself: "Is the camera in the SAME PHYSICAL POSITION?"
+1. SAME BACKGROUND ARCHITECTURE - Same room, same distinctive elements (range hood, cabinets, windows) visible from same angle
+2. SAME CHARACTER ARRANGEMENT - Characters in similar positions relative to each other  
+3. SAME CAMERA ANGLE - Shooting from same general direction
+4. CONTINUOUS ACTION - Action flows naturally across frames
 
-DIFF (different setup) if ANY of these are true:
-- Character facing camera in one frame, back to camera in other = DIFF
-- Can see character's face in one, can't see it in other = DIFF  
-- Wide shot vs close-up = DIFF
-- Different background/wall visible = DIFF
-- Camera on opposite side of the action = DIFF
+IMPORTANT: Storyboard artists are inconsistent with scale. Focus on BACKGROUND ELEMENTS and ENVIRONMENT - if the same room/architecture is visible from the same angle, it's likely one continuous shot even if character positions shift slightly.
 
-SAME (same setup) ONLY if ALL of these are true:
-- Camera is filming from exact same position
-- Same background elements visible
-- Same shot size (both wide, both medium, or both close-up)
-- Same characters visible from same angle
+Frames are DIFFERENT SHOTS if:
+- Completely different location or background
+- Camera clearly on opposite side of characters
+- Cut to different subject entirely (insert, new scene)
 
-=== IMPORTANT ===
-"Same room" does NOT mean "same setup"!
-A kitchen scene can have 10 different camera setups.
-Focus on WHERE THE CAMERA IS, not where the characters are.
+BIAS TOWARD GROUPING consecutive frames in the same environment.
 
-=== TASK: FILL IN ALL ${transitionCount} TRANSITIONS ===
-
-${transitionList.join('\n')}
-
-=== OUTPUT ===
-1. Fill in SAME or DIFF for each transition above
-2. End with JSON array: [[1,2],[3],[4,5,6]]` }
+Return ONLY a JSON array:
+[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` }
         ]
       }]
     });
     
     const text = response.content[0].text;
-    console.log(`[Storyboard] Pass 2 response (first 1000 chars):`, text.substring(0, 1000));
-    
-    const jsonMatch = text.match(/\[\s*\[[\s\S]*\]\s*\]/);
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
     
     if (jsonMatch) {
       const groups = JSON.parse(jsonMatch[0]);
-      console.log(`[Storyboard] Pass 2: AI grouped into ${groups.length} shots:`, JSON.stringify(groups));
+      console.log(`[Storyboard] Pass 2: AI grouped into ${groups.length} shots`);
       
       // Apply groupings to frames
       groups.forEach((group, shotIdx) => {
@@ -893,7 +844,6 @@ ${transitionList.join('\n')}
   
   return frames;
 }
-
 
 app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'storyboard-'));
@@ -1063,7 +1013,31 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       
       // Match images to cast members
       const members = castData.members || [];
-      const images = detected.images || [];
+      const rawImages = detected.images || [];
+      
+      // Filter images by aspect ratio - headshots should be roughly square or portrait
+      // Text blocks tend to be very wide and short (ratio > 2)
+      const images = [];
+      for (const img of rawImages) {
+        try {
+          // Decode base64 to get dimensions
+          const buffer = Buffer.from(img, 'base64');
+          const metadata = await sharp(buffer).metadata();
+          const ratio = metadata.width / metadata.height;
+          
+          // Accept images with aspect ratio between 0.5 (portrait) and 1.8 (slightly wide)
+          if (ratio >= 0.5 && ratio <= 1.8) {
+            images.push(img);
+          } else {
+            console.log(`[Cast] Skipping non-headshot image: ${metadata.width}x${metadata.height} (ratio ${ratio.toFixed(2)})`);
+          }
+        } catch (e) {
+          // If we can't check, include it anyway
+          images.push(img);
+        }
+      }
+      
+      console.log(`[Cast] Filtered to ${images.length} headshot images`);
       
       for (let j = 0; j < members.length; j++) {
         const member = members[j];
