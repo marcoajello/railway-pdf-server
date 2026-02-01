@@ -867,28 +867,54 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       pageImages = [imgPath];
     }
     
-    console.log(`[Storyboard] ${pageImages.length} page(s) - starting parallel processing`);
+    console.log(`[Storyboard] ${pageImages.length} page(s) - starting processing`);
     
-    const pageResults = await Promise.all(pageImages.map(async (imagePath, i) => {
-      const pageNum = i + 1;
-      console.log(`[Storyboard] Page ${pageNum}: starting...`);
+    // BATCH APPROACH: Process up to 4 pages per API call for efficiency
+    const BATCH_SIZE = 4;
+    const batches = [];
+    for (let i = 0; i < pageImages.length; i += BATCH_SIZE) {
+      batches.push(pageImages.slice(i, i + BATCH_SIZE).map((p, j) => ({ path: p, pageNum: i + j + 1 })));
+    }
+    
+    // Process batches with controlled concurrency (2 concurrent batches max)
+    const CONCURRENCY = 2;
+    const allPageResults = [];
+    
+    for (let i = 0; i < batches.length; i += CONCURRENCY) {
+      const batchGroup = batches.slice(i, i + CONCURRENCY);
       
-      const imageBuffer = await fs.readFile(imagePath);
+      const batchResults = await Promise.all(batchGroup.map(async (batch) => {
+        // Run rectangle detection in parallel for this batch
+        const rectPromises = batch.map(({ path, pageNum }) => 
+          detectRectangles(path).then(r => ({ pageNum, detected: r }))
+        );
+        
+        // Run batched text extraction (one API call for multiple pages)
+        const textPromise = extractTextBatched(batch);
+        
+        const [rectResults, textResults] = await Promise.all([
+          Promise.all(rectPromises),
+          textPromise
+        ]);
+        
+        // Merge results by page
+        return batch.map(({ pageNum }) => {
+          const detected = rectResults.find(r => r.pageNum === pageNum)?.detected || { count: 0, images: [] };
+          const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
+          return { detected, textData, pageNum };
+        });
+      }));
       
-      const [detected, textData] = await Promise.all([
-        detectRectangles(imagePath),
-        extractText(imageBuffer)
-      ]);
-      
-      console.log(`[Storyboard] Page ${pageNum}: ${detected.count} rectangles, ${textData.frames?.length || 0} text frames`);
-      
-      return { detected, textData, pageNum };
-    }));
+      allPageResults.push(...batchResults.flat());
+    }
+    
+    // Sort by page number to maintain order
+    allPageResults.sort((a, b) => a.pageNum - b.pageNum);
     
     const allFrames = [];
     let currentSpot = null;
     
-    for (const { detected, textData, pageNum } of pageResults) {
+    for (const { detected, textData, pageNum } of allPageResults) {
       if (textData.spotName) currentSpot = textData.spotName;
       
       const textFrames = textData.frames || [];
@@ -964,9 +990,101 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     console.error('[Storyboard] Error:', error);
     res.status(500).json({ error: error.message });
   } finally {
+    // Clean up temp directory
     try { await fs.rm(tempDir, { recursive: true, force: true }); } catch (e) {}
   }
 });
+
+/**
+ * Extract text from multiple pages in a single API call
+ */
+async function extractTextBatched(pages) {
+  const client = getAnthropicClient();
+  if (!client) throw new Error('ANTHROPIC_API_KEY not set');
+  
+  // Prepare all images
+  const imageContents = await Promise.all(pages.map(async ({ path: imagePath, pageNum }) => {
+    const imageBuffer = await fs.readFile(imagePath);
+    const resized = await sharp(imageBuffer)
+      .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    
+    return {
+      pageNum,
+      content: {
+        type: 'image',
+        source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') }
+      }
+    };
+  }));
+  
+  // Build message with all images
+  const content = [];
+  imageContents.forEach(({ pageNum, content: imgContent }) => {
+    content.push({ type: 'text', text: `--- PAGE ${pageNum} ---` });
+    content.push(imgContent);
+  });
+  
+  content.push({ type: 'text', text: `Extract storyboard data from each page above.
+
+STEP 1 - SPOT/SCRIPT NAME (CRITICAL):
+Look for a BOLD TITLE near the top of each page - this is the commercial/spot name.
+These titles indicate DIFFERENT COMMERCIALS/SPOTS in the same PDF.
+Always extract the title exactly as written - even if it's just a number.
+This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within a commercial.
+
+STEP 2 - GRID LAYOUT:
+Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
+
+STEP 3 - FRAME NUMBERS:
+- If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
+- If NO visible numbers, number sequentially: 1, 2, 3, 4...
+
+STEP 4 - EXTRACT:
+Return a JSON array with one object per page:
+[
+  {
+    "pageNum": 1,
+    "spotName": "EXACT TITLE FROM PAGE" or null,
+    "gridLayout": "2x3",
+    "hasVisibleNumbers": true/false,
+    "frames": [
+      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines..." }
+    ]
+  },
+  { "pageNum": 2, ... }
+]
+
+RULES:
+- spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
+- description: action/camera direction text
+- dialog: spoken lines with character prefix
+- Skip empty frames` });
+  
+  console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
+  
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 8192,
+    messages: [{ role: 'user', content }]
+  });
+  
+  const text = response.content[0].text;
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || text.match(/\[[\s\S]*\]/);
+  
+  try {
+    const parsed = JSON.parse(jsonMatch ? (jsonMatch[1] || jsonMatch[0]).trim() : text.trim());
+    // Ensure it's an array
+    const results = Array.isArray(parsed) ? parsed : [parsed];
+    console.log(`[Storyboard] Batched extraction returned ${results.length} page results`);
+    return results;
+  } catch (e) {
+    console.error('[Storyboard] Batched text parse error:', e.message);
+    // Return empty results for each page
+    return pages.map(({ pageNum }) => ({ pageNum, spotName: null, frames: [] }));
+  }
+}
 
 // CAST EXTRACTION
 app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
@@ -1013,31 +1131,7 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       
       // Match images to cast members
       const members = castData.members || [];
-      const rawImages = detected.images || [];
-      
-      // Filter images by aspect ratio - headshots should be roughly square or portrait
-      // Text blocks tend to be very wide and short (ratio > 2)
-      const images = [];
-      for (const img of rawImages) {
-        try {
-          // Decode base64 to get dimensions
-          const buffer = Buffer.from(img, 'base64');
-          const metadata = await sharp(buffer).metadata();
-          const ratio = metadata.width / metadata.height;
-          
-          // Accept images with aspect ratio between 0.5 (portrait) and 1.8 (slightly wide)
-          if (ratio >= 0.5 && ratio <= 1.8) {
-            images.push(img);
-          } else {
-            console.log(`[Cast] Skipping non-headshot image: ${metadata.width}x${metadata.height} (ratio ${ratio.toFixed(2)})`);
-          }
-        } catch (e) {
-          // If we can't check, include it anyway
-          images.push(img);
-        }
-      }
-      
-      console.log(`[Cast] Filtered to ${images.length} headshot images`);
+      const images = detected.images || [];
       
       for (let j = 0; j < members.length; j++) {
         const member = members[j];
