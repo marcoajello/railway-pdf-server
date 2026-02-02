@@ -1263,8 +1263,8 @@ JSON only: {"x": 50, "y": 40, "size": 50}` }
     const faceY = (faceCoords.y / 100) * imgHeight;
     const faceSize = (faceCoords.size / 100) * imgWidth;
     
-    // Make square crop around face center
-    const cropSize = Math.min(Math.round(faceSize * 1.8), Math.min(imgWidth, imgHeight));
+    // Make square crop around face center - zoom in tighter on face
+    const cropSize = Math.min(Math.round(faceSize * 1.3), Math.min(imgWidth, imgHeight));
     const cropX = Math.max(0, Math.round(faceX - cropSize / 2));
     const cropY = Math.max(0, Math.round(faceY - cropSize / 2));
     
