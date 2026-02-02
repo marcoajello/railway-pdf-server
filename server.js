@@ -1131,36 +1131,53 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       
       // Match images to cast members
       const members = castData.members || [];
-      const images = detected.images || [];
+      const rawImages = detected.images || [];
+      
+      // Pre-filter: only keep images that contain faces (not text boxes)
+      const validHeadshots = [];
+      for (let k = 0; k < rawImages.length; k++) {
+        const img = rawImages[k];
+        if (!img) continue;
+        
+        // Try face detection - if we find a face, it's a headshot
+        let cropResult = null;
+        try {
+          cropResult = await cropToFace(img);
+        } catch (e) {
+          // Ignore errors
+        }
+        
+        if (cropResult) {
+          validHeadshots.push({
+            image: cropResult.image,
+            faceX: cropResult.faceX,
+            faceY: cropResult.faceY
+          });
+        } else {
+          console.log(`[Cast] Filtered out rectangle ${k + 1} (no face - likely text)`);
+        }
+      }
+      
+      console.log(`[Cast] After filtering: ${validHeadshots.length} headshots for ${members.length} members`);
       
       for (let j = 0; j < members.length; j++) {
         const member = members[j];
-        let img = images[j] || null;
-        let faceX = 0.5;
-        let faceY = 0.5;
+        const headshot = validHeadshots[j] || null;
+        const name = member.actorName || member.characterName || `Member ${j + 1}`;
         
-        // If we have an image, try to crop to the face
-        if (img) {
-          try {
-            const cropResult = await cropToFace(img);
-            if (cropResult) {
-              img = cropResult.image;
-              faceX = cropResult.faceX;
-              faceY = cropResult.faceY;
-              console.log(`[Cast] Cropped face for ${member.actorName} at x=${(faceX*100).toFixed(0)}%, y=${(faceY*100).toFixed(0)}%`);
-            }
-          } catch (e) {
-            console.log(`[Cast] Face crop failed for ${member.actorName}:`, e.message);
-          }
+        if (headshot) {
+          console.log(`[Cast] ${name}: headshot at x=${(headshot.faceX*100).toFixed(0)}%, y=${(headshot.faceY*100).toFixed(0)}%`);
+        } else {
+          console.log(`[Cast] ${name}: no headshot available`);
         }
         
         allCast.push({
           actorName: member.actorName || '',
           characterName: member.characterName || '',
           role: member.role || '',
-          image: img,
-          faceX: faceX,
-          faceY: faceY
+          image: headshot ? headshot.image : null,
+          faceX: headshot ? headshot.faceX : 0.5,
+          faceY: headshot ? headshot.faceY : 0.5
         });
       }
     }
