@@ -1849,6 +1849,8 @@ Return as JSON array with format:
   }
 ]
 
+If a document is empty, unreadable, or contains no scheduling constraints, return an empty array []. Do NOT create constraints about documents being empty or unreadable.
+
 Documents to analyze:
 ${text.substring(0, 50000)}`;
 
@@ -1870,6 +1872,19 @@ ${text.substring(0, 50000)}`;
         console.error('[Constraints] JSON parse error:', e.message);
       }
     }
+    
+    // Filter out junk/error constraints
+    constraints = constraints.filter(c => {
+      const lt = (c.text || '').toLowerCase();
+      if (lt.includes('appears to be empty') || lt.includes('not accessible') ||
+          lt.includes('could not extract') || lt.includes('no constraints found') ||
+          lt.includes('unable to read') || lt.includes('no relevant') ||
+          (c.who === 'N/A' && c.when === 'N/A' && c.type === 'other')) {
+        console.log('[Constraints] Filtered junk:', c.text);
+        return false;
+      }
+      return true;
+    });
     
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[Constraints] Extracted ${constraints.length} constraints (${elapsed}s)`);
