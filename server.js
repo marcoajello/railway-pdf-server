@@ -1175,6 +1175,12 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
           actorName: member.actorName || '',
           characterName: member.characterName || '',
           role: member.role || '',
+          age: member.age || null,
+          dob: member.dob || null,
+          isMinor: member.isMinor || false,
+          hardIn: member.hardIn || null,
+          hardOut: member.hardOut || null,
+          unionStatus: member.unionStatus || null,
           image: headshot ? headshot.image : null,
           faceX: headshot ? headshot.faceX : 0.5,
           faceY: headshot ? headshot.faceY : 0.5
@@ -1323,7 +1329,7 @@ This is a cast sheet with headshot photos and names. Each name is positioned DIR
 
 For each headshot/photo, identify:
 1. NAME - The name directly below the photo (this is usually the character name or role)
-2. Any additional info shown
+2. Any additional info shown (age, DOB, union status, call times, etc.)
 
 Return JSON in EXACT visual order - go row by row, left to right:
 {
@@ -1331,7 +1337,13 @@ Return JSON in EXACT visual order - go row by row, left to right:
     {
       "actorName": "",
       "characterName": "NINA",
-      "role": ""
+      "role": "",
+      "age": null,
+      "dob": null,
+      "isMinor": false,
+      "hardIn": null,
+      "hardOut": null,
+      "unionStatus": null
     }
   ]
 }
@@ -1343,6 +1355,12 @@ RULES:
 - actorName: Real person's name (if shown separately)
 - characterName: Character/role name shown below photo
 - role: Additional description if any
+- age: Numeric age if shown (e.g. 12). Set to null if not shown.
+- dob: Date of birth string if shown (e.g. "01/15/2014"). Set to null if not shown.
+- isMinor: true if person is under 18 or listed as minor/child. false otherwise.
+- hardIn: Earliest start/call time if shown (e.g. "9:00 AM"). Set to null if not shown.
+- hardOut: Latest end/wrap time if shown (e.g. "3:00 PM"). Set to null if not shown.
+- unionStatus: "union" if SAG/AFTRA/union member, "non-union" if specified, null if not shown.
 - Count must match number of photos exactly` }
       ]
     }]
@@ -1777,6 +1795,92 @@ async function detectFaceWithFaceApi(base64Image) {
     return null;
   }
 }
+
+// ============================================================================
+// FOLD: EXTRACT CONSTRAINTS FROM DOCUMENT TEXT
+// ============================================================================
+
+app.post('/api/extract-constraints', async (req, res) => {
+  try {
+    const { text } = req.body;
+    
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ error: 'Missing or invalid text field' });
+    }
+    
+    const client = getAnthropicClient();
+    if (!client) {
+      return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+    }
+    
+    console.log(`[Constraints] Analyzing ${text.length} chars of document text`);
+    const startTime = Date.now();
+    
+    const prompt = `Analyze these production documents and extract ALL scheduling constraints, requirements, and important information. Look for:
+
+1. TIME CONSTRAINTS: Hard in times, hard out times, call times, wrap times, meal breaks, turnaround requirements, overtime limits
+2. TALENT CONSTRAINTS: Actor availability, fitting times, pickup times, drop-off times, consecutive work day limits
+3. MINOR/CHILD PERFORMERS: Ages, dates of birth (DOB), minor status, school day requirements, work hour restrictions for minors
+4. LOCATION CONSTRAINTS: Permit windows, noise restrictions, parking limitations, load-in/load-out times
+5. EQUIPMENT CONSTRAINTS: Rental pickup/return times, special equipment availability windows
+6. UNION STATUS: SAG-AFTRA, IATSE, or other union memberships and their associated rules
+7. OTHER CONSTRAINTS: Weather dependencies, daylight requirements, union rules, safety requirements
+
+IMPORTANT: For each person mentioned, always extract:
+- Their age or date of birth if mentioned anywhere in the document
+- Whether they are a minor (under 18)
+- Any hard in (earliest start) or hard out (latest end) times
+- Union or non-union status
+
+For each constraint found, extract:
+- The specific constraint or requirement
+- Who/what it applies to (use the person's name exactly as written)
+- The time/date if specified
+- The source document
+
+Return as JSON array with format:
+[
+  {
+    "type": "time|talent|minor|location|equipment|union|other",
+    "text": "Clear description of the constraint",
+    "who": "Person/thing it applies to (if applicable)",
+    "when": "Time/date (if specified)",
+    "source": "Document name"
+  }
+]
+
+Documents to analyze:
+${text.substring(0, 50000)}`;
+
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    
+    const content = response.content?.[0]?.text || '';
+    
+    // Parse JSON from response
+    const jsonMatch = content.match(/\[[\s\S]*\]/);
+    let constraints = [];
+    if (jsonMatch) {
+      try {
+        constraints = JSON.parse(jsonMatch[0]);
+      } catch (e) {
+        console.error('[Constraints] JSON parse error:', e.message);
+      }
+    }
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[Constraints] Extracted ${constraints.length} constraints (${elapsed}s)`);
+    
+    res.json({ constraints });
+    
+  } catch (error) {
+    console.error('[Constraints] Error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`Server on port ${PORT}`);
