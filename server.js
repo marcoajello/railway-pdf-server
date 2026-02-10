@@ -1086,6 +1086,114 @@ RULES:
   }
 }
 
+// SHOTLIST / SCHEDULE EXTRACTION
+app.post('/api/extract-shotlist', upload.single('pdf'), async (req, res) => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'shotlist-'));
+  
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+    
+    console.log('[ShotList] Processing:', req.file.originalname);
+    const startTime = Date.now();
+    
+    const imageDir = path.join(tempDir, 'images');
+    await fs.mkdir(imageDir, { recursive: true });
+    
+    // Convert PDF pages to images
+    let pageImages = [];
+    if (req.file.mimetype === 'application/pdf') {
+      pageImages = await pdfToImages(req.file.buffer, imageDir);
+    } else {
+      const imgPath = path.join(imageDir, 'page-1.png');
+      await sharp(req.file.buffer).png().toFile(imgPath);
+      pageImages = [imgPath];
+    }
+    
+    console.log(`[ShotList] ${pageImages.length} page(s)`);
+    
+    const client = getAnthropicClient();
+    if (!client) throw new Error('ANTHROPIC_API_KEY not set');
+    
+    let allShots = [];
+    
+    for (let i = 0; i < pageImages.length; i++) {
+      const imageBuffer = await fs.readFile(pageImages[i]);
+      const resized = await sharp(imageBuffer)
+        .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      
+      const response = await client.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4096,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
+            { type: 'text', text: `Extract a structured shot list or schedule from this document.
+
+This could be:
+- A shot list (numbered shots with descriptions)
+- A production schedule (time blocks with activities)
+- A call sheet schedule section
+- Any list of production activities/setups
+
+Convert each activity, shot, or time block into a numbered entry.
+
+For SCHEDULES with time blocks: each distinct activity becomes a "shot" entry. Use the time as the scene field and the activity name as the description. Include duration and any notes.
+
+Return JSON:
+{
+  "shots": [
+    {
+      "number": "1",
+      "description": "PHOTO SETUP",
+      "scene": "7:30 AM",
+      "notes": "4.5 hours"
+    }
+  ]
+}
+
+RULES:
+- Number entries sequentially starting from 1
+- description: The main activity, shot description, or setup name
+- scene: Time/timecode if shown, scene number, or location. Use "" if none.
+- notes: Duration, crew notes, equipment, or any extra info. Use "" if none.
+- Include ALL entries - don't skip breaks, meals, or setup times
+- Keep the original text as close as possible
+- For multi-line entries, combine into a single description` }
+          ]
+        }]
+      });
+      
+      const text = response.content[0].text;
+      const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+      try {
+        const parsed = JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
+        const pageShots = parsed.shots || [];
+        // Re-number if multiple pages
+        const offset = allShots.length;
+        pageShots.forEach((s, idx) => { s.number = String(offset + idx + 1); });
+        allShots.push(...pageShots);
+      } catch (e) {
+        console.error(`[ShotList] Page ${i + 1} parse error`);
+      }
+    }
+    
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`[ShotList] Extracted ${allShots.length} entries (${elapsed}s)`);
+    
+    res.json({ shots: allShots });
+    
+  } catch (error) {
+    console.error('[ShotList] Error:', error);
+    res.status(500).json({ error: error.message });
+  } finally {
+    try { await fs.rm(tempDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
 // CAST EXTRACTION
 app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cast-'));
