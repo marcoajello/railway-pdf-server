@@ -1123,59 +1123,61 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       
       const imageBuffer = await fs.readFile(imagePath);
       
-      // Detect rectangles (headshots)
-      const detected = await detectRectangles(imagePath);
-      
       // Use AI to extract actor/character names
       const castData = await extractCastText(imageBuffer);
+      const members = castData.members || [];
       
-      console.log(`[Cast] Page ${pageNum}: ${detected.count} images, ${castData.members?.length || 0} members`);
-      
-      // Capture document-level union status (first page with evidence wins)
-      if (!documentUnionStatus && castData.documentUnionStatus) {
+      // Track document-level union status
+      if (castData.documentUnionStatus && !documentUnionStatus) {
         documentUnionStatus = castData.documentUnionStatus;
         unionEvidence = castData.unionEvidence || null;
-        console.log(`[Cast] Page ${pageNum}: document union status = "${documentUnionStatus}" (${unionEvidence})`);
+        console.log(`[Cast] Document union status: ${documentUnionStatus} (${unionEvidence})`);
       }
       
-      // Match images to cast members
-      const members = castData.members || [];
-      const rawImages = detected.images || [];
+      console.log(`[Cast] Page ${pageNum}: ${members.length} members found by AI`);
       
-      // Pre-filter: only keep images that contain faces (not text boxes)
-      const validHeadshots = [];
-      for (let k = 0; k < rawImages.length; k++) {
-        const img = rawImages[k];
-        if (!img) continue;
-        
-        // Try face detection - if we find a face, it's a headshot
-        let cropResult = null;
+      // Detect ALL faces on full page image using face-api.js
+      let pageFaces = [];
+      if (faceApiReady && faceapi) {
         try {
-          cropResult = await cropToFace(img);
-        } catch (e) {
-          // Ignore errors
-        }
-        
-        if (cropResult) {
-          validHeadshots.push({
-            image: cropResult.image,
-            faceX: cropResult.faceX,
-            faceY: cropResult.faceY
-          });
-        } else {
-          console.log(`[Cast] Filtered out rectangle ${k + 1} (no face - likely text)`);
+          pageFaces = await detectAllFacesOnPage(imagePath);
+          console.log(`[Cast] Page ${pageNum}: ${pageFaces.length} faces detected`);
+        } catch (err) {
+          console.log(`[Cast] Page ${pageNum}: face detection error:`, err.message);
         }
       }
       
-      console.log(`[Cast] After filtering: ${validHeadshots.length} headshots for ${members.length} members`);
+      // Also try rectangle detection as fallback (for bordered headshots)
+      if (pageFaces.length === 0) {
+        console.log(`[Cast] Page ${pageNum}: no faces found, trying rectangle detection...`);
+        const detected = await detectRectangles(imagePath);
+        const rawImages = detected.images || [];
+        
+        for (let k = 0; k < rawImages.length; k++) {
+          const img = rawImages[k];
+          if (!img) continue;
+          try {
+            const cropResult = await cropToFace(img);
+            if (cropResult) {
+              pageFaces.push({
+                image: cropResult.image,
+                faceX: cropResult.faceX,
+                faceY: cropResult.faceY
+              });
+            }
+          } catch (e) { /* skip */ }
+        }
+        console.log(`[Cast] Page ${pageNum}: ${pageFaces.length} faces from rectangle fallback`);
+      }
       
+      // Match faces to members by index (both sorted in reading order)
       for (let j = 0; j < members.length; j++) {
         const member = members[j];
-        const headshot = validHeadshots[j] || null;
+        const headshot = pageFaces[j] || null;
         const name = member.actorName || member.characterName || `Member ${j + 1}`;
         
         if (headshot) {
-          console.log(`[Cast] ${name}: headshot at x=${(headshot.faceX*100).toFixed(0)}%, y=${(headshot.faceY*100).toFixed(0)}%`);
+          console.log(`[Cast] ${name}: headshot matched`);
         } else {
           console.log(`[Cast] ${name}: no headshot available`);
         }
@@ -1209,6 +1211,109 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
     try { await fs.rm(tempDir, { recursive: true, force: true }); } catch (e) {}
   }
 });
+
+// Detect ALL faces on a full page image, crop each, return sorted in reading order
+async function detectAllFacesOnPage(imagePath) {
+  if (!faceApiReady || !faceapi) return [];
+  
+  const canvasModule = await import('canvas');
+  const { createCanvas, loadImage } = canvasModule.default || canvasModule;
+  
+  const imageBuffer = await fs.readFile(imagePath);
+  let img = await loadImage(imageBuffer);
+  
+  const imgWidth = img.width;
+  const imgHeight = img.height;
+  
+  console.log(`[FaceAPI-All] Page image size: ${imgWidth}x${imgHeight}`);
+  
+  // Detect all faces
+  const detections = await faceapi
+    .detectAllFaces(img, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.3 }))
+    .withFaceLandmarks(true);
+  
+  if (!detections || detections.length === 0) {
+    console.log('[FaceAPI-All] No faces detected on page');
+    return [];
+  }
+  
+  console.log(`[FaceAPI-All] Found ${detections.length} faces`);
+  
+  // Sort faces in reading order: top-to-bottom rows, then left-to-right
+  const rowThreshold = imgHeight * 0.08; // Faces within 8% of page height are on same row
+  const sortedDetections = [...detections].sort((a, b) => {
+    const aY = a.detection.box.y + a.detection.box.height / 2;
+    const bY = b.detection.box.y + b.detection.box.height / 2;
+    const aX = a.detection.box.x;
+    const bX = b.detection.box.x;
+    
+    // Same row?
+    if (Math.abs(aY - bY) < rowThreshold) {
+      return aX - bX; // Left to right
+    }
+    return aY - bY; // Top to bottom
+  });
+  
+  // Crop each face into a headshot
+  const faces = [];
+  for (const detection of sortedDetections) {
+    const box = detection.box || detection.detection.box;
+    if (!box) continue;
+    
+    // Get eye positions for better centering
+    const landmarks = detection.landmarks;
+    let centerX = box.x + box.width / 2;
+    let centerY = box.y + box.height / 2;
+    
+    if (landmarks) {
+      try {
+        const leftEye = landmarks.getLeftEye();
+        const rightEye = landmarks.getRightEye();
+        centerX = (leftEye.reduce((s, p) => s + p.x, 0) / leftEye.length + 
+                   rightEye.reduce((s, p) => s + p.x, 0) / rightEye.length) / 2;
+        centerY = (leftEye.reduce((s, p) => s + p.y, 0) / leftEye.length + 
+                   rightEye.reduce((s, p) => s + p.y, 0) / rightEye.length) / 2;
+      } catch (e) { /* use box center */ }
+    }
+    
+    // Crop square around face - generous to include hair and chin
+    const faceSize = Math.max(box.width, box.height);
+    const cropSize = Math.min(Math.round(faceSize * 2.0), Math.min(imgWidth, imgHeight));
+    let cropX = Math.round(centerX - cropSize / 2);
+    let cropY = Math.round(centerY - cropSize * 0.4); // Offset up to show more forehead
+    
+    // Clamp to image bounds
+    cropX = Math.max(0, Math.min(cropX, imgWidth - cropSize));
+    cropY = Math.max(0, Math.min(cropY, imgHeight - cropSize));
+    const finalSize = Math.min(cropSize, imgWidth - cropX, imgHeight - cropY);
+    
+    if (finalSize < 50) continue;
+    
+    try {
+      const croppedBuffer = await sharp(imageBuffer)
+        .extract({ left: cropX, top: cropY, width: finalSize, height: finalSize })
+        .resize(300, 300, { fit: 'cover' })
+        .jpeg({ quality: 90 })
+        .toBuffer();
+      
+      // Face position within the crop
+      const faceXInCrop = Math.max(0, Math.min(1, (centerX - cropX) / finalSize));
+      const faceYInCrop = Math.max(0, Math.min(1, (centerY - cropY) / finalSize));
+      
+      faces.push({
+        image: croppedBuffer.toString('base64'),
+        faceX: faceXInCrop,
+        faceY: faceYInCrop
+      });
+      
+      console.log(`[FaceAPI-All] Face ${faces.length}: box ${Math.round(box.x)},${Math.round(box.y)} ${Math.round(box.width)}x${Math.round(box.height)} -> crop ${cropX},${cropY} ${finalSize}x${finalSize}`);
+    } catch (err) {
+      console.log(`[FaceAPI-All] Crop error:`, err.message);
+    }
+  }
+  
+  return faces;
+}
 
 // Crop image to face using face-api.js (primary) or Claude (fallback)
 // Returns { image: base64, faceX: 0-1, faceY: 0-1 } or null
@@ -1340,12 +1445,8 @@ For each headshot/photo, identify:
 1. NAME - The name directly below the photo (this is usually the character name or role)
 2. Any additional info shown (age, DOB, union status, call times, etc.)
 
-Also scan the ENTIRE page for document-level union language: headers, footers, watermarks, logos, or text mentioning SAG, AFTRA, SAG-AFTRA, Screen Actors Guild, union, non-union, Fi-Core, Taft-Hartley, etc.
-
 Return JSON in EXACT visual order - go row by row, left to right:
 {
-  "documentUnionStatus": "union" | "non-union" | null,
-  "unionEvidence": "e.g. SAG-AFTRA logo in header, or null",
   "members": [
     {
       "actorName": "",
@@ -1373,9 +1474,7 @@ RULES:
 - isMinor: true if person is under 18 or listed as minor/child. false otherwise.
 - hardIn: Earliest start/call time if shown (e.g. "9:00 AM"). Set to null if not shown.
 - hardOut: Latest end/wrap time if shown (e.g. "3:00 PM"). Set to null if not shown.
-- unionStatus: "union" if SAG/AFTRA/union member per this individual, "non-union" if specified, null if not shown per individual.
-- documentUnionStatus: "union" if any SAG/AFTRA/union language appears anywhere on the page (headers, footers, logos, watermarks), "non-union" if explicitly stated as non-union, null if no evidence.
-- unionEvidence: Brief description of what union language was found, or null.
+- unionStatus: "union" if SAG/AFTRA/union member, "non-union" if specified, null if not shown.
 - Count must match number of photos exactly` }
       ]
     }]
