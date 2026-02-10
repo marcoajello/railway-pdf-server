@@ -1116,6 +1116,7 @@ app.post('/api/extract-shotlist', upload.single('pdf'), async (req, res) => {
     if (!client) throw new Error('ANTHROPIC_API_KEY not set');
     
     let allShots = [];
+    let result = {};
     
     for (let i = 0; i < pageImages.length; i++) {
       const imageBuffer = await fs.readFile(pageImages[i]);
@@ -1131,38 +1132,68 @@ app.post('/api/extract-shotlist', upload.single('pdf'), async (req, res) => {
           role: 'user',
           content: [
             { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
-            { type: 'text', text: `Extract a structured shot list or schedule from this document.
+            { type: 'text', text: `Analyze this production document and extract structured data.
 
-This could be:
-- A shot list (numbered shots with descriptions)
-- A production schedule (time blocks with activities)
-- A call sheet schedule section
-- Any list of production activities/setups
+STEP 1: Determine the document type:
+- "schedule" = Has times/time blocks with activities (call sheets, production schedules, daily timelines)
+- "shotlist" = Numbered shots/scenes with descriptions (shot lists, scene breakdowns)
 
-Convert each activity, shot, or time block into a numbered entry.
+STEP 2: Extract entries based on type.
 
-For SCHEDULES with time blocks: each distinct activity becomes a "shot" entry. Use the time as the scene field and the activity name as the description. Include duration and any notes.
-
-Return JSON:
+For SCHEDULE documents, extract each time block as an event:
 {
-  "shots": [
+  "type": "schedule",
+  "scheduleStart": "7:30 AM",
+  "entries": [
     {
-      "number": "1",
-      "description": "PHOTO SETUP",
-      "scene": "7:30 AM",
-      "notes": "4.5 hours"
+      "title": "PHOTO SETUP",
+      "startTime": "7:30 AM",
+      "endTime": "12:00 PM",
+      "duration": 270,
+      "eventType": "EVENT",
+      "notes": ""
+    },
+    {
+      "title": "LUNCH",
+      "startTime": "12:00 PM",
+      "endTime": "1:00 PM",
+      "duration": 60,
+      "eventType": "EVENT",
+      "notes": "@12pm"
     }
   ]
 }
 
-RULES:
-- Number entries sequentially starting from 1
-- description: The main activity, shot description, or setup name
-- scene: Time/timecode if shown, scene number, or location. Use "" if none.
-- notes: Duration, crew notes, equipment, or any extra info. Use "" if none.
-- Include ALL entries - don't skip breaks, meals, or setup times
-- Keep the original text as close as possible
-- For multi-line entries, combine into a single description` }
+For SHOTLIST documents, extract each shot:
+{
+  "type": "shotlist",
+  "entries": [
+    {
+      "number": "1",
+      "description": "Wide establishing shot of house exterior",
+      "scene": "1A",
+      "notes": "Golden hour"
+    }
+  ]
+}
+
+SCHEDULE RULES:
+- title: Activity/event name (e.g. "PHOTO SETUP", "LUNCH", "HERO SOLO")
+- startTime: Start time in 12h format (e.g. "7:30 AM"). Required.
+- endTime: End time in 12h format. Calculate from next entry's start if not explicit.
+- duration: Duration in MINUTES (integer). Calculate from start/end times.
+- eventType: Always "EVENT"
+- notes: Any extra info (crew notes, meal details, etc.)
+- Include ALL blocks: prep, setup, meals, strikes, load out
+- Use the document's own times. Do NOT invent times.
+- If a block has no explicit end time, calculate it from the next block's start time.
+- scheduleStart: The earliest time in the schedule
+
+SHOTLIST RULES:
+- number: Shot/scene number as shown
+- description: Full shot description
+- scene: Scene number or location if shown
+- notes: Any additional info` }
           ]
         }]
       });
@@ -1171,20 +1202,44 @@ RULES:
       const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
       try {
         const parsed = JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
-        const pageShots = parsed.shots || [];
-        // Re-number if multiple pages
-        const offset = allShots.length;
-        pageShots.forEach((s, idx) => { s.number = String(offset + idx + 1); });
-        allShots.push(...pageShots);
+        
+        // Detect format and normalize
+        if (parsed.type === 'schedule' && parsed.entries) {
+          if (!result.type) result.type = 'schedule';
+          if (parsed.scheduleStart) result.scheduleStart = parsed.scheduleStart;
+          parsed.entries.forEach((e, idx) => {
+            e.number = String(allShots.length + idx + 1);
+          });
+          allShots.push(...parsed.entries);
+        } else if (parsed.type === 'shotlist' && parsed.entries) {
+          if (!result.type) result.type = 'shotlist';
+          const offset = allShots.length;
+          parsed.entries.forEach((e, idx) => {
+            e.number = e.number || String(offset + idx + 1);
+          });
+          allShots.push(...parsed.entries);
+        } else if (parsed.shots) {
+          // Legacy format fallback
+          if (!result.type) result.type = 'shotlist';
+          const offset = allShots.length;
+          parsed.shots.forEach((s, idx) => { s.number = String(offset + idx + 1); });
+          allShots.push(...parsed.shots);
+        }
       } catch (e) {
         console.error(`[ShotList] Page ${i + 1} parse error`);
       }
     }
     
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`[ShotList] Extracted ${allShots.length} entries (${elapsed}s)`);
+    console.log(`[ShotList] Extracted ${allShots.length} entries as ${result.type || 'unknown'} (${elapsed}s)`);
     
-    res.json({ shots: allShots });
+    res.json({ 
+      type: result.type || 'shotlist',
+      scheduleStart: result.scheduleStart || null,
+      entries: allShots,
+      // Legacy compat
+      shots: allShots
+    });
     
   } catch (error) {
     console.error('[ShotList] Error:', error);
