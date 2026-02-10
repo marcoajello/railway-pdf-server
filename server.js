@@ -1112,6 +1112,8 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
     console.log(`[Cast] ${pageImages.length} page(s) - processing`);
     
     const allCast = [];
+    let documentUnionStatus = null;
+    let unionEvidence = null;
     
     for (let i = 0; i < pageImages.length; i++) {
       const imagePath = pageImages[i];
@@ -1128,6 +1130,13 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       const castData = await extractCastText(imageBuffer);
       
       console.log(`[Cast] Page ${pageNum}: ${detected.count} images, ${castData.members?.length || 0} members`);
+      
+      // Capture document-level union status (first page with evidence wins)
+      if (!documentUnionStatus && castData.documentUnionStatus) {
+        documentUnionStatus = castData.documentUnionStatus;
+        unionEvidence = castData.unionEvidence || null;
+        console.log(`[Cast] Page ${pageNum}: document union status = "${documentUnionStatus}" (${unionEvidence})`);
+      }
       
       // Match images to cast members
       const members = castData.members || [];
@@ -1191,7 +1200,7 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[Cast] Total: ${allCast.length} cast members (${elapsed}s)`);
     
-    res.json({ cast: allCast });
+    res.json({ cast: allCast, documentUnionStatus, unionEvidence });
     
   } catch (error) {
     console.error('[Cast] Error:', error);
@@ -1331,8 +1340,12 @@ For each headshot/photo, identify:
 1. NAME - The name directly below the photo (this is usually the character name or role)
 2. Any additional info shown (age, DOB, union status, call times, etc.)
 
+Also scan the ENTIRE page for document-level union language: headers, footers, watermarks, logos, or text mentioning SAG, AFTRA, SAG-AFTRA, Screen Actors Guild, union, non-union, Fi-Core, Taft-Hartley, etc.
+
 Return JSON in EXACT visual order - go row by row, left to right:
 {
+  "documentUnionStatus": "union" | "non-union" | null,
+  "unionEvidence": "e.g. SAG-AFTRA logo in header, or null",
   "members": [
     {
       "actorName": "",
@@ -1360,7 +1373,9 @@ RULES:
 - isMinor: true if person is under 18 or listed as minor/child. false otherwise.
 - hardIn: Earliest start/call time if shown (e.g. "9:00 AM"). Set to null if not shown.
 - hardOut: Latest end/wrap time if shown (e.g. "3:00 PM"). Set to null if not shown.
-- unionStatus: "union" if SAG/AFTRA/union member, "non-union" if specified, null if not shown.
+- unionStatus: "union" if SAG/AFTRA/union member per this individual, "non-union" if specified, null if not shown per individual.
+- documentUnionStatus: "union" if any SAG/AFTRA/union language appears anywhere on the page (headers, footers, logos, watermarks), "non-union" if explicitly stated as non-union, null if no evidence.
+- unionEvidence: Brief description of what union language was found, or null.
 - Count must match number of photos exactly` }
       ]
     }]
