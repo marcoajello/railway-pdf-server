@@ -1142,30 +1142,41 @@ First, determine the document type:
 Return JSON (no extra text):
 {
   "type": "schedule" or "shotlist",
-  "scheduleStart": "7:00 AM",
+  "scheduleStart": "6:00 AM",
   "entries": [
     {
       "title": "PHOTO SETUP",
       "duration": 270,
       "scene": "",
-      "notes": "Full crew needed"
+      "notes": ""
     }
   ]
 }
 
 FIELD RULES:
-- title: The ACTIVITY NAME or SHOT DESCRIPTION. This is the most important field. Examples: "Location Prep", "HERO SOLO", "LUNCH", "Move Set-Up", "Camera Wrap". NEVER put times or durations here.
-- duration: Duration in MINUTES as a number. Convert hours to minutes (1.5h = 90, 4.5hr = 270). If not specified, use 30.
-- scene: Scene number or location if shown. Use "" if none. Do NOT put times here.
-- notes: Crew notes, equipment, or other details. Do NOT put times or durations here - those go in the duration field.
-- scheduleStart: The earliest time shown (e.g. call time). Use "" if no times shown.
+
+title: Read each activity block on the document and copy its EXACT TEXT verbatim, then strip ONLY times and durations from that text. Keep everything else exactly as written — same words, same capitalization, same punctuation.
+  Example: document shows "LUNCH @12pm 1h" → title: "LUNCH" (stripped @12pm and 1h)
+  Example: document shows "HERO SOLO 30m" → title: "HERO SOLO" (stripped 30m)
+  Example: document shows "Reduced Crew 2nd Meal 6pm" → title: "Reduced Crew 2nd Meal" (stripped 6pm)
+  Example: document shows "Location Prep 1.5h" → title: "Location Prep" (stripped 1.5h)
+  Example: document shows "9pm Tail Lights" → title: "Tail Lights" (stripped 9pm)
+  Example: document shows "BTS Camera Call 12pm" → title: "BTS Camera Call" (stripped 12pm)
+  DO NOT paraphrase, summarize, or generate new descriptions. Copy the words from the document.
+
+duration: Duration in MINUTES as a number. Convert from the document: 1.5h=90, 4.5hr=270, 30m=30, 2h=120. If no duration shown, estimate from the time block size on the timeline. Default 30 if unknown.
+
+scene: Scene number or location if shown. Use "" if none.
+
+notes: Crew notes, equipment, or other meaningful non-timing details. Use "" if none.
+
+scheduleStart: The EARLIEST time any activity begins — NOT the crew call time. Pre-call activities like location prep, pre-light, or advance crew often start before call. Look at the timeline and use the first activity's start time. For example, if "Location Prep" starts at 6:00 AM but "CALL" is 7:30 AM, scheduleStart should be "6:00 AM".
 
 CRITICAL:
-- The title field MUST contain the human-readable activity name, NOT timing info
-- Duration MUST be a number in minutes, NOT a string like "1.5h"
-- Include ALL entries - don't skip breaks, meals, setups, or wrap
-- Number entries sequentially
-- For multi-line entries, combine into a single title` }
+- Include ALL entries — don't skip breaks, meals, setups, resets, or wrap
+- The title must come from the actual text on the document, with only times/durations removed
+- For multi-line activity blocks, combine the text lines into a single title
+- Entries should be in chronological order` }
           ]
         }]
       });
