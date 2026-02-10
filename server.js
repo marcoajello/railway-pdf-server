@@ -1123,32 +1123,19 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
       
       const imageBuffer = await fs.readFile(imagePath);
       
-      // Use AI to extract actor/character names
-      const castData = await extractCastText(imageBuffer);
-      const members = castData.members || [];
-      
-      // Track document-level union status
-      if (castData.documentUnionStatus && !documentUnionStatus) {
-        documentUnionStatus = castData.documentUnionStatus;
-        unionEvidence = castData.unionEvidence || null;
-        console.log(`[Cast] Document union status: ${documentUnionStatus} (${unionEvidence})`);
-      }
-      
-      console.log(`[Cast] Page ${pageNum}: ${members.length} members found by AI`);
-      
-      // Detect ALL faces on full page image using face-api.js
-      let pageFaces = [];
+      // Step 1: Detect ALL faces on the page
+      let faceBoxes = []; // { box, landmarks, cropImage, faceX, faceY }
       if (faceApiReady && faceapi) {
         try {
-          pageFaces = await detectAllFacesOnPage(imagePath);
-          console.log(`[Cast] Page ${pageNum}: ${pageFaces.length} faces detected`);
+          faceBoxes = await detectAllFacesOnPage(imagePath);
+          console.log(`[Cast] Page ${pageNum}: ${faceBoxes.length} faces detected`);
         } catch (err) {
           console.log(`[Cast] Page ${pageNum}: face detection error:`, err.message);
         }
       }
       
-      // Also try rectangle detection as fallback (for bordered headshots)
-      if (pageFaces.length === 0) {
+      // Fallback to rectangle detection if no faces found
+      if (faceBoxes.length === 0) {
         console.log(`[Cast] Page ${pageNum}: no faces found, trying rectangle detection...`);
         const detected = await detectRectangles(imagePath);
         const rawImages = detected.images || [];
@@ -1159,27 +1146,54 @@ app.post('/api/extract-cast', upload.single('pdf'), async (req, res) => {
           try {
             const cropResult = await cropToFace(img);
             if (cropResult) {
-              pageFaces.push({
+              faceBoxes.push({
                 image: cropResult.image,
                 faceX: cropResult.faceX,
-                faceY: cropResult.faceY
+                faceY: cropResult.faceY,
+                pageX: detected.rectangles[k]?.x || 0,
+                pageY: detected.rectangles[k]?.y || 0
               });
             }
           } catch (e) { /* skip */ }
         }
-        console.log(`[Cast] Page ${pageNum}: ${pageFaces.length} faces from rectangle fallback`);
+        console.log(`[Cast] Page ${pageNum}: ${faceBoxes.length} faces from rectangle fallback`);
       }
       
-      // Match faces to members by index (both sorted in reading order)
+      // Step 2: Annotate the page image with numbered markers at each face
+      let annotatedBuffer = imageBuffer;
+      if (faceBoxes.length > 0) {
+        try {
+          annotatedBuffer = await annotatePageWithFaceNumbers(imageBuffer, faceBoxes);
+          console.log(`[Cast] Page ${pageNum}: annotated image with ${faceBoxes.length} face markers`);
+        } catch (err) {
+          console.log(`[Cast] Page ${pageNum}: annotation error:`, err.message);
+        }
+      }
+      
+      // Step 3: Send annotated image to Claude - extract names AND match to face numbers
+      const castData = await extractCastWithFaceMatching(annotatedBuffer, faceBoxes.length);
+      const members = castData.members || [];
+      
+      // Track document-level union status
+      if (castData.documentUnionStatus && !documentUnionStatus) {
+        documentUnionStatus = castData.documentUnionStatus;
+        unionEvidence = castData.unionEvidence || null;
+        console.log(`[Cast] Document union status: ${documentUnionStatus} (${unionEvidence})`);
+      }
+      
+      console.log(`[Cast] Page ${pageNum}: ${members.length} members matched by AI`);
+      
+      // Step 4: Build results using AI-matched face numbers
       for (let j = 0; j < members.length; j++) {
         const member = members[j];
-        const headshot = pageFaces[j] || null;
+        const faceIdx = (member.faceNumber || 0) - 1; // Convert 1-based to 0-based
+        const headshot = faceBoxes[faceIdx] || null;
         const name = member.actorName || member.characterName || `Member ${j + 1}`;
         
         if (headshot) {
-          console.log(`[Cast] ${name}: headshot matched`);
+          console.log(`[Cast] ${name}: matched to face #${member.faceNumber}`);
         } else {
-          console.log(`[Cast] ${name}: no headshot available`);
+          console.log(`[Cast] ${name}: no headshot (face #${member.faceNumber} not found)`);
         }
         
         allCast.push({
@@ -1240,18 +1254,14 @@ async function detectAllFacesOnPage(imagePath) {
   console.log(`[FaceAPI-All] Found ${detections.length} faces`);
   
   // Sort faces in reading order: top-to-bottom rows, then left-to-right
-  const rowThreshold = imgHeight * 0.08; // Faces within 8% of page height are on same row
+  const rowThreshold = imgHeight * 0.08;
   const sortedDetections = [...detections].sort((a, b) => {
     const aY = a.detection.box.y + a.detection.box.height / 2;
     const bY = b.detection.box.y + b.detection.box.height / 2;
     const aX = a.detection.box.x;
     const bX = b.detection.box.x;
-    
-    // Same row?
-    if (Math.abs(aY - bY) < rowThreshold) {
-      return aX - bX; // Left to right
-    }
-    return aY - bY; // Top to bottom
+    if (Math.abs(aY - bY) < rowThreshold) return aX - bX;
+    return aY - bY;
   });
   
   // Crop each face into a headshot
@@ -1276,11 +1286,11 @@ async function detectAllFacesOnPage(imagePath) {
       } catch (e) { /* use box center */ }
     }
     
-    // Crop square around face - generous to include hair and chin
+    // Tight crop: 1.5x face size (head + small margin)
     const faceSize = Math.max(box.width, box.height);
-    const cropSize = Math.min(Math.round(faceSize * 2.0), Math.min(imgWidth, imgHeight));
+    const cropSize = Math.min(Math.round(faceSize * 1.5), Math.min(imgWidth, imgHeight));
     let cropX = Math.round(centerX - cropSize / 2);
-    let cropY = Math.round(centerY - cropSize * 0.4); // Offset up to show more forehead
+    let cropY = Math.round(centerY - cropSize * 0.4); // Offset up for forehead
     
     // Clamp to image bounds
     cropX = Math.max(0, Math.min(cropX, imgWidth - cropSize));
@@ -1296,17 +1306,19 @@ async function detectAllFacesOnPage(imagePath) {
         .jpeg({ quality: 90 })
         .toBuffer();
       
-      // Face position within the crop
       const faceXInCrop = Math.max(0, Math.min(1, (centerX - cropX) / finalSize));
       const faceYInCrop = Math.max(0, Math.min(1, (centerY - cropY) / finalSize));
       
       faces.push({
         image: croppedBuffer.toString('base64'),
         faceX: faceXInCrop,
-        faceY: faceYInCrop
+        faceY: faceYInCrop,
+        // Page-level coordinates for annotation
+        pageCenterX: Math.round(centerX),
+        pageCenterY: Math.round(centerY)
       });
       
-      console.log(`[FaceAPI-All] Face ${faces.length}: box ${Math.round(box.x)},${Math.round(box.y)} ${Math.round(box.width)}x${Math.round(box.height)} -> crop ${cropX},${cropY} ${finalSize}x${finalSize}`);
+      console.log(`[FaceAPI-All] Face ${faces.length}: center ${Math.round(centerX)},${Math.round(centerY)} box ${Math.round(box.width)}x${Math.round(box.height)}`);
     } catch (err) {
       console.log(`[FaceAPI-All] Crop error:`, err.message);
     }
@@ -1421,6 +1433,129 @@ JSON only: {"x": 50, "y": 40, "size": 50}` }
 }
 
 // AI function to extract cast info from page
+// Annotate page image with numbered circles at each detected face position
+async function annotatePageWithFaceNumbers(imageBuffer, faceBoxes) {
+  const canvasModule = await import('canvas');
+  const { createCanvas, loadImage } = canvasModule.default || canvasModule;
+  
+  const img = await loadImage(imageBuffer);
+  const canvas = createCanvas(img.width, img.height);
+  const ctx = canvas.getContext('2d');
+  
+  // Draw original image
+  ctx.drawImage(img, 0, 0);
+  
+  // Draw numbered circles at each face
+  for (let i = 0; i < faceBoxes.length; i++) {
+    const face = faceBoxes[i];
+    const cx = face.pageCenterX || (face.pageX || 0);
+    const cy = face.pageCenterY || (face.pageY || 0);
+    
+    // Red circle with white number
+    const radius = Math.max(20, Math.min(40, img.width * 0.025));
+    
+    // Draw circle background
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 0, 0, 0.85)';
+    ctx.fill();
+    ctx.strokeStyle = 'white';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    
+    // Draw number
+    ctx.fillStyle = 'white';
+    ctx.font = `bold ${Math.round(radius * 1.2)}px Arial`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(String(i + 1), cx, cy);
+  }
+  
+  // Export as JPEG
+  const buffer = canvas.toBuffer('image/jpeg', { quality: 0.85 });
+  return buffer;
+}
+
+// Send annotated image to Claude - extracts names AND matches each to a face number
+async function extractCastWithFaceMatching(imageBuffer, faceCount) {
+  const client = getAnthropicClient();
+  if (!client) throw new Error('ANTHROPIC_API_KEY not set');
+  
+  const resized = await sharp(imageBuffer)
+    .resize(1600, 1600, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 90 })
+    .toBuffer();
+  
+  const faceNote = faceCount > 0 
+    ? `\nThe image has ${faceCount} RED NUMBERED CIRCLES overlaid on detected faces. Each circle contains a number (1, 2, 3...). Match each person's name to their face number by looking at which name is closest to which numbered circle.`
+    : '';
+  
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4096,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
+        { type: 'text', text: `Extract cast/talent information from this cast sheet.${faceNote}
+
+For each person, identify their name(s) and match to the correct face number.
+
+CRITICAL RULES:
+- Names can appear ABOVE, BELOW, or BESIDE their photo - determine by PROXIMITY, not by reading order
+- If a person has TWO names shown (e.g. character name AND actor name), include both
+- If only ONE name is shown per person, put it in actorName and leave characterName empty
+- NEVER put "UNKNOWN" or "N/A" in any field - leave it as empty string "" instead
+- faceNumber must match the red numbered circle on or near that person's photo
+- If no numbered circles are visible, use left-to-right, top-to-bottom order (1, 2, 3...)
+
+Return JSON:
+{
+  "members": [
+    {
+      "faceNumber": 1,
+      "actorName": "JANE DOE",
+      "characterName": "NINA",
+      "role": "",
+      "age": null,
+      "dob": null,
+      "isMinor": false,
+      "hardIn": null,
+      "hardOut": null,
+      "unionStatus": null
+    }
+  ],
+  "documentUnionStatus": null,
+  "unionEvidence": null
+}
+
+FIELD GUIDE:
+- faceNumber: The red circle number on this person's face (integer)
+- actorName: Real person's name (the talent/actor). Use "" if not shown.
+- characterName: Character/role name. Use "" if not shown.
+- If only one name exists per person, it is most likely the ACTOR name - put it in actorName
+- role: Additional role description if any
+- age: Numeric age if shown. null if not shown.
+- dob: Date of birth string if shown. null if not shown.
+- isMinor: true if under 18 or listed as minor/child
+- hardIn/hardOut: Call/wrap times if shown. null if not shown.
+- unionStatus: "union" if SAG/AFTRA, "non-union" if specified, null if not shown
+- documentUnionStatus: If the document header/title indicates a union status for the whole production, put it here
+- unionEvidence: Quote the text that indicates union status` }
+      ]
+    }]
+  });
+  
+  const text = response.content[0].text;
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  try {
+    return JSON.parse((jsonMatch ? jsonMatch[1] : text).trim());
+  } catch (e) {
+    console.error('[Cast] Text parse error:', text.substring(0, 200));
+    return { members: [] };
+  }
+}
+
 async function extractCastText(imageBuffer) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not set');
