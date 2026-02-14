@@ -756,123 +756,89 @@ async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames;
 
-  // Only analyze if we have images
-  const framesWithImages = frames.filter(f => f.image);
-  if (framesWithImages.length < 2) return frames;
-
-  try {
-    // Build thumbnails — map indices so we can apply results back
-    const imageContents = [];
-    const frameIndexMap = []; // maps imageContents index → frames array index
-
-    for (let i = 0; i < frames.length; i++) {
-      if (imageContents.length >= 40) break;
-      const f = frames[i];
-      if (f.image) {
-        const thumb = await sharp(Buffer.from(f.image, 'base64'))
-          .resize(400, 400, { fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 75 })
-          .toBuffer();
-
-        imageContents.push({
-          type: 'image',
-          source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') }
-        });
-        frameIndexMap.push(i);
-      }
+  // Build thumbnails — map indices so we can apply results back
+  const thumbs = []; // { img: {type,source}, frameIdx, desc }
+  for (let i = 0; i < frames.length; i++) {
+    if (thumbs.length >= 40) break;
+    const f = frames[i];
+    if (f.image) {
+      const thumb = await sharp(Buffer.from(f.image, 'base64'))
+        .resize(500, 500, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 80 })
+        .toBuffer();
+      thumbs.push({
+        img: { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') } },
+        frameIdx: i,
+        desc: f.description || ''
+      });
     }
+  }
 
-    if (imageContents.length < 2) return frames;
+  if (thumbs.length < 2) return frames;
 
-    console.log(`[Storyboard] Pass 2: Pairwise boundary detection on ${imageContents.length} frames`);
+  console.log(`[Storyboard] Pass 2: Parallel pairwise comparison on ${thumbs.length} frames (${thumbs.length - 1} pairs)`);
 
-    // Pairwise boundary detection: show all frames with descriptions, then ask for SAME/CUT
-    const content = [];
-    imageContents.forEach((img, idx) => {
-      const frameIdx = frameIndexMap[idx];
-      const desc = frames[frameIdx]?.description || '';
-      const label = desc ? `Frame ${idx + 1} — "${desc.substring(0, 80)}":` : `Frame ${idx + 1}:`;
-      content.push({ type: 'text', text: label });
-      content.push(img);
-    });
+  // Build all pair comparisons and run in parallel
+  const pairPromises = [];
+  for (let i = 0; i < thumbs.length - 1; i++) {
+    const a = thumbs[i];
+    const b = thumbs[i + 1];
 
-    // Build the list of transitions to evaluate
-    const pairList = [];
-    for (let i = 1; i < imageContents.length; i++) {
-      pairList.push(`${i}→${i + 1}:`);
-    }
+    const content = [
+      { type: 'text', text: `Frame A${a.desc ? ` — "${a.desc.substring(0, 100)}"` : ''}:` },
+      a.img,
+      { type: 'text', text: `Frame B${b.desc ? ` — "${b.desc.substring(0, 100)}"` : ''}:` },
+      b.img,
+      { type: 'text', text: `Are these two storyboard frames from the SAME continuous camera shot, or is there a CUT to a new camera setup?
 
-    content.push({ type: 'text', text: `Above are ${imageContents.length} storyboard frames from a TV commercial, shown in order.
+SAME = camera stays in the same position and framing. Action progresses but the camera doesn't move. Arrows drawn on Frame A indicating camera movement (push in, pull out, pan) toward Frame B's framing also means SAME — the camera is moving continuously within one shot.
 
-STEP 1: For each frame, note its camera setup in this format:
-F1: [shot size] [subject] [camera direction] [ARROWS if present]
-F2: [shot size] [subject] [camera direction] [ARROWS if present]
-...
+CUT = the camera has moved to a different setup. Different shot size (wide vs close-up), different angle, different subject, reverse angle (camera on opposite side), or different location.
 
-Shot sizes: ELS (extreme long), LS (long/wide), MS (medium), MCU (medium close-up), CU (close-up), ECU (extreme close-up), INSERT
-Camera direction: facing subject from FRONT, BACK, LEFT, RIGHT, ABOVE, etc.
-ARROWS: Note any arrows drawn on the frame — these are a storyboard convention indicating camera movement (push in, pull out, pan, tilt, dolly, zoom). Arrows mean the camera is moving DURING this frame.
+Answer with ONLY one word: SAME or CUT` }
+    ];
 
-STEP 2: Compare each consecutive pair.
-- If a frame has ARROWS indicating movement toward the next frame's framing, they are the SAME shot (the camera is moving continuously).
-- If the shot size, subject, OR camera direction changed WITHOUT arrows bridging them, it's a CUT.
-- Two frames showing the same subject from the same angle with minor action changes = SAME.
+    pairPromises.push(
+      client.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 16,
+        messages: [{ role: 'user', content }]
+      }).then(r => {
+        const word = (r.content[0]?.text || '').trim().toUpperCase();
+        return { idx: i, result: word.includes('CUT') ? 'CUT' : 'SAME' };
+      }).catch(e => {
+        console.error(`[Storyboard] Pair ${i}→${i+1} error:`, e.message);
+        return { idx: i, result: 'UNKNOWN' };
+      })
+    );
+  }
 
-Output format for Step 2:
-${pairList.join('\n')}
+  // Run all pairs in parallel (batched to avoid rate limits)
+  const BATCH = 8;
+  const results = [];
+  for (let i = 0; i < pairPromises.length; i += BATCH) {
+    const batch = pairPromises.slice(i, i + BATCH);
+    results.push(...await Promise.all(batch));
+  }
+  results.sort((a, b) => a.idx - b.idx);
 
-Write ONLY "CUT" or "SAME" after each arrow.` });
+  // Apply results to frames
+  let shotGroup = 0;
+  frames[thumbs[0].frameIdx].shotGroup = shotGroup;
 
-    const response = await client.messages.create({
-      model: 'claude-opus-4-6',
-      max_tokens: 2048,
-      messages: [{ role: 'user', content }]
-    });
+  const decisions = [];
+  for (const { idx, result } of results) {
+    if (result === 'CUT') shotGroup++;
+    decisions.push(result);
+    frames[thumbs[idx + 1].frameIdx].shotGroup = shotGroup;
+  }
 
-    const text = response.content[0].text;
-    console.log(`[Storyboard] Pass 2 raw response: ${text}`);
+  console.log(`[Storyboard] Pass 2: ${decisions.join(', ')} → ${shotGroup + 1} shots`);
 
-    // Parse SAME/CUT responses — look for each transition
-    // Use word boundaries to avoid matching "12→13" when looking for "2→3"
-    let shotGroup = 0;
-    let parsedCount = 0;
-    if (frameIndexMap[0] !== undefined && frames[frameIndexMap[0]]) {
-      frames[frameIndexMap[0]].shotGroup = shotGroup;
-    }
-
-    for (let i = 1; i < imageContents.length; i++) {
-      // Match "N→N+1: CUT/SAME" with word boundary on the first number
-      const pattern = new RegExp(`(?:^|\\D)${i}\\s*[→>\\-]+\\s*${i + 1}\\s*[:.]?\\s*(SAME|CUT)`, 'im');
-      const match = text.match(pattern);
-
-      if (match) {
-        parsedCount++;
-        if (match[1].toUpperCase() === 'CUT') {
-          shotGroup++;
-        }
-      } else {
-        console.log(`[Storyboard] Pass 2: Could not parse transition ${i}→${i + 1}`);
-      }
-
-      const frameIdx = frameIndexMap[i];
-      if (frameIdx !== undefined && frames[frameIdx]) {
-        frames[frameIdx].shotGroup = shotGroup;
-      }
-    }
-
-    const totalTransitions = imageContents.length - 1;
-    console.log(`[Storyboard] Pass 2: Parsed ${parsedCount}/${totalTransitions} transitions, detected ${shotGroup + 1} shots from ${imageContents.length} frames`);
-
-    // Sanity check: if we couldn't parse most transitions, or got 0 cuts from 4+ frames,
-    // the analysis likely failed — clear shotGroup so fallback grouping is used
-    if (parsedCount < totalTransitions * 0.5 || (shotGroup === 0 && imageContents.length >= 5)) {
-      console.log(`[Storyboard] Pass 2: Suspicious result (${shotGroup} cuts, ${parsedCount} parsed) — discarding, will use fallback grouping`);
-      frames.forEach(f => { delete f.shotGroup; });
-    }
-
-  } catch (e) {
-    console.error('[Storyboard] Pass 2 error:', e.message);
-    // Fallback — no grouping applied, groupIntoShots will use number-based or per-frame fallback
+  // Sanity check: if 0 cuts from 5+ frames, discard
+  if (shotGroup === 0 && thumbs.length >= 5) {
+    console.log(`[Storyboard] Pass 2: 0 cuts from ${thumbs.length} frames — discarding`);
+    frames.forEach(f => { delete f.shotGroup; });
   }
 
   return frames;
