@@ -802,30 +802,26 @@ async function analyzeGroupings(frames) {
       pairList.push(`${i}→${i + 1}:`);
     }
 
-    content.push({ type: 'text', text: `Above are ${imageContents.length} storyboard frames from a commercial in sequence.
+    content.push({ type: 'text', text: `Above are ${imageContents.length} storyboard frames from a TV commercial, shown in order.
 
-For each consecutive pair, decide: is it the SAME continuous camera shot, or is there a CUT to a new camera setup?
+STEP 1: For each frame, note its camera setup in this format:
+F1: [shot size] [subject] [camera direction]
+F2: [shot size] [subject] [camera direction]
+...
 
-CUT — the camera has moved to a new position or setup:
-- Reverse angle (camera flips to the other side of the subject — even if same people are shown)
-- Different shot size (wide → close-up, medium → wide, etc.)
-- Different camera position or perspective on the scene
-- Different subject or location
-- Over-the-shoulder vs. facing — these are DIFFERENT setups
+Shot sizes: ELS (extreme long), LS (long/wide), MS (medium), MCU (medium close-up), CU (close-up), ECU (extreme close-up), INSERT
+Camera direction: facing subject from FRONT, BACK, LEFT, RIGHT, ABOVE, etc.
 
-SAME — the camera stays locked in the same position and framing:
-- Action continues but camera doesn't move
-- Characters gesture, talk, or shift slightly within the same framing
-- Same background composition from the same viewpoint
+STEP 2: Compare each consecutive pair. If the shot size, subject, OR camera direction changed, it's a CUT.
 
-The key question is: would a film crew need to MOVE THE CAMERA to get this new frame? If yes → CUT. If the camera could stay on its tripod → SAME.
+Output format for Step 2:
+${pairList.join('\n')}
 
-For each pair below, write ONLY "SAME" or "CUT":
-${pairList.join('\n')}` });
+Write ONLY "CUT" or "SAME" after each arrow.` });
 
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 2048,
       messages: [{ role: 'user', content }]
     });
 
