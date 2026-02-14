@@ -802,11 +802,11 @@ SAME shot means the camera is in the same setup:
 - Same framing, same subject, same angle — action just progresses
 - Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
 
-CUT means the camera moved to a new setup:
-- Different framing (wide shot vs close-up)
-- Different subject
-- Reverse angle / shot-reverse-shot: if the subject faces LEFT in one frame and RIGHT in the next (or vice versa), the camera has moved to the opposite side = CUT, even if it's the same person
-- Different location or background
+CUT means the camera needs to be in a DIFFERENT PHYSICAL POSITION:
+- Would a film crew need to MOVE THE CAMERA to get this new angle?
+- Different shot size (wide vs close-up)
+- Camera on the opposite side of the subject (reverse angle)
+- Different subject or different location/background
 
 ${pairList.join('\n')}
 
