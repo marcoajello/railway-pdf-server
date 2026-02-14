@@ -794,25 +794,25 @@ async function analyzeGroupings(frames) {
     pairList.push(`${i + 1}→${i + 2}: SAME or CUT?`);
   }
 
-  content.push({ type: 'text', text: `You are a storyboard analyst for a TV commercial with ${thumbs.length} frames.
+  content.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
 
-STEP 1: For each frame, note its shot size (WIDE, MEDIUM, CLOSE-UP, EXTREME CU) and what the camera sees (subject, angle, background).
+For each consecutive pair, decide SAME or CUT.
 
-STEP 2: For each consecutive pair, decide SAME or CUT.
+SAME shot means the camera is in the same setup:
+- Same framing, same subject, same angle — action just progresses
+- Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
 
-SAME = camera stays in the same position. Same shot size, same angle, action just progresses. Arrows drawn on frames indicate camera movement (push/pull/pan/tilt) = still the SAME continuous shot.
+CUT means the camera moved to a new setup:
+- Different framing (wide shot vs close-up)
+- Different subject
+- Reverse angle (camera switches to opposite side — even if same people)
+- Different location
 
-CUT = camera is in a different position. ANY of these = CUT:
-- Shot size changes (e.g. WIDE to CLOSE-UP)
-- Camera is on the other side of the subject (reverse angle)
-- Different subject or location
+When in doubt, lean toward SAME. Storyboard frames from the same shot often look slightly different due to the artist's drawing — focus on whether the CAMERA SETUP changed, not small drawing variations.
 
-Format your answer as:
-Frame 1: [shot size] - [brief description]
-Frame 2: [shot size] - [brief description]
-...
-Then:
-${pairList.join('\n')}` });
+${pairList.join('\n')}
+
+Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
 
   try {
     const response = await client.messages.create({
