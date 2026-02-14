@@ -805,14 +805,18 @@ async function analyzeGroupings(frames) {
     content.push({ type: 'text', text: `Above are ${imageContents.length} storyboard frames from a TV commercial, shown in order.
 
 STEP 1: For each frame, note its camera setup in this format:
-F1: [shot size] [subject] [camera direction]
-F2: [shot size] [subject] [camera direction]
+F1: [shot size] [subject] [camera direction] [ARROWS if present]
+F2: [shot size] [subject] [camera direction] [ARROWS if present]
 ...
 
 Shot sizes: ELS (extreme long), LS (long/wide), MS (medium), MCU (medium close-up), CU (close-up), ECU (extreme close-up), INSERT
 Camera direction: facing subject from FRONT, BACK, LEFT, RIGHT, ABOVE, etc.
+ARROWS: Note any arrows drawn on the frame — these are a storyboard convention indicating camera movement (push in, pull out, pan, tilt, dolly, zoom). Arrows mean the camera is moving DURING this frame.
 
-STEP 2: Compare each consecutive pair. If the shot size, subject, OR camera direction changed, it's a CUT.
+STEP 2: Compare each consecutive pair.
+- If a frame has ARROWS indicating movement toward the next frame's framing, they are the SAME shot (the camera is moving continuously).
+- If the shot size, subject, OR camera direction changed WITHOUT arrows bridging them, it's a CUT.
+- Two frames showing the same subject from the same angle with minor action changes = SAME.
 
 Output format for Step 2:
 ${pairList.join('\n')}
@@ -861,7 +865,7 @@ Write ONLY "CUT" or "SAME" after each arrow.` });
 
     // Sanity check: if we couldn't parse most transitions, or got 0 cuts from 4+ frames,
     // the analysis likely failed — clear shotGroup so fallback grouping is used
-    if (parsedCount < totalTransitions * 0.5 || (shotGroup === 0 && imageContents.length >= 4)) {
+    if (parsedCount < totalTransitions * 0.5 || (shotGroup === 0 && imageContents.length >= 5)) {
       console.log(`[Storyboard] Pass 2: Suspicious result (${shotGroup} cuts, ${parsedCount} parsed) — discarding, will use fallback grouping`);
       frames.forEach(f => { delete f.shotGroup; });
     }
