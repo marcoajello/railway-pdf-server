@@ -805,8 +805,8 @@ SAME shot means the camera is in the same setup:
 CUT means the camera moved to a new setup:
 - Different framing (wide shot vs close-up)
 - Different subject
-- Reverse angle (camera switches to opposite side — even if same people)
-- Different location
+- Reverse angle / shot-reverse-shot: if the subject faces LEFT in one frame and RIGHT in the next (or vice versa), the camera has moved to the opposite side = CUT, even if it's the same person
+- Different location or background
 
 ${pairList.join('\n')}
 
