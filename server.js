@@ -754,24 +754,24 @@ function groupIntoShots(frames) {
 // Pass 2: AI-powered shot grouping analysis
 async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
-  if (!client) return frames; // Fallback to pass 1 results
-  
+  if (!client) return frames;
+
   // Only analyze if we have images
   const framesWithImages = frames.filter(f => f.image);
   if (framesWithImages.length < 2) return frames;
 
   try {
-    // Build thumbnails for AI analysis — map frame indices so we can apply results back
+    // Build thumbnails — map indices so we can apply results back
     const imageContents = [];
     const frameIndexMap = []; // maps imageContents index → frames array index
 
     for (let i = 0; i < frames.length; i++) {
-      if (imageContents.length >= 40) break; // cap at 40 frames
+      if (imageContents.length >= 40) break;
       const f = frames[i];
       if (f.image) {
         const thumb = await sharp(Buffer.from(f.image, 'base64'))
-          .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
-          .jpeg({ quality: 70 })
+          .resize(400, 400, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 75 })
           .toBuffer();
 
         imageContents.push({
@@ -784,62 +784,68 @@ async function analyzeGroupings(frames) {
 
     if (imageContents.length < 2) return frames;
 
-    console.log(`[Storyboard] Pass 2: Analyzing ${imageContents.length} frames for shot grouping`);
+    console.log(`[Storyboard] Pass 2: Pairwise boundary detection on ${imageContents.length} frames`);
 
-    // Build the content array with labeled frames
+    // Pairwise boundary detection: show all frames, then ask for SAME/CUT at each transition
     const content = [];
     imageContents.forEach((img, idx) => {
       content.push({ type: 'text', text: `Frame ${idx + 1}:` });
       content.push(img);
     });
 
-    content.push({ type: 'text', text: `These are ${imageContents.length} storyboard frames from a commercial, shown in order (Frame 1 through Frame ${imageContents.length}).
+    // Build the list of transitions to evaluate
+    const pairList = [];
+    for (let i = 1; i < imageContents.length; i++) {
+      pairList.push(`${i}→${i + 1}:`);
+    }
 
-Group consecutive frames into SHOTS (a shot = one continuous camera take).
+    content.push({ type: 'text', text: `Above are ${imageContents.length} storyboard frames from a commercial in sequence.
 
-Frames belong to the SAME SHOT when they share:
-- Same background/environment visible from the same camera angle
-- Same general character arrangement (people in roughly same positions)
-- Continuous action that flows naturally across frames
-- Same camera perspective (wide, medium, close-up from same direction)
+For each consecutive pair, decide: is it the SAME camera shot continuing, or is there a CUT to a new shot?
 
-Storyboard artists are INCONSISTENT with scale and detail level. Two frames may look slightly different in drawing style but still represent the same shot. Focus on ENVIRONMENT and CAMERA ANGLE, not drawing consistency.
+A CUT happens when the camera CHANGES between two frames:
+- Different shot size (e.g. wide shot → close-up, or medium → wide)
+- Different camera angle or position
+- Different subject becomes the focus
+- Different location or background
 
-Start a NEW SHOT only when there is a clear CUT:
-- Different location or background entirely
-- Camera jumps to opposite side of characters
-- Cut to a completely different subject (insert shot, cutaway, new scene)
-- Dramatic change in framing (e.g., wide establishing → extreme close-up of object)
+SAME means the camera stays in essentially the same position and framing — the action progresses but the camera doesn't change. Minor character movement or gesture changes within the same framing = SAME.
 
-IMPORTANT: When in doubt, GROUP frames together. It is much better to over-group (user can split later) than to over-split. Consecutive frames in the same environment from the same angle are almost always the same shot.
-
-Return ONLY a JSON array of arrays. Each inner array is one shot, containing frame numbers:
-[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` });
+For each pair below, write SAME or CUT:
+${pairList.join('\n')}` });
 
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 2048,
+      max_tokens: 1024,
       messages: [{ role: 'user', content }]
     });
 
     const text = response.content[0].text;
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    console.log(`[Storyboard] Pass 2 raw response: ${text}`);
 
-    if (jsonMatch) {
-      const groups = JSON.parse(jsonMatch[0]);
-      console.log(`[Storyboard] Pass 2: AI grouped ${imageContents.length} frames into ${groups.length} shots`);
-
-      // Apply groupings to frames using the index map
-      groups.forEach((group, shotIdx) => {
-        group.forEach(frameNum => {
-          const contentIdx = frameNum - 1; // 1-indexed → 0-indexed in imageContents
-          const frameIdx = frameIndexMap[contentIdx]; // map to actual frames index
-          if (frameIdx !== undefined && frames[frameIdx]) {
-            frames[frameIdx].shotGroup = shotIdx;
-          }
-        });
-      });
+    // Parse SAME/CUT responses — look for each transition
+    let shotGroup = 0;
+    if (frameIndexMap[0] !== undefined && frames[frameIndexMap[0]]) {
+      frames[frameIndexMap[0]].shotGroup = shotGroup;
     }
+
+    for (let i = 1; i < imageContents.length; i++) {
+      // Look for this transition in the response (e.g. "1→2: CUT" or "1→2: SAME")
+      const pattern = new RegExp(`${i}\\s*[→>\\-]+\\s*${i + 1}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
+      const match = text.match(pattern);
+
+      if (match && match[1].toUpperCase() === 'CUT') {
+        shotGroup++;
+      }
+
+      const frameIdx = frameIndexMap[i];
+      if (frameIdx !== undefined && frames[frameIdx]) {
+        frames[frameIdx].shotGroup = shotGroup;
+      }
+    }
+
+    console.log(`[Storyboard] Pass 2: Detected ${shotGroup + 1} shots from ${imageContents.length} frames`);
+
   } catch (e) {
     console.error('[Storyboard] Pass 2 error:', e.message);
     // Fallback — no grouping applied, groupIntoShots will use number-based or per-frame fallback
