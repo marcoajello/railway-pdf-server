@@ -776,69 +776,76 @@ async function analyzeGroupings(frames) {
 
   if (thumbs.length < 2) return frames;
 
-  console.log(`[Storyboard] Pass 2: Parallel pairwise comparison on ${thumbs.length} frames (${thumbs.length - 1} pairs)`);
+  console.log(`[Storyboard] Pass 2: Single-call Opus pairwise on ${thumbs.length} frames`);
 
-  // Build all pair comparisons and run in parallel
-  const pairPromises = [];
+  // Build a single message with ALL frames, then ask for pairwise SAME/CUT
+  const content = [];
+
+  // Add all frame images with labels
+  for (let i = 0; i < thumbs.length; i++) {
+    const t = thumbs[i];
+    content.push({ type: 'text', text: `Frame ${i + 1}${t.desc ? ` — "${t.desc.substring(0, 100)}"` : ''}:` });
+    content.push(t.img);
+  }
+
+  // Build pair list
+  const pairList = [];
   for (let i = 0; i < thumbs.length - 1; i++) {
-    const a = thumbs[i];
-    const b = thumbs[i + 1];
-
-    const content = [
-      { type: 'text', text: `Frame A${a.desc ? ` — "${a.desc.substring(0, 100)}"` : ''}:` },
-      a.img,
-      { type: 'text', text: `Frame B${b.desc ? ` — "${b.desc.substring(0, 100)}"` : ''}:` },
-      b.img,
-      { type: 'text', text: `Are these two storyboard frames from the SAME continuous camera shot, or is there a CUT to a new camera setup?
-
-SAME = camera stays in the same position and framing. Action progresses but the camera doesn't move. Arrows drawn on Frame A indicating camera movement (push in, pull out, pan) toward Frame B's framing also means SAME — the camera is moving continuously within one shot.
-
-CUT = the camera has moved to a different setup. Different shot size (wide vs close-up), different angle, different subject, reverse angle (camera on opposite side), or different location.
-
-Answer with ONLY one word: SAME or CUT` }
-    ];
-
-    pairPromises.push(
-      client.messages.create({
-        model: 'claude-sonnet-4-5-20250929',
-        max_tokens: 16,
-        messages: [{ role: 'user', content }]
-      }).then(r => {
-        const word = (r.content[0]?.text || '').trim().toUpperCase();
-        return { idx: i, result: word.includes('CUT') ? 'CUT' : 'SAME' };
-      }).catch(e => {
-        console.error(`[Storyboard] Pair ${i}→${i+1} error:`, e.message);
-        return { idx: i, result: 'UNKNOWN' };
-      })
-    );
+    pairList.push(`${i + 1}→${i + 2}: SAME or CUT?`);
   }
 
-  // Run all pairs in parallel (batched to avoid rate limits)
-  const BATCH = 8;
-  const results = [];
-  for (let i = 0; i < pairPromises.length; i += BATCH) {
-    const batch = pairPromises.slice(i, i + BATCH);
-    results.push(...await Promise.all(batch));
-  }
-  results.sort((a, b) => a.idx - b.idx);
+  content.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
 
-  // Apply results to frames
-  let shotGroup = 0;
-  frames[thumbs[0].frameIdx].shotGroup = shotGroup;
+For each consecutive pair, decide SAME or CUT.
 
-  const decisions = [];
-  for (const { idx, result } of results) {
-    if (result === 'CUT') shotGroup++;
-    decisions.push(result);
-    frames[thumbs[idx + 1].frameIdx].shotGroup = shotGroup;
-  }
+SAME shot means the camera is in the same setup:
+- Same framing, same subject, same angle — action just progresses
+- Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
 
-  console.log(`[Storyboard] Pass 2: ${decisions.join(', ')} → ${shotGroup + 1} shots`);
+CUT means the camera moved to a new setup:
+- Different framing (wide shot vs close-up)
+- Different subject
+- Reverse angle (camera switches to opposite side — even if same people)
+- Different location
 
-  // Sanity check: if 0 cuts from 5+ frames, discard
-  if (shotGroup === 0 && thumbs.length >= 5) {
-    console.log(`[Storyboard] Pass 2: 0 cuts from ${thumbs.length} frames — discarding`);
-    frames.forEach(f => { delete f.shotGroup; });
+${pairList.join('\n')}
+
+Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 2048,
+      messages: [{ role: 'user', content }]
+    });
+
+    const text = response.content[0]?.text || '';
+    console.log(`[Storyboard] Pass 2 raw:`, text);
+
+    // Parse decisions
+    let shotGroup = 0;
+    frames[thumbs[0].frameIdx].shotGroup = shotGroup;
+    const decisions = [];
+
+    for (let i = 0; i < thumbs.length - 1; i++) {
+      // Match patterns like "1→2: CUT" or "1->2: SAME" — use flexible matching
+      const pattern = new RegExp(`(?:^|\\D)${i + 1}\\s*[→>\\-]+\\s*${i + 2}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
+      const match = text.match(pattern);
+      const decision = match ? match[1].toUpperCase() : 'SAME';
+      decisions.push(decision);
+      if (decision === 'CUT') shotGroup++;
+      frames[thumbs[i + 1].frameIdx].shotGroup = shotGroup;
+    }
+
+    console.log(`[Storyboard] Pass 2: ${decisions.join(', ')} → ${shotGroup + 1} shots`);
+
+    // Sanity check: if 0 cuts from 5+ frames, discard
+    if (shotGroup === 0 && thumbs.length >= 5) {
+      console.log(`[Storyboard] Pass 2: 0 cuts from ${thumbs.length} frames — discarding`);
+      frames.forEach(f => { delete f.shotGroup; });
+    }
+  } catch (err) {
+    console.error('[Storyboard] Pass 2 error:', err.message);
   }
 
   return frames;
