@@ -696,33 +696,29 @@ function groupIntoShots(frames) {
   const shots = [];
   let currentShot = null;
   let shotNumber = 1;
-  
+
+  // Check if Pass 2 AI grouping produced results
+  const hasAIGrouping = frames.some(f => f.shotGroup !== undefined);
+
   for (let i = 0; i < frames.length; i++) {
     const f = frames[i];
-    
-    // Start new shot if:
-    // - First frame
-    // - Frame doesn't continue previous
-    // - Has visible numbers and number changed (different base number)
     let startNewShot = false;
-    
+
     if (i === 0) {
       startNewShot = true;
+    } else if (hasAIGrouping && f.shotGroup !== undefined && frames[i-1].shotGroup !== undefined) {
+      // Prefer AI visual grouping when available (handles numbered boards too)
+      startNewShot = f.shotGroup !== frames[i-1].shotGroup;
     } else if (f.hasVisibleNumber) {
-      // If has visible numbers, group by base number (existing logic)
+      // Fallback: group by base number (1A, 1B → same shot; 1, 2 → different)
       const prevNum = (frames[i-1].frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
       const currNum = (f.frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
       startNewShot = prevNum !== currNum;
     } else {
-      // No visible numbers - use AI's grouping (shotGroup field from Pass 2)
-      if (f.shotGroup !== undefined && frames[i-1].shotGroup !== undefined) {
-        startNewShot = f.shotGroup !== frames[i-1].shotGroup;
-      } else {
-        // Fallback: each frame is its own shot
-        startNewShot = true;
-      }
+      // No grouping data and no numbers — each frame is its own shot
+      startNewShot = true;
     }
-    
+
     if (startNewShot) {
       if (currentShot) shots.push(currentShot);
       currentShot = {
@@ -733,16 +729,16 @@ function groupIntoShots(frames) {
         dialogs: []
       };
     }
-    
+
     currentShot.frames.push(f.frameNumber);
     if (f.image) currentShot.images.push(f.image);
     if (f.description) currentShot.descriptions.push(f.description);
     if (f.dialog) currentShot.dialogs.push(f.dialog);
   }
-  
+
   // Don't forget the last shot
   if (currentShot) shots.push(currentShot);
-  
+
   return shots.map(g => ({
     shotNumber: g.shotNumber,
     frames: g.frames,
@@ -760,88 +756,95 @@ async function analyzeGroupings(frames) {
   const client = getAnthropicClient();
   if (!client) return frames; // Fallback to pass 1 results
   
-  // Only analyze if we have images and no visible numbers
+  // Only analyze if we have images
   const framesWithImages = frames.filter(f => f.image);
   if (framesWithImages.length < 2) return frames;
-  if (frames.every(f => f.hasVisibleNumber)) return frames; // Trust visible numbers
-  
+
   try {
-    // Build a grid of thumbnails for the AI to analyze
+    // Build thumbnails for AI analysis — map frame indices so we can apply results back
     const imageContents = [];
-    
-    // Create smaller thumbnails for pass 2
-    for (let i = 0; i < Math.min(framesWithImages.length, 24); i++) {
-      const f = framesWithImages[i];
+    const frameIndexMap = []; // maps imageContents index → frames array index
+
+    for (let i = 0; i < frames.length; i++) {
+      if (imageContents.length >= 40) break; // cap at 40 frames
+      const f = frames[i];
       if (f.image) {
         const thumb = await sharp(Buffer.from(f.image, 'base64'))
           .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
           .jpeg({ quality: 70 })
           .toBuffer();
-        
+
         imageContents.push({
           type: 'image',
           source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') }
         });
+        frameIndexMap.push(i);
       }
     }
-    
+
     if (imageContents.length < 2) return frames;
-    
+
     console.log(`[Storyboard] Pass 2: Analyzing ${imageContents.length} frames for shot grouping`);
-    
+
+    // Build the content array with labeled frames
+    const content = [];
+    imageContents.forEach((img, idx) => {
+      content.push({ type: 'text', text: `Frame ${idx + 1}:` });
+      content.push(img);
+    });
+
+    content.push({ type: 'text', text: `These are ${imageContents.length} storyboard frames from a commercial, shown in order (Frame 1 through Frame ${imageContents.length}).
+
+Group consecutive frames into SHOTS (a shot = one continuous camera take).
+
+Frames belong to the SAME SHOT when they share:
+- Same background/environment visible from the same camera angle
+- Same general character arrangement (people in roughly same positions)
+- Continuous action that flows naturally across frames
+- Same camera perspective (wide, medium, close-up from same direction)
+
+Storyboard artists are INCONSISTENT with scale and detail level. Two frames may look slightly different in drawing style but still represent the same shot. Focus on ENVIRONMENT and CAMERA ANGLE, not drawing consistency.
+
+Start a NEW SHOT only when there is a clear CUT:
+- Different location or background entirely
+- Camera jumps to opposite side of characters
+- Cut to a completely different subject (insert shot, cutaway, new scene)
+- Dramatic change in framing (e.g., wide establishing → extreme close-up of object)
+
+IMPORTANT: When in doubt, GROUP frames together. It is much better to over-group (user can split later) than to over-split. Consecutive frames in the same environment from the same angle are almost always the same shot.
+
+Return ONLY a JSON array of arrays. Each inner array is one shot, containing frame numbers:
+[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` });
+
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      messages: [{
-        role: 'user',
-        content: [
-          ...imageContents,
-          { type: 'text', text: `These are ${imageContents.length} storyboard frames in sequence (Frame 1 through Frame ${imageContents.length}).
-
-Group them into SHOTS. Frames belong to the SAME SHOT if:
-
-1. SAME BACKGROUND ARCHITECTURE - Same room, same distinctive elements (range hood, cabinets, windows) visible from same angle
-2. SAME CHARACTER ARRANGEMENT - Characters in similar positions relative to each other  
-3. SAME CAMERA ANGLE - Shooting from same general direction
-4. CONTINUOUS ACTION - Action flows naturally across frames
-
-IMPORTANT: Storyboard artists are inconsistent with scale. Focus on BACKGROUND ELEMENTS and ENVIRONMENT - if the same room/architecture is visible from the same angle, it's likely one continuous shot even if character positions shift slightly.
-
-Frames are DIFFERENT SHOTS if:
-- Completely different location or background
-- Camera clearly on opposite side of characters
-- Cut to different subject entirely (insert, new scene)
-
-BIAS TOWARD GROUPING consecutive frames in the same environment.
-
-Return ONLY a JSON array:
-[[1, 2, 3, 4], [5], [6, 7], [8, 9, 10]]` }
-        ]
-      }]
+      max_tokens: 2048,
+      messages: [{ role: 'user', content }]
     });
-    
+
     const text = response.content[0].text;
     const jsonMatch = text.match(/\[[\s\S]*\]/);
-    
+
     if (jsonMatch) {
       const groups = JSON.parse(jsonMatch[0]);
-      console.log(`[Storyboard] Pass 2: AI grouped into ${groups.length} shots`);
-      
-      // Apply groupings to frames
+      console.log(`[Storyboard] Pass 2: AI grouped ${imageContents.length} frames into ${groups.length} shots`);
+
+      // Apply groupings to frames using the index map
       groups.forEach((group, shotIdx) => {
         group.forEach(frameNum => {
-          const idx = frameNum - 1; // Convert to 0-indexed
-          if (frames[idx]) {
-            frames[idx].shotGroup = shotIdx;
+          const contentIdx = frameNum - 1; // 1-indexed → 0-indexed in imageContents
+          const frameIdx = frameIndexMap[contentIdx]; // map to actual frames index
+          if (frameIdx !== undefined && frames[frameIdx]) {
+            frames[frameIdx].shotGroup = shotIdx;
           }
         });
       });
     }
   } catch (e) {
     console.error('[Storyboard] Pass 2 error:', e.message);
-    // Fallback to pass 1 results
+    // Fallback — no grouping applied, groupIntoShots will use number-based or per-frame fallback
   }
-  
+
   return frames;
 }
 
@@ -973,11 +976,11 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         frames.forEach((f, idx) => {
           f.frameNumber = String(idx + 1);
         });
-        
-        // Pass 2: AI grouping analysis (only for unnumbered storyboards)
-        await analyzeGroupings(frames);
       }
-      
+
+      // Always run Pass 2 AI grouping for visual shot analysis
+      await analyzeGroupings(frames);
+
       spots.push({
         name,
         shots: groupIntoShots(frames)
