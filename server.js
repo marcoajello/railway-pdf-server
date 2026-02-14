@@ -786,10 +786,13 @@ async function analyzeGroupings(frames) {
 
     console.log(`[Storyboard] Pass 2: Pairwise boundary detection on ${imageContents.length} frames`);
 
-    // Pairwise boundary detection: show all frames, then ask for SAME/CUT at each transition
+    // Pairwise boundary detection: show all frames with descriptions, then ask for SAME/CUT
     const content = [];
     imageContents.forEach((img, idx) => {
-      content.push({ type: 'text', text: `Frame ${idx + 1}:` });
+      const frameIdx = frameIndexMap[idx];
+      const desc = frames[frameIdx]?.description || '';
+      const label = desc ? `Frame ${idx + 1} — "${desc.substring(0, 80)}":` : `Frame ${idx + 1}:`;
+      content.push({ type: 'text', text: label });
       content.push(img);
     });
 
@@ -817,7 +820,7 @@ SAME — the camera stays locked in the same position and framing:
 
 The key question is: would a film crew need to MOVE THE CAMERA to get this new frame? If yes → CUT. If the camera could stay on its tripod → SAME.
 
-For each pair below, write SAME or CUT:
+For each pair below, write ONLY "SAME" or "CUT":
 ${pairList.join('\n')}` });
 
     const response = await client.messages.create({
@@ -830,18 +833,25 @@ ${pairList.join('\n')}` });
     console.log(`[Storyboard] Pass 2 raw response: ${text}`);
 
     // Parse SAME/CUT responses — look for each transition
+    // Use word boundaries to avoid matching "12→13" when looking for "2→3"
     let shotGroup = 0;
+    let parsedCount = 0;
     if (frameIndexMap[0] !== undefined && frames[frameIndexMap[0]]) {
       frames[frameIndexMap[0]].shotGroup = shotGroup;
     }
 
     for (let i = 1; i < imageContents.length; i++) {
-      // Look for this transition in the response (e.g. "1→2: CUT" or "1→2: SAME")
-      const pattern = new RegExp(`${i}\\s*[→>\\-]+\\s*${i + 1}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
+      // Match "N→N+1: CUT/SAME" with word boundary on the first number
+      const pattern = new RegExp(`(?:^|\\D)${i}\\s*[→>\\-]+\\s*${i + 1}\\s*[:.]?\\s*(SAME|CUT)`, 'im');
       const match = text.match(pattern);
 
-      if (match && match[1].toUpperCase() === 'CUT') {
-        shotGroup++;
+      if (match) {
+        parsedCount++;
+        if (match[1].toUpperCase() === 'CUT') {
+          shotGroup++;
+        }
+      } else {
+        console.log(`[Storyboard] Pass 2: Could not parse transition ${i}→${i + 1}`);
       }
 
       const frameIdx = frameIndexMap[i];
@@ -850,7 +860,15 @@ ${pairList.join('\n')}` });
       }
     }
 
-    console.log(`[Storyboard] Pass 2: Detected ${shotGroup + 1} shots from ${imageContents.length} frames`);
+    const totalTransitions = imageContents.length - 1;
+    console.log(`[Storyboard] Pass 2: Parsed ${parsedCount}/${totalTransitions} transitions, detected ${shotGroup + 1} shots from ${imageContents.length} frames`);
+
+    // Sanity check: if we couldn't parse most transitions, or got 0 cuts from 4+ frames,
+    // the analysis likely failed — clear shotGroup so fallback grouping is used
+    if (parsedCount < totalTransitions * 0.5 || (shotGroup === 0 && imageContents.length >= 4)) {
+      console.log(`[Storyboard] Pass 2: Suspicious result (${shotGroup} cuts, ${parsedCount} parsed) — discarding, will use fallback grouping`);
+      frames.forEach(f => { delete f.shotGroup; });
+    }
 
   } catch (e) {
     console.error('[Storyboard] Pass 2 error:', e.message);
