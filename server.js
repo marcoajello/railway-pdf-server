@@ -801,15 +801,21 @@ async function analyzeGroupings(frames) {
 
     content.push({ type: 'text', text: `Above are ${imageContents.length} storyboard frames from a commercial in sequence.
 
-For each consecutive pair, decide: is it the SAME camera shot continuing, or is there a CUT to a new shot?
+For each consecutive pair, decide: is it the SAME continuous camera shot, or is there a CUT to a new camera setup?
 
-A CUT happens when the camera CHANGES between two frames:
-- Different shot size (e.g. wide shot → close-up, or medium → wide)
-- Different camera angle or position
-- Different subject becomes the focus
-- Different location or background
+CUT — the camera has moved to a new position or setup:
+- Reverse angle (camera flips to the other side of the subject — even if same people are shown)
+- Different shot size (wide → close-up, medium → wide, etc.)
+- Different camera position or perspective on the scene
+- Different subject or location
+- Over-the-shoulder vs. facing — these are DIFFERENT setups
 
-SAME means the camera stays in essentially the same position and framing — the action progresses but the camera doesn't change. Minor character movement or gesture changes within the same framing = SAME.
+SAME — the camera stays locked in the same position and framing:
+- Action continues but camera doesn't move
+- Characters gesture, talk, or shift slightly within the same framing
+- Same background composition from the same viewpoint
+
+The key question is: would a film crew need to MOVE THE CAMERA to get this new frame? If yes → CUT. If the camera could stay on its tripod → SAME.
 
 For each pair below, write SAME or CUT:
 ${pairList.join('\n')}` });
