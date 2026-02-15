@@ -752,12 +752,12 @@ function groupIntoShots(frames) {
 }
 
 // Pass 2: AI-powered shot grouping analysis
-async function analyzeGroupings(frames) {
+// Opus option — simple prompt, small thumbnails, ~$0.44/spot
+async function analyzeGroupingsOpus(frames) {
   const client = getAnthropicClient();
   if (!client) return frames;
 
-  // Build thumbnails — map indices so we can apply results back
-  const thumbs = []; // { img: {type,source}, frameIdx, desc }
+  const thumbs = [];
   for (let i = 0; i < frames.length; i++) {
     if (thumbs.length >= 40) break;
     const f = frames[i];
@@ -775,20 +775,15 @@ async function analyzeGroupings(frames) {
   }
 
   if (thumbs.length < 2) return frames;
+  console.log(`[Storyboard] Pass 2 (Opus): ${thumbs.length} frames`);
 
-  console.log(`[Storyboard] Pass 2: Single-call Opus pairwise on ${thumbs.length} frames`);
-
-  // Build a single message with ALL frames, then ask for pairwise SAME/CUT
   const content = [];
-
-  // Add all frame images with labels
   for (let i = 0; i < thumbs.length; i++) {
     const t = thumbs[i];
     content.push({ type: 'text', text: `Frame ${i + 1}${t.desc ? ` — "${t.desc.substring(0, 100)}"` : ''}:` });
     content.push(t.img);
   }
 
-  // Build pair list
   const pairList = [];
   for (let i = 0; i < thumbs.length - 1; i++) {
     pairList.push(`${i + 1}→${i + 2}: SAME or CUT?`);
@@ -820,34 +815,110 @@ Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
       max_tokens: 2048,
       messages: [{ role: 'user', content }]
     });
-
-    const text = response.content[0]?.text || '';
-    console.log(`[Storyboard] Pass 2 raw:`, text);
-
-    // Parse decisions
-    let shotGroup = 0;
-    frames[thumbs[0].frameIdx].shotGroup = shotGroup;
-    const decisions = [];
-
-    for (let i = 0; i < thumbs.length - 1; i++) {
-      // Match patterns like "1→2: CUT" or "1->2: SAME" — use flexible matching
-      const pattern = new RegExp(`(?:^|\\D)${i + 1}\\s*[→>\\-]+\\s*${i + 2}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
-      const match = text.match(pattern);
-      const decision = match ? match[1].toUpperCase() : 'SAME';
-      decisions.push(decision);
-      if (decision === 'CUT') shotGroup++;
-      frames[thumbs[i + 1].frameIdx].shotGroup = shotGroup;
-    }
-
-    console.log(`[Storyboard] Pass 2: ${decisions.join(', ')} → ${shotGroup + 1} shots`);
-
-    // Sanity check: if 0 cuts from 5+ frames, discard
-    if (shotGroup === 0 && thumbs.length >= 5) {
-      console.log(`[Storyboard] Pass 2: 0 cuts from ${thumbs.length} frames — discarding`);
-      frames.forEach(f => { delete f.shotGroup; });
-    }
+    return applyPass2Decisions(frames, thumbs, response.content[0]?.text || '');
   } catch (err) {
-    console.error('[Storyboard] Pass 2 error:', err.message);
+    console.error('[Storyboard] Pass 2 (Opus) error:', err.message);
+    return frames;
+  }
+}
+
+// Sonnet option — full descriptions, high-res images, ~$0.10/spot
+async function analyzeGroupings(frames) {
+  const client = getAnthropicClient();
+  if (!client) return frames;
+
+  // Build high-res images (1200px) for better visual detail
+  const thumbs = [];
+  for (let i = 0; i < frames.length; i++) {
+    if (thumbs.length >= 40) break;
+    const f = frames[i];
+    if (f.image) {
+      const thumb = await sharp(Buffer.from(f.image, 'base64'))
+        .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      thumbs.push({
+        img: { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: thumb.toString('base64') } },
+        frameIdx: i,
+        desc: f.description || ''
+      });
+    }
+  }
+
+  if (thumbs.length < 2) return frames;
+  console.log(`[Storyboard] Pass 2 (Sonnet HD): ${thumbs.length} frames`);
+
+  const content = [];
+
+  // Add all frame images with FULL descriptions
+  for (let i = 0; i < thumbs.length; i++) {
+    const t = thumbs[i];
+    const descText = t.desc ? `\nDescription: "${t.desc}"` : '';
+    content.push({ type: 'text', text: `Frame ${i + 1}:${descText}` });
+    content.push(t.img);
+  }
+
+  const pairList = [];
+  for (let i = 0; i < thumbs.length - 1; i++) {
+    pairList.push(`${i + 1}→${i + 2}: SAME or CUT?`);
+  }
+
+  content.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
+
+For each consecutive pair, decide SAME or CUT.
+
+SAME shot means the camera is in the same setup:
+- Same framing, same subject, same angle — action just progresses
+- Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
+
+CUT means the camera moved to a new setup:
+- Different framing (wide shot vs close-up)
+- Different subject
+- Reverse angle (camera switches to opposite side — even if same people)
+- Different location
+
+When in doubt, lean toward SAME. Storyboard frames from the same shot often look slightly different due to the artist's drawing — focus on whether the CAMERA SETUP changed, not small drawing variations.
+
+${pairList.join('\n')}
+
+Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 2048,
+      messages: [{ role: 'user', content }]
+    });
+    return applyPass2Decisions(frames, thumbs, response.content[0]?.text || '');
+  } catch (err) {
+    console.error('[Storyboard] Pass 2 (Sonnet) error:', err.message);
+    return frames;
+  }
+}
+
+// Shared: parse SAME/CUT decisions and apply shotGroup to frames
+function applyPass2Decisions(frames, thumbs, text) {
+  console.log(`[Storyboard] Pass 2 raw:`, text);
+
+  let shotGroup = 0;
+  frames[thumbs[0].frameIdx].shotGroup = shotGroup;
+  const decisions = [];
+
+  for (let i = 0; i < thumbs.length - 1; i++) {
+    const pattern = new RegExp(`(?:^|\\D)${i + 1}\\s*[→>\\-]+\\s*${i + 2}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
+    const match = text.match(pattern);
+    const decision = match ? match[1].toUpperCase() : 'SAME';
+    decisions.push(decision);
+    if (decision === 'CUT') shotGroup++;
+    frames[thumbs[i + 1].frameIdx].shotGroup = shotGroup;
+  }
+
+  console.log(`[Storyboard] Pass 2: ${decisions.join(', ')} → ${shotGroup + 1} shots`);
+
+  // Sanity check: if 0 cuts from 5+ frames, discard
+  if (shotGroup === 0 && thumbs.length >= 5) {
+    console.log(`[Storyboard] Pass 2: 0 cuts from ${thumbs.length} frames — discarding`);
+    frames.forEach(f => { delete f.shotGroup; });
   }
 
   return frames;
