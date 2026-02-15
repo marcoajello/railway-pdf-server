@@ -870,10 +870,10 @@ Rules:
 
 When in doubt, use the SAME letter. Storyboard art varies between frames — focus on camera placement, not drawing style.
 
-Answer ONLY with:
-Frame 1: A
-Frame 2: A
-Frame 3: B
+For each frame, answer with the letter AND a brief reason explaining where the camera is:
+Frame 1: A — camera is behind the desk, looking at the group
+Frame 2: A — same position, action progresses
+Frame 3: B — camera moved to close-up position near the subject
 ...etc.` });
 
   try {
