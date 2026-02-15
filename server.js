@@ -944,15 +944,21 @@ Frame 3: B — same boots, slightly wider
     const pairText = pairRes.content[0]?.text || '';
     const subjectText = subjectRes.content[0]?.text || '';
 
+    // Flexible label parser — handles **Frame 1: A**, **Frame 1:** A, Frame 1: **A**, etc.
+    function parseLabels(text, count) {
+      const labels = [];
+      for (let i = 0; i < count; i++) {
+        const pattern = new RegExp(`Frame\\s+${i + 1}[^A-Za-z0-9]*([A-Z])(?:\\*|\\s|—|\\b)`, 'i');
+        const match = text.match(pattern);
+        labels.push(match ? match[1].toUpperCase() : null);
+      }
+      return labels;
+    }
+
     // Parse Pass A: position labels → cuts
     console.log(`[Storyboard] Pass A (positions) raw:`, positionText);
     const positionCuts = new Set();
-    const posLabels = [];
-    for (let i = 0; i < thumbs.length; i++) {
-      const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*\\*{0,2}([A-Z])\\*{0,2}`, 'i');
-      const match = positionText.match(pattern);
-      posLabels.push(match ? match[1].toUpperCase() : null);
-    }
+    const posLabels = parseLabels(positionText, thumbs.length);
     for (let i = 1; i < posLabels.length; i++) {
       if (posLabels[i] && posLabels[i - 1] && posLabels[i] !== posLabels[i - 1]) {
         positionCuts.add(i);
@@ -975,12 +981,7 @@ Frame 3: B — same boots, slightly wider
     // Parse Pass C: subject labels → cuts
     console.log(`[Storyboard] Pass C (subjects) raw:`, subjectText);
     const subjectCuts = new Set();
-    const subLabels = [];
-    for (let i = 0; i < thumbs.length; i++) {
-      const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*\\*{0,2}([A-Z])\\*{0,2}`, 'i');
-      const match = subjectText.match(pattern);
-      subLabels.push(match ? match[1].toUpperCase() : null);
-    }
+    const subLabels = parseLabels(subjectText, thumbs.length);
     for (let i = 1; i < subLabels.length; i++) {
       if (subLabels[i] && subLabels[i - 1] && subLabels[i] !== subLabels[i - 1]) {
         subjectCuts.add(i);
