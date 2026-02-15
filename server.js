@@ -900,9 +900,29 @@ ${pairList.join('\n')}
 
 Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
 
-  // Run both passes in PARALLEL
+  // --- Pass C: Subject/content identification ---
+  const subjectContent = [...imageContent];
+  subjectContent.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
+
+For each frame, identify WHAT the camera is focused on — the primary subject that fills the frame. Then assign a subject label (A, B, C, etc.) where frames showing the same subject at roughly the same scale get the same letter.
+
+Different label when:
+- The subject changes (e.g. boots → full figure → crown → face)
+- The scale changes dramatically (extreme close-up of a detail vs wide shot of a person)
+- We see a completely different part of the scene
+
+Same label when:
+- Same subject at similar scale, just a different moment or pose
+
+For each frame, answer with the letter AND what the subject is:
+Frame 1: A — extreme close-up of floor/rug pattern
+Frame 2: B — close-up of boots walking
+Frame 3: B — same boots, slightly wider
+...etc.` });
+
+  // Run all three passes in PARALLEL
   try {
-    const [positionRes, pairRes] = await Promise.all([
+    const [positionRes, pairRes, subjectRes] = await Promise.all([
       client.messages.create({
         model: 'claude-sonnet-4-5-20250929',
         max_tokens: 2048,
@@ -912,27 +932,33 @@ Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
         model: 'claude-sonnet-4-5-20250929',
         max_tokens: 2048,
         messages: [{ role: 'user', content: pairContent }]
+      }),
+      client.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: subjectContent }]
       })
     ]);
 
     const positionText = positionRes.content[0]?.text || '';
     const pairText = pairRes.content[0]?.text || '';
+    const subjectText = subjectRes.content[0]?.text || '';
 
     // Parse Pass A: position labels → cuts
     console.log(`[Storyboard] Pass A (positions) raw:`, positionText);
     const positionCuts = new Set();
-    const labels = [];
+    const posLabels = [];
     for (let i = 0; i < thumbs.length; i++) {
       const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*\\*{0,2}([A-Z])\\*{0,2}`, 'i');
       const match = positionText.match(pattern);
-      labels.push(match ? match[1].toUpperCase() : null);
+      posLabels.push(match ? match[1].toUpperCase() : null);
     }
-    for (let i = 1; i < labels.length; i++) {
-      if (labels[i] && labels[i - 1] && labels[i] !== labels[i - 1]) {
+    for (let i = 1; i < posLabels.length; i++) {
+      if (posLabels[i] && posLabels[i - 1] && posLabels[i] !== posLabels[i - 1]) {
         positionCuts.add(i);
       }
     }
-    console.log(`[Storyboard] Pass A labels: ${labels.join(', ')} → cuts at: [${[...positionCuts].join(', ')}]`);
+    console.log(`[Storyboard] Pass A labels: ${posLabels.join(', ')} → cuts at: [${[...positionCuts].join(', ')}]`);
 
     // Parse Pass B: SAME/CUT decisions → cuts
     console.log(`[Storyboard] Pass B (pairwise) raw:`, pairText);
@@ -941,14 +967,36 @@ Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
       const pattern = new RegExp(`(?:^|\\D)${i + 1}\\s*[→>\\-]+\\s*${i + 2}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
       const match = pairText.match(pattern);
       if (match && match[1].toUpperCase() === 'CUT') {
-        pairCuts.add(i + 1); // cut BEFORE frame i+1
+        pairCuts.add(i + 1);
       }
     }
     console.log(`[Storyboard] Pass B cuts at: [${[...pairCuts].join(', ')}]`);
 
-    // Merge: if EITHER pass says CUT, it's a CUT
-    const mergedCuts = new Set([...positionCuts, ...pairCuts]);
-    console.log(`[Storyboard] Merged cuts (union): [${[...mergedCuts].sort((a,b) => a-b).join(', ')}]`);
+    // Parse Pass C: subject labels → cuts
+    console.log(`[Storyboard] Pass C (subjects) raw:`, subjectText);
+    const subjectCuts = new Set();
+    const subLabels = [];
+    for (let i = 0; i < thumbs.length; i++) {
+      const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*\\*{0,2}([A-Z])\\*{0,2}`, 'i');
+      const match = subjectText.match(pattern);
+      subLabels.push(match ? match[1].toUpperCase() : null);
+    }
+    for (let i = 1; i < subLabels.length; i++) {
+      if (subLabels[i] && subLabels[i - 1] && subLabels[i] !== subLabels[i - 1]) {
+        subjectCuts.add(i);
+      }
+    }
+    console.log(`[Storyboard] Pass C labels: ${subLabels.join(', ')} → cuts at: [${[...subjectCuts].join(', ')}]`);
+
+    // Merge: 2-out-of-3 vote — cut if at least 2 passes agree
+    const allBoundaries = new Set([...positionCuts, ...pairCuts, ...subjectCuts]);
+    const mergedCuts = new Set();
+    for (const b of allBoundaries) {
+      const votes = (positionCuts.has(b) ? 1 : 0) + (pairCuts.has(b) ? 1 : 0) + (subjectCuts.has(b) ? 1 : 0);
+      if (votes >= 2) mergedCuts.add(b);
+    }
+    console.log(`[Storyboard] Votes: ${[...allBoundaries].sort((a,b) => a-b).map(b => `${b}=${(positionCuts.has(b)?'A':'')+(pairCuts.has(b)?'B':'')+(subjectCuts.has(b)?'C':'')}`).join(', ')}`);
+    console.log(`[Storyboard] Merged cuts (2/3 vote): [${[...mergedCuts].sort((a,b) => a-b).join(', ')}]`);
 
     // Apply merged cuts to frames
     let shotGroup = 0;
@@ -958,7 +1006,7 @@ Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
       frames[thumbs[i].frameIdx].shotGroup = shotGroup;
     }
 
-    console.log(`[Storyboard] Pass 2: ${shotGroup + 1} shots (ensemble)`);
+    console.log(`[Storyboard] Pass 2: ${shotGroup + 1} shots (3-pass ensemble)`);
 
     // Sanity check: if 0 cuts from 5+ frames, discard
     if (shotGroup === 0 && thumbs.length >= 5) {
