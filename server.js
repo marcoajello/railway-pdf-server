@@ -800,7 +800,7 @@ SAME shot means the camera is in the same setup:
 CUT means the camera moved to a new setup:
 - Different framing (wide shot vs close-up)
 - Different subject
-- Reverse angle (camera switches to opposite side — even if same people)
+- The BACKGROUND/OBJECTS visible behind the subject change dramatically — you see a completely different side of the environment. This means the camera moved to the opposite side.
 - Different location
 
 When in doubt, lean toward SAME. Storyboard frames from the same shot often look slightly different due to the artist's drawing — focus on whether the CAMERA SETUP changed, not small drawing variations.
@@ -874,7 +874,7 @@ SAME shot means the camera is in the same setup:
 CUT means the camera moved to a new setup:
 - Different framing (wide shot vs close-up)
 - Different subject
-- Reverse angle (camera switches to opposite side — even if same people)
+- The BACKGROUND/OBJECTS visible behind the subject change dramatically — you see a completely different side of the environment. This means the camera moved to the opposite side.
 - Different location
 
 When in doubt, lean toward SAME. Storyboard frames from the same shot often look slightly different due to the artist's drawing — focus on whether the CAMERA SETUP changed, not small drawing variations.
