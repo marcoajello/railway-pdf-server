@@ -861,17 +861,18 @@ async function analyzeGroupings(frames) {
   const positionContent = [...imageContent];
   positionContent.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
 
-Imagine you are looking at the scene from above — a bird's eye floor plan. For each frame, figure out WHERE the camera is physically standing in the room, and assign it a camera position label (A, B, C, etc.).
+For each frame, picture the MAIN SUBJECT as a 3D object (a person, a car, a table — whatever dominates the frame). Ask yourself: which SIDE or SURFACE of that subject am I looking at? Assign a camera setup label (A, B, C, etc.) based on this.
 
 Rules:
-- Frames shot from the same camera position get the SAME letter, even if the action progresses.
-- Arrows drawn on frames indicate the camera is MOVING (push in, dolly, pan) — this is still the same position/setup, use the same letter.
-- If the camera is on the OPPOSITE side of the room/subject, that's a different position = different letter.
-- IMPORTANT: Dramatic changes in shot size = different camera position. An extreme close-up (e.g. just hands, just a crown, just boots) requires the camera to be MUCH closer than a wide/full body shot. These cannot be the same setup even if the storyboard describes them as a continuous move. Judge by the IMAGES, not the descriptions.
-- A small change in framing from the same direction (e.g. medium to medium-close) is the same position IF connected by arrows/movement.
-- DIFFERENT SIDE = DIFFERENT POSITION: Think about which SIDE of each person or object you can see. If one frame shows the BACK or SIDE of a person (over-the-shoulder, behind them) and another frame shows their FACE or FRONT, the camera rotated ~180° — that is a DIFFERENT position. This applies to objects too: front of a car vs rear, one side of a table vs the other side. Mentally picture each subject as a 3D object and ask: am I seeing the same face/surface, or a different one?
+- Same side/surface of the same subject at similar scale = SAME letter, even if the action progresses.
+- Arrows drawn on frames indicate continuous camera movement = same letter.
+- If you see a person from BEHIND (back of head, over their shoulder, looking past them) in one frame, and then you see that person's FACE in another frame — those MUST be different letters. The camera physically moved to the other side of them.
+- Same principle for objects: front of a car vs rear, one side of a desk vs the other = different letter.
+- Dramatic changes in shot size = different letter. An extreme close-up (just hands, just eyes) requires the camera to be MUCH closer than a wide shot — different setup.
+- A wider shot that reveals MORE of the same scene (same subjects still visible, just more context around them) can be the same letter IF the camera is looking from the same direction.
+- DO NOT think in terms of "sides of the room." Think in terms of "which surface of the subject am I seeing."
 
-When in doubt, use the SAME letter — but trust dramatic visual differences in the images over text descriptions.
+When in doubt, use the SAME letter — but if the subject's orientation toward camera clearly changed (back→front, left side→right side), use a DIFFERENT letter.
 
 For each frame, answer with the letter AND a brief reason explaining where the camera is:
 Frame 1: A — camera is behind the desk, looking at the group
