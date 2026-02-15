@@ -846,19 +846,20 @@ async function analyzeGroupings(frames) {
   }
 
   if (thumbs.length < 2) return frames;
-  console.log(`[Storyboard] Pass 2 (Sonnet HD — camera position): ${thumbs.length} frames`);
+  console.log(`[Storyboard] Pass 2 (dual-pass ensemble): ${thumbs.length} frames`);
 
-  const content = [];
-
-  // Add all frame images with FULL descriptions
+  // Build shared image content block (reused by both passes)
+  const imageContent = [];
   for (let i = 0; i < thumbs.length; i++) {
     const t = thumbs[i];
     const descText = t.desc ? `\nDescription: "${t.desc}"` : '';
-    content.push({ type: 'text', text: `Frame ${i + 1}:${descText}` });
-    content.push(t.img);
+    imageContent.push({ type: 'text', text: `Frame ${i + 1}:${descText}` });
+    imageContent.push(t.img);
   }
 
-  content.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
+  // --- Pass A: Camera position labels (spatial reasoning) ---
+  const positionContent = [...imageContent];
+  positionContent.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
 
 Imagine you are looking at the scene from above — a bird's eye floor plan. For each frame, figure out WHERE the camera is physically standing in the room, and assign it a camera position label (A, B, C, etc.).
 
@@ -876,17 +877,102 @@ Frame 2: A — same position, action progresses
 Frame 3: B — camera moved to close-up position near the subject
 ...etc.` });
 
-  try {
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 2048,
-      messages: [{ role: 'user', content }]
-    });
-    return applyPositionLabels(frames, thumbs, response.content[0]?.text || '');
-  } catch (err) {
-    console.error('[Storyboard] Pass 2 (Sonnet) error:', err.message);
-    return frames;
+  // --- Pass B: Pairwise SAME/CUT (direct comparison) ---
+  const pairContent = [...imageContent];
+  const pairList = [];
+  for (let i = 0; i < thumbs.length - 1; i++) {
+    pairList.push(`${i + 1}→${i + 2}: SAME or CUT?`);
   }
+  pairContent.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
+
+For each consecutive pair, decide SAME or CUT.
+
+SAME shot means the camera is in the same setup:
+- Same framing, same subject, same angle — action just progresses
+- Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
+
+CUT means the camera moved to a new setup:
+- Different framing (wide shot vs close-up)
+- Different subject
+- Reverse angle (camera on opposite side of the subject — even if same people)
+- Different location
+
+When in doubt, lean toward SAME. Focus on whether the CAMERA SETUP changed, not small drawing variations.
+
+${pairList.join('\n')}
+
+Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
+
+  // Run both passes in PARALLEL
+  try {
+    const [positionRes, pairRes] = await Promise.all([
+      client.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: positionContent }]
+      }),
+      client.messages.create({
+        model: 'claude-sonnet-4-5-20250929',
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: pairContent }]
+      })
+    ]);
+
+    const positionText = positionRes.content[0]?.text || '';
+    const pairText = pairRes.content[0]?.text || '';
+
+    // Parse Pass A: position labels → cuts
+    console.log(`[Storyboard] Pass A (positions) raw:`, positionText);
+    const positionCuts = new Set();
+    const labels = [];
+    for (let i = 0; i < thumbs.length; i++) {
+      const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*\\*{0,2}([A-Z])\\*{0,2}`, 'i');
+      const match = positionText.match(pattern);
+      labels.push(match ? match[1].toUpperCase() : null);
+    }
+    for (let i = 1; i < labels.length; i++) {
+      if (labels[i] && labels[i - 1] && labels[i] !== labels[i - 1]) {
+        positionCuts.add(i);
+      }
+    }
+    console.log(`[Storyboard] Pass A labels: ${labels.join(', ')} → cuts at: [${[...positionCuts].join(', ')}]`);
+
+    // Parse Pass B: SAME/CUT decisions → cuts
+    console.log(`[Storyboard] Pass B (pairwise) raw:`, pairText);
+    const pairCuts = new Set();
+    for (let i = 0; i < thumbs.length - 1; i++) {
+      const pattern = new RegExp(`(?:^|\\D)${i + 1}\\s*[→>\\-]+\\s*${i + 2}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
+      const match = pairText.match(pattern);
+      if (match && match[1].toUpperCase() === 'CUT') {
+        pairCuts.add(i + 1); // cut BEFORE frame i+1
+      }
+    }
+    console.log(`[Storyboard] Pass B cuts at: [${[...pairCuts].join(', ')}]`);
+
+    // Merge: if EITHER pass says CUT, it's a CUT
+    const mergedCuts = new Set([...positionCuts, ...pairCuts]);
+    console.log(`[Storyboard] Merged cuts (union): [${[...mergedCuts].sort((a,b) => a-b).join(', ')}]`);
+
+    // Apply merged cuts to frames
+    let shotGroup = 0;
+    frames[thumbs[0].frameIdx].shotGroup = shotGroup;
+    for (let i = 1; i < thumbs.length; i++) {
+      if (mergedCuts.has(i)) shotGroup++;
+      frames[thumbs[i].frameIdx].shotGroup = shotGroup;
+    }
+
+    console.log(`[Storyboard] Pass 2: ${shotGroup + 1} shots (ensemble)`);
+
+    // Sanity check: if 0 cuts from 5+ frames, discard
+    if (shotGroup === 0 && thumbs.length >= 5) {
+      console.log(`[Storyboard] Pass 2: 0 cuts from ${thumbs.length} frames — discarding`);
+      frames.forEach(f => { delete f.shotGroup; });
+    }
+  } catch (err) {
+    console.error('[Storyboard] Pass 2 error:', err.message);
+  }
+
+  return frames;
 }
 
 // Parse camera position labels (A, B, C...) and derive shotGroups
