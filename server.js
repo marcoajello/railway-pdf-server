@@ -869,6 +869,7 @@ Rules:
 - If the camera is on the OPPOSITE side of the room/subject, that's a different position = different letter.
 - IMPORTANT: Dramatic changes in shot size = different camera position. An extreme close-up (e.g. just hands, just a crown, just boots) requires the camera to be MUCH closer than a wide/full body shot. These cannot be the same setup even if the storyboard describes them as a continuous move. Judge by the IMAGES, not the descriptions.
 - A small change in framing from the same direction (e.g. medium to medium-close) is the same position IF connected by arrows/movement.
+- DIFFERENT SIDE = DIFFERENT POSITION: Think about which SIDE of each person or object you can see. If one frame shows the BACK or SIDE of a person (over-the-shoulder, behind them) and another frame shows their FACE or FRONT, the camera rotated ~180° — that is a DIFFERENT position. This applies to objects too: front of a car vs rear, one side of a table vs the other side. Mentally picture each subject as a 3D object and ask: am I seeing the same face/surface, or a different one?
 
 When in doubt, use the SAME letter — but trust dramatic visual differences in the images over text descriptions.
 
@@ -892,8 +893,7 @@ SAME = the two frames show essentially the same view. Same shot size, same angle
 
 CUT = the view changed significantly. ANY of these = CUT:
 - Shot size changed dramatically (close-up vs wide, detail vs full figure)
-- Camera is on the OTHER SIDE of the subject — we see the front of objects in one frame and the back/reverse in the next, or vice versa. This is called a REVERSE ANGLE and is always a CUT.
-- The SURFACES and OBJECTS visible have flipped — e.g. we see one side of a desk/table/shelf in one frame and the opposite side in the next. The camera must have moved 120-180 degrees.
+- DIFFERENT SIDE of a person or object: Mentally picture each subject as a 3D object. If you see the BACK or SIDE of someone (over-the-shoulder, behind them, looking past them) in one frame and their FACE or FRONT in the next — the camera moved ~180°, that is ALWAYS a cut. Same for objects: front of a car vs rear, one side of a desk vs the other.
 - Different subject or different part of a subject (boots vs crown vs face)
 - Different background or environment visible
 
