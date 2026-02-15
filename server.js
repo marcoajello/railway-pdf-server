@@ -861,18 +861,22 @@ async function analyzeGroupings(frames) {
   const positionContent = [...imageContent];
   positionContent.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
 
-For each frame, picture the MAIN SUBJECT as a 3D object (a person, a car, a table — whatever dominates the frame). Ask yourself: which SIDE or SURFACE of that subject am I looking at? Assign a camera setup label (A, B, C, etc.) based on this.
+For each frame, determine the camera SETUP by considering two things together:
+
+1. POSITION — Where is the camera physically? (how far from the subject, which side)
+2. ORIENTATION — Which SURFACE of the main subject are we seeing? (front/face, back/behind, left side, right side)
+
+A camera setup label (A, B, C, etc.) changes when EITHER of these changes significantly.
 
 Rules:
-- Same side/surface of the same subject at similar scale = SAME letter, even if the action progresses.
+- Same position + same surface of subject = SAME letter, even if the action progresses.
 - Arrows drawn on frames indicate continuous camera movement = same letter.
-- If you see a person from BEHIND (back of head, over their shoulder, looking past them) in one frame, and then you see that person's FACE in another frame — those MUST be different letters. The camera physically moved to the other side of them.
+- If you see a person from BEHIND (back of head, over their shoulder, looking past them) in one frame, and then you see that person's FACE in another — the orientation flipped, that is a DIFFERENT letter. Picture each person as a 3D figure: which side of them is facing the camera?
 - Same principle for objects: front of a car vs rear, one side of a desk vs the other = different letter.
-- Dramatic changes in shot size = different letter. An extreme close-up (just hands, just eyes) requires the camera to be MUCH closer than a wide shot — different setup.
-- A wider shot that reveals MORE of the same scene (same subjects still visible, just more context around them) can be the same letter IF the camera is looking from the same direction.
-- DO NOT think in terms of "sides of the room." Think in terms of "which surface of the subject am I seeing."
+- Dramatic change in distance = different letter. An extreme close-up (just hands, just eyes) vs a wide shot = different setup.
+- A slightly wider or tighter shot from the same direction, showing the same surface of the same subjects, can be the same letter — especially if connected by arrows.
 
-When in doubt, use the SAME letter — but if the subject's orientation toward camera clearly changed (back→front, left side→right side), use a DIFFERENT letter.
+When in doubt, use the SAME letter — but if the subject's surface facing camera changed (back→front, left→right), that is ALWAYS a different letter.
 
 For each frame, answer with the letter AND a brief reason explaining where the camera is:
 Frame 1: A — camera is behind the desk, looking at the group
