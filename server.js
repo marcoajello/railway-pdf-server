@@ -888,11 +888,12 @@ Frame 3: B — camera moved to close-up position near the subject
 
 For each consecutive pair, look ONLY at the two images and decide SAME or CUT. Ignore the text descriptions — judge purely by what the camera sees.
 
-SAME = the two frames show essentially the same view. Same shot size, same angle, same subject — only the action or pose changed slightly.
+SAME = the two frames show essentially the same view. Same shot size, same angle, same subject — only the action or pose changed slightly. Arrows drawn between frames indicate continuous camera movement = SAME.
 
-CUT = the view changed. ANY of these = CUT:
-- Shot size changed (close-up vs wide, detail vs full figure)
-- Camera is on the other side of the subject (we see their front vs their back)
+CUT = the view changed significantly. ANY of these = CUT:
+- Shot size changed dramatically (close-up vs wide, detail vs full figure)
+- Camera is on the OTHER SIDE of the subject — we see the front of objects in one frame and the back/reverse in the next, or vice versa. This is called a REVERSE ANGLE and is always a CUT.
+- The SURFACES and OBJECTS visible have flipped — e.g. we see one side of a desk/table/shelf in one frame and the opposite side in the next. The camera must have moved 120-180 degrees.
 - Different subject or different part of a subject (boots vs crown vs face)
 - Different background or environment visible
 
