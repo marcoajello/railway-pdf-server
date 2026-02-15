@@ -867,9 +867,10 @@ Rules:
 - Frames shot from the same camera position get the SAME letter, even if the action progresses.
 - Arrows drawn on frames indicate the camera is MOVING (push in, dolly, pan) — this is still the same position/setup, use the same letter.
 - If the camera is on the OPPOSITE side of the room/subject, that's a different position = different letter.
-- A different shot size from the same direction (e.g. medium to close-up without cutting) is the same position IF connected by arrows/movement. Otherwise it's a new position.
+- IMPORTANT: Dramatic changes in shot size = different camera position. An extreme close-up (e.g. just hands, just a crown, just boots) requires the camera to be MUCH closer than a wide/full body shot. These cannot be the same setup even if the storyboard describes them as a continuous move. Judge by the IMAGES, not the descriptions.
+- A small change in framing from the same direction (e.g. medium to medium-close) is the same position IF connected by arrows/movement.
 
-When in doubt, use the SAME letter. Storyboard art varies between frames — focus on camera placement, not drawing style.
+When in doubt, use the SAME letter — but trust dramatic visual differences in the images over text descriptions.
 
 For each frame, answer with the letter AND a brief reason explaining where the camera is:
 Frame 1: A — camera is behind the desk, looking at the group
@@ -892,12 +893,12 @@ SAME shot means the camera is in the same setup:
 - Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
 
 CUT means the camera moved to a new setup:
-- Different framing (wide shot vs close-up)
-- Different subject
-- Reverse angle (camera on opposite side of the subject — even if same people)
-- Different location
+- Different framing (wide shot vs close-up, or extreme close-up vs medium)
+- Different subject or different part of the subject (e.g. boots vs face vs hands)
+- Reverse angle (camera on opposite side of the subject)
+- Different location or background
 
-When in doubt, lean toward SAME. Focus on whether the CAMERA SETUP changed, not small drawing variations.
+Focus on what you SEE in the images. If the framing, angle, or subject changes significantly, it's a CUT.
 
 ${pairList.join('\n')}
 
