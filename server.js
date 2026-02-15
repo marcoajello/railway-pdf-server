@@ -886,19 +886,15 @@ Frame 3: B — camera moved to close-up position near the subject
   }
   pairContent.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
 
-For each consecutive pair, decide SAME or CUT.
+For each consecutive pair, look ONLY at the two images and decide SAME or CUT. Ignore the text descriptions — judge purely by what the camera sees.
 
-SAME shot means the camera is in the same setup:
-- Same framing, same subject, same angle — action just progresses
-- Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
+SAME = the two frames show essentially the same view. Same shot size, same angle, same subject — only the action or pose changed slightly.
 
-CUT means the camera moved to a new setup:
-- Different framing (wide shot vs close-up, or extreme close-up vs medium)
-- Different subject or different part of the subject (e.g. boots vs face vs hands)
-- Reverse angle (camera on opposite side of the subject)
-- Different location or background
-
-Focus on what you SEE in the images. If the framing, angle, or subject changes significantly, it's a CUT.
+CUT = the view changed. ANY of these = CUT:
+- Shot size changed (close-up vs wide, detail vs full figure)
+- Camera is on the other side of the subject (we see their front vs their back)
+- Different subject or different part of a subject (boots vs crown vs face)
+- Different background or environment visible
 
 ${pairList.join('\n')}
 
