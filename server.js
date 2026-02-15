@@ -896,7 +896,7 @@ function applyPositionLabels(frames, thumbs, text) {
   // Parse "Frame N: X" lines
   const labels = [];
   for (let i = 0; i < thumbs.length; i++) {
-    const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*([A-Z])`, 'i');
+    const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*\\*{0,2}([A-Z])\\*{0,2}`, 'i');
     const match = text.match(pattern);
     labels.push(match ? match[1].toUpperCase() : null);
   }
