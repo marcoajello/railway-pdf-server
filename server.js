@@ -846,7 +846,7 @@ async function analyzeGroupings(frames) {
   }
 
   if (thumbs.length < 2) return frames;
-  console.log(`[Storyboard] Pass 2 (Sonnet HD): ${thumbs.length} frames`);
+  console.log(`[Storyboard] Pass 2 (Sonnet HD — camera position): ${thumbs.length} frames`);
 
   const content = [];
 
@@ -858,30 +858,23 @@ async function analyzeGroupings(frames) {
     content.push(t.img);
   }
 
-  const pairList = [];
-  for (let i = 0; i < thumbs.length - 1; i++) {
-    pairList.push(`${i + 1}→${i + 2}: SAME or CUT?`);
-  }
-
   content.push({ type: 'text', text: `You are analyzing ${thumbs.length} storyboard frames from a TV commercial.
 
-For each consecutive pair, decide SAME or CUT.
+Imagine you are looking at the scene from above — a bird's eye floor plan. For each frame, figure out WHERE the camera is physically standing in the room, and assign it a camera position label (A, B, C, etc.).
 
-SAME shot means the camera is in the same setup:
-- Same framing, same subject, same angle — action just progresses
-- Arrows drawn on frames (any color) indicate camera MOVEMENT (push in, pull out, pan, tilt, dolly, zoom). Arrows = continuous shot, NOT a cut.
+Rules:
+- Frames shot from the same camera position get the SAME letter, even if the action progresses.
+- Arrows drawn on frames indicate the camera is MOVING (push in, dolly, pan) — this is still the same position/setup, use the same letter.
+- If the camera is on the OPPOSITE side of the room/subject, that's a different position = different letter.
+- A different shot size from the same direction (e.g. medium to close-up without cutting) is the same position IF connected by arrows/movement. Otherwise it's a new position.
 
-CUT means the camera moved to a new setup:
-- Different framing (wide shot vs close-up)
-- Different subject
-- The BACKGROUND/OBJECTS visible behind the subject change dramatically — you see a completely different side of the environment. This means the camera moved to the opposite side.
-- Different location
+When in doubt, use the SAME letter. Storyboard art varies between frames — focus on camera placement, not drawing style.
 
-When in doubt, lean toward SAME. Storyboard frames from the same shot often look slightly different due to the artist's drawing — focus on whether the CAMERA SETUP changed, not small drawing variations.
-
-${pairList.join('\n')}
-
-Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
+Answer ONLY with:
+Frame 1: A
+Frame 2: A
+Frame 3: B
+...etc.` });
 
   try {
     const response = await client.messages.create({
@@ -889,11 +882,47 @@ Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
       max_tokens: 2048,
       messages: [{ role: 'user', content }]
     });
-    return applyPass2Decisions(frames, thumbs, response.content[0]?.text || '');
+    return applyPositionLabels(frames, thumbs, response.content[0]?.text || '');
   } catch (err) {
     console.error('[Storyboard] Pass 2 (Sonnet) error:', err.message);
     return frames;
   }
+}
+
+// Parse camera position labels (A, B, C...) and derive shotGroups
+function applyPositionLabels(frames, thumbs, text) {
+  console.log(`[Storyboard] Pass 2 raw:`, text);
+
+  // Parse "Frame N: X" lines
+  const labels = [];
+  for (let i = 0; i < thumbs.length; i++) {
+    const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*([A-Z])`, 'i');
+    const match = text.match(pattern);
+    labels.push(match ? match[1].toUpperCase() : null);
+  }
+
+  console.log(`[Storyboard] Pass 2 labels:`, labels.join(', '));
+
+  // Convert to shotGroups: new group whenever label changes
+  let shotGroup = 0;
+  frames[thumbs[0].frameIdx].shotGroup = shotGroup;
+
+  for (let i = 1; i < thumbs.length; i++) {
+    if (labels[i] && labels[i - 1] && labels[i] !== labels[i - 1]) {
+      shotGroup++;
+    }
+    frames[thumbs[i].frameIdx].shotGroup = shotGroup;
+  }
+
+  console.log(`[Storyboard] Pass 2: ${shotGroup + 1} shots from position labels`);
+
+  // Sanity check: if 0 cuts from 5+ frames, discard
+  if (shotGroup === 0 && thumbs.length >= 5) {
+    console.log(`[Storyboard] Pass 2: 0 cuts from ${thumbs.length} frames — discarding`);
+    frames.forEach(f => { delete f.shotGroup; });
+  }
+
+  return frames;
 }
 
 // Shared: parse SAME/CUT decisions and apply shotGroup to frames
