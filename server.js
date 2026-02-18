@@ -2176,35 +2176,42 @@ Use the ROW NUMBERS from the labels - do NOT number images sequentially yourself
 
 There are exactly ${frames.length} rows to analyze. Your response must have exactly ${frames.length} assignments.
 
-=== ANALYSIS APPROACH ===
+=== HOW TO IDENTIFY CHARACTERS ===
 
-Use TWO sources of evidence to identify characters:
+You have TWO sources of evidence. Use BOTH:
 
-1. VISUAL: Count human figures drawn in the storyboard frame. Match them to reference photos by gender, hair, build, and context.
-2. TEXT: Read the description/dialogue text for each row. Character names mentioned in the text (e.g. "KAREN enters the kitchen") are strong evidence that character is in the frame — especially when the drawing is ambiguous.
+1. VISUAL: Look at the drawn figures. Match them to reference photos by gender, hair, build, and position.
+2. TEXT: Read the description/dialogue text for each row. The text is written by the director and is AUTHORITATIVE about who is in the scene.
+
+=== CRITICAL: TEXT OVERRIDES VISUAL AMBIGUITY ===
+
+If the text description names a character (e.g. "KAREN enters the kitchen", "Rick visible in background"), that character IS in the frame — period. The text was written by the person who drew the board. They know who is in their own drawing.
+
+When the text names a character:
+- Look carefully for ANY figure that could be them, including background figures, partially visible people, silhouettes, or figures entering/exiting frame
+- Count that figure in your bodyCount even if you initially missed it
+- Tag that character
+
+The ONLY reason to skip a text-named character is if the frame is genuinely empty or shows zero human figures at all.
 
 === ANALYSIS STEPS ===
 
 For each ROW (using the row number from the label):
-1. Count human figures DRAWN in the image(s)
-2. Read the text description for character name mentions
-3. Match figures to characters using reference photos + text clues
-4. If the text explicitly names a character (e.g. "RICK walks in") and you can see a figure that could be them, TAG THEM — even if the drawing alone is ambiguous
-5. If the text names a character but there is genuinely NO figure in the frame that could be them, do not tag them
+1. Read the text description FIRST — note which characters are named
+2. Look at the image — find a figure for each named character
+3. Also check for any additional figures not mentioned in text
+4. Match all figures to characters using reference photos + text
 
-The text description is written by the director/storyboard artist and is authoritative about who is in the scene. Trust it as a key signal, not just the drawing.
-
-STRICT RULES:
-- Do NOT tag more characters than human figures visible in the frame
-- DO use text descriptions to help identify which character each figure is
-- If a figure is ambiguous but the text names a specific character, that identification wins
+RULES:
+- Text-named characters should almost always be tagged — look harder for their figure
+- DO use reference photos to distinguish similar characters
 - ${headshotsAvailable > 0 ? 'Use reference photos to distinguish similar characters' : 'Build profiles from establishing shots'}
 
 Respond with JSON:
 {
   "assignments": [
-    {"rowNum": "1", "bodyCount": 1, "characters": ["RICK"], "reasoning": "1 male figure in doorway, text confirms RICK"},
-    {"rowNum": "2", "bodyCount": 2, "characters": ["RICK", "TANYA"], "reasoning": "2 figures - text says RICK and TANYA enter"},
+    {"rowNum": "1", "bodyCount": 1, "characters": ["RICK"], "reasoning": "Text says RICK, 1 male figure in doorway matches"},
+    {"rowNum": "2", "bodyCount": 3, "characters": ["RICK", "TANYA", "KAREN"], "reasoning": "Text names KAREN entering, 2 figures at table + 1 entering background"},
     ...
   ]
 }
@@ -2212,7 +2219,7 @@ Respond with JSON:
 VALIDATION:
 - Use the ROW NUMBERS from the image labels (ROW 1, ROW 2, etc.)
 - You must have exactly ${frames.length} assignments
-- For each row, characters.length MUST NOT exceed bodyCount`
+- Every character named in the text description should be tagged unless there is truly no figure present`
     });
     
     const response = await anthropic.messages.create({
