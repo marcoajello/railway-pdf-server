@@ -2204,8 +2204,9 @@ For each ROW (using the row number from the label):
 
 RULES:
 - Text-named characters should almost always be tagged — look harder for their figure
-- DO use reference photos to distinguish similar characters
 - ${headshotsAvailable > 0 ? 'Use reference photos to distinguish similar characters' : 'Build profiles from establishing shots'}
+- CONTINUITY: Storyboard frames are SEQUENTIAL. A close-up (hands, object detail, tight shot) immediately following wider shots of a character is almost certainly still showing that same character. Tag them. For example: if frames 3-4 show Henry at a cabinet, and frame 5 is a close-up of hands holding a box, those are Henry's hands.
+- Similarly, if a character is established in a scene and subsequent frames show the same location/action from different angles, assume they are still present unless the framing clearly excludes them
 
 Respond with JSON:
 {
