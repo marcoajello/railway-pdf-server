@@ -692,6 +692,102 @@ RULES:
   }
 }
 
+/**
+ * Vision fallback: Ask Claude to identify panel bounding boxes when OpenCV fails.
+ * Returns array of base64 cropped images in reading order.
+ */
+async function detectPanelsWithVision(imageBuffer, expectedCount) {
+  const client = getAnthropicClient();
+  if (!client) return [];
+
+  const resized = await sharp(imageBuffer)
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 85 })
+    .toBuffer();
+
+  const metadata = await sharp(resized).metadata();
+  const imgW = metadata.width;
+  const imgH = metadata.height;
+
+  console.log(`[Storyboard] Vision fallback: asking Claude for panel boxes (expecting ~${expectedCount})`);
+
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 2048,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
+        { type: 'text', text: `This is a storyboard page. Find each DRAWING PANEL (the rectangular areas containing artwork/sketches).
+
+Return the bounding box of each panel as pixel coordinates relative to this ${imgW}x${imgH} image.
+Read panels LEFT-TO-RIGHT, then TOP-TO-BOTTOM (reading order).
+Skip text-only areas, headers, and shot number labels — only return the drawing panels.
+
+Return ONLY JSON:
+{
+  "panels": [
+    {"x": 50, "y": 100, "w": 300, "h": 220},
+    {"x": 380, "y": 100, "w": 300, "h": 220}
+  ]
+}
+
+x,y = top-left corner. w,h = width and height in pixels.` }
+      ]
+    }]
+  });
+
+  const text = response.content[0]?.text || '';
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
+
+  let panels;
+  try {
+    const parsed = JSON.parse(jsonMatch[1].trim());
+    panels = parsed.panels || [];
+  } catch (e) {
+    const objMatch = text.match(/\{[\s\S]*"panels"[\s\S]*\}/);
+    if (objMatch) {
+      try {
+        panels = JSON.parse(objMatch[0]).panels || [];
+      } catch (_) {
+        console.error('[Storyboard] Vision fallback: failed to parse response');
+        return [];
+      }
+    } else {
+      return [];
+    }
+  }
+
+  console.log(`[Storyboard] Vision fallback: Claude found ${panels.length} panels`);
+
+  const images = [];
+  for (const p of panels) {
+    try {
+      const x = Math.max(0, Math.round(p.x));
+      const y = Math.max(0, Math.round(p.y));
+      const w = Math.min(Math.round(p.w), imgW - x);
+      const h = Math.min(Math.round(p.h), imgH - y);
+
+      if (w < 20 || h < 20) {
+        images.push(null);
+        continue;
+      }
+
+      const cropped = await sharp(resized)
+        .extract({ left: x, top: y, width: w, height: h })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+
+      images.push(cropped.toString('base64'));
+    } catch (e) {
+      console.error(`[Storyboard] Vision fallback: crop error for panel:`, e.message);
+      images.push(null);
+    }
+  }
+
+  return images;
+}
+
 function groupIntoShots(frames) {
   const shots = [];
   let currentShot = null;
@@ -1139,12 +1235,33 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           textPromise
         ]);
         
-        // Merge results by page
-        return batch.map(({ pageNum }) => {
+        // Merge results by page, with Vision fallback for tricky boards
+        return Promise.all(batch.map(async ({ path: imgPath, pageNum }) => {
           const detected = rectResults.find(r => r.pageNum === pageNum)?.detected || { count: 0, images: [] };
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
-          return { detected, textData, pageNum };
-        });
+
+          // Vision fallback: if OpenCV found far fewer images than text frames, use Claude Vision
+          let images = detected.images || [];
+          const textFrameCount = textData.frames?.length || 0;
+
+          if (textFrameCount >= 2 && images.length < textFrameCount * 0.5) {
+            console.log(`[Storyboard] Page ${pageNum}: OpenCV found ${images.length} images but text found ${textFrameCount} frames — triggering Vision fallback`);
+            try {
+              const imageBuffer = await fs.readFile(imgPath);
+              const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
+              if (visionImages.length >= textFrameCount * 0.5) {
+                images = visionImages;
+                console.log(`[Storyboard] Page ${pageNum}: Vision fallback returned ${images.length} panels`);
+              } else {
+                console.log(`[Storyboard] Page ${pageNum}: Vision fallback only found ${visionImages.length} — keeping OpenCV results`);
+              }
+            } catch (e) {
+              console.error(`[Storyboard] Page ${pageNum}: Vision fallback error:`, e.message);
+            }
+          }
+
+          return { detected: { ...detected, images }, textData, pageNum };
+        }));
       }));
       
       allPageResults.push(...batchResults.flat());
