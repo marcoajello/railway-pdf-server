@@ -1207,8 +1207,8 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
     console.log(`[Storyboard] ${pageImages.length} page(s) - starting processing`);
     
-    // BATCH APPROACH: Process up to 4 pages per API call for efficiency
-    const BATCH_SIZE = 4;
+    // Process 1 page per API call — batching dilutes attention on dense storyboards
+    const BATCH_SIZE = 1;
     const batches = [];
     for (let i = 0; i < pageImages.length; i += BATCH_SIZE) {
       batches.push(pageImages.slice(i, i + BATCH_SIZE).map((p, j) => ({ path: p, pageNum: i + j + 1 })));
@@ -1365,8 +1365,8 @@ async function extractTextBatched(pages) {
   const imageContents = await Promise.all(pages.map(async ({ path: imagePath, pageNum }) => {
     const imageBuffer = await fs.readFile(imagePath);
     const resized = await sharp(imageBuffer)
-      .resize(1200, 1200, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: 80 })
+      .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 85 })
       .toBuffer();
     
     return {
