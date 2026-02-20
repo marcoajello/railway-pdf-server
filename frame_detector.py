@@ -2,8 +2,8 @@
 """
 Rectangle detector for storyboard frames.
 Three-path detection:
-  1. Bordered — thin grid lines detected → extract panels from grid
-  2. Borderless — uniform background detected → find content regions
+  1. Bordered — thin dark grid lines → extract panels from grid
+  2. Borderless — detect background-colored gaps → infer panels
   3. Unknown — neither works → signal Vision fallback
 """
 import cv2
@@ -18,40 +18,29 @@ import base64
 def detect_borders(gray, img_width, img_height):
     """
     Determine whether this page has bordered panels.
-    Returns (is_bordered, h_lines_mask, v_lines_mask).
-    Guards against solid dark backgrounds by checking line thickness.
+    Guards against solid dark backgrounds by checking line coverage.
     """
     _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
-    # Horizontal lines
     h_kernel_len = max(img_width // 8, 80)
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel_len, 1))
     h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
 
-    # Vertical lines
     v_kernel_len = max(img_height // 8, 80)
     v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_kernel_len))
     v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
 
-    # Guard: if line masks cover too much area, it's a solid background, not borders
     total_pixels = img_width * img_height
     line_coverage = (np.count_nonzero(h_lines) + np.count_nonzero(v_lines)) / total_pixels
     if line_coverage > 0.15:
         return False, h_lines, v_lines
 
-    # Count distinct horizontal lines by projecting onto Y axis
     h_proj = np.sum(h_lines, axis=1) > 0
-    h_runs = np.diff(h_proj.astype(int))
-    h_line_count = np.sum(h_runs == 1)
-
-    # Count distinct vertical lines by projecting onto X axis
+    h_line_count = np.sum(np.diff(h_proj.astype(int)) == 1)
     v_proj = np.sum(v_lines, axis=0) > 0
-    v_runs = np.diff(v_proj.astype(int))
-    v_line_count = np.sum(v_runs == 1)
+    v_line_count = np.sum(np.diff(v_proj.astype(int)) == 1)
 
-    # Need at least 2 horizontal AND 2 vertical lines to form panel borders
     is_bordered = h_line_count >= 2 and v_line_count >= 2
-
     return is_bordered, h_lines, v_lines
 
 
@@ -60,7 +49,6 @@ def detect_borders(gray, img_width, img_height):
 def extract_bordered_panels(gray, h_lines, v_lines, img_width, img_height):
     """Extract panel rectangles from detected grid lines."""
     grid = cv2.add(h_lines, v_lines)
-
     dilate_kernel = np.ones((3, 3), np.uint8)
     grid = cv2.dilate(grid, dilate_kernel, iterations=2)
 
@@ -74,104 +62,246 @@ def extract_bordered_panels(gray, h_lines, v_lines, img_width, img_height):
         area = cv2.contourArea(contour)
         if area < min_area or area > max_area:
             continue
-
         x, y, w, h = cv2.boundingRect(contour)
-
-        aspect = w / h if h > 0 else 0
-        if aspect < 0.5 or aspect > 4.0:
+        if (w / h if h > 0 else 0) < 0.5 or (w / h if h > 0 else 0) > 4.0:
             continue
-
         if w < 60 or h < 40:
             continue
-
-        bbox_area = w * h
-        fill_ratio = area / bbox_area if bbox_area > 0 else 0
-        if fill_ratio < 0.3:
+        if (area / (w * h) if w * h > 0 else 0) < 0.3:
             continue
-
         rectangles.append({'x': int(x), 'y': int(y), 'width': int(w), 'height': int(h)})
 
     return rectangles
 
 
-# ─── Phase 2b: Borderless Content Region Detection ─────────────────────────
+# ─── Phase 2b: Borderless Gap-Based Detection ──────────────────────────────
 
 def detect_background_color(gray, img_width, img_height):
-    """
-    Detect the dominant background color by sampling page edges and corners.
-    Returns the median grayscale value of the background.
-    """
-    samples = []
+    """Detect dominant background color by sampling page edges."""
     margin = max(10, min(img_width, img_height) // 20)
+    samples = np.concatenate([
+        gray[0:margin, :].flatten(),
+        gray[img_height - margin:, :].flatten(),
+        gray[:, 0:margin].flatten(),
+        gray[:, img_width - margin:].flatten()
+    ])
+    return int(np.median(samples))
 
-    # Sample strips along all four edges
-    samples.append(gray[0:margin, :].flatten())                 # top
-    samples.append(gray[img_height - margin:, :].flatten())     # bottom
-    samples.append(gray[:, 0:margin].flatten())                 # left
-    samples.append(gray[:, img_width - margin:].flatten())      # right
 
-    all_samples = np.concatenate(samples)
-    bg_value = int(np.median(all_samples))
+def find_gap_runs(profile, threshold=0.7, min_width=8):
+    """
+    Find runs of background in a 1D profile.
+    Returns list of (start, end) tuples.
+    """
+    is_bg = profile > threshold
+    gaps = []
+    in_gap = False
+    gap_start = 0
 
-    return bg_value
+    for i in range(len(is_bg)):
+        if is_bg[i] and not in_gap:
+            gap_start = i
+            in_gap = True
+        elif not is_bg[i] and in_gap:
+            if i - gap_start >= min_width:
+                gaps.append((gap_start, i))
+            in_gap = False
+    if in_gap and len(is_bg) - gap_start >= min_width:
+        gaps.append((gap_start, len(is_bg)))
+
+    return gaps
+
+
+def cluster_gap_positions(all_gap_midpoints, tolerance):
+    """
+    Cluster gap midpoints from multiple rows.
+    Returns list of (position, count) sorted by position.
+    """
+    if not all_gap_midpoints:
+        return []
+
+    sorted_pts = sorted(all_gap_midpoints)
+    clusters = []
+    cluster = [sorted_pts[0]]
+
+    for pt in sorted_pts[1:]:
+        if pt - cluster[-1] <= tolerance:
+            cluster.append(pt)
+        else:
+            clusters.append(cluster)
+            cluster = [pt]
+    clusters.append(cluster)
+
+    return [(int(np.median(c)), len(c)) for c in clusters]
 
 
 def extract_borderless_panels(gray, img_width, img_height):
     """
-    Find content regions (photos/drawings) on a uniform background.
-    Works for white, black, or solid-color backgrounds.
+    Find panels by detecting background-colored gaps.
+    1. Find row gaps (horizontal strips of background)
+    2. Per-row: find column gaps
+    3. For rows with missing gaps: use hints from other rows,
+       look harder near those positions with relaxed threshold
     """
     bg_value = detect_background_color(gray, img_width, img_height)
+    tolerance = 35
 
-    # Threshold: find pixels that differ significantly from background
-    diff_threshold = 30
+    bg_mask = np.abs(gray.astype(int) - bg_value) < tolerance
 
-    if bg_value > 128:
-        # Light background — content is darker
-        _, content_mask = cv2.threshold(gray, bg_value - diff_threshold, 255, cv2.THRESH_BINARY_INV)
-    else:
-        # Dark background — content is lighter
-        _, content_mask = cv2.threshold(gray, bg_value + diff_threshold, 255, cv2.THRESH_BINARY)
+    h_profile = np.mean(bg_mask, axis=1)
+    min_h_gap = max(8, img_height // 80)
+    min_content_h = img_height // 15
+    min_v_gap = max(6, img_width // 100)
+    min_content_w = img_width // 15
 
-    # Close small gaps within individual panels (fill holes in photos)
-    close_kernel = np.ones((5, 5), np.uint8)
-    content_mask = cv2.morphologyEx(content_mask, cv2.MORPH_CLOSE, close_kernel, iterations=3)
+    # Step 1: Find row gaps
+    h_gaps = find_gap_runs(h_profile, threshold=0.7, min_width=min_h_gap)
+    if len(h_gaps) < 2:
+        return [], bg_value
 
-    # Gentle dilate to solidify panel regions without merging neighbors
-    dilate_kernel = np.ones((5, 5), np.uint8)
-    content_mask = cv2.dilate(content_mask, dilate_kernel, iterations=2)
+    rows = []
+    for i in range(len(h_gaps) - 1):
+        row_top = h_gaps[i][1]
+        row_bottom = h_gaps[i + 1][0]
+        if row_bottom - row_top >= min_content_h:
+            rows.append((row_top, row_bottom))
 
-    # Erode to separate text captions from images
-    # Text is thin so it gets eroded away; photos are large and survive
-    erode_kernel = np.ones((8, 8), np.uint8)
-    content_mask = cv2.erode(content_mask, erode_kernel, iterations=2)
+    if not rows:
+        return [], bg_value
 
-    # Restore panel edges slightly after erosion
-    restore_kernel = np.ones((4, 4), np.uint8)
-    content_mask = cv2.dilate(content_mask, restore_kernel, iterations=1)
+    # Step 2: Per-row column gap detection
+    row_gaps = {}       # row_index -> list of (start, end) gap tuples
+    row_panels = {}     # row_index -> list of panel rects
 
-    # Find contours
-    contours, _ = cv2.findContours(content_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for idx, (row_top, row_bottom) in enumerate(rows):
+        row_slice = bg_mask[row_top:row_bottom, :]
+        v_profile = np.mean(row_slice, axis=0)
+        v_gaps = find_gap_runs(v_profile, threshold=0.7, min_width=min_v_gap)
+        row_gaps[idx] = v_gaps
 
+        # Extract panels from this row's gaps
+        panels = []
+        if len(v_gaps) >= 2:
+            for j in range(len(v_gaps) - 1):
+                col_left = v_gaps[j][1]
+                col_right = v_gaps[j + 1][0]
+                if col_right - col_left >= min_content_w:
+                    panels.append({
+                        'x': int(col_left), 'y': int(row_top),
+                        'width': int(col_right - col_left),
+                        'height': int(row_bottom - row_top)
+                    })
+        row_panels[idx] = panels
+
+    # Step 3: Find the best row (most panels found)
+    best_row_idx = max(row_panels, key=lambda k: len(row_panels[k]))
+    best_count = len(row_panels[best_row_idx])
+
+    if best_count == 0:
+        return [], bg_value
+
+    # Collect gap midpoints from all rows that found panels
+    all_gap_mids = []
+    for idx, gaps in row_gaps.items():
+        if len(row_panels[idx]) >= 1:
+            for g_start, g_end in gaps:
+                mid = (g_start + g_end) // 2
+                # Skip edge gaps (page margins)
+                if mid > img_width * 0.03 and mid < img_width * 0.97:
+                    all_gap_mids.append(mid)
+
+    # Cluster them to find prevailing column boundary positions
+    gap_clusters = cluster_gap_positions(all_gap_mids, tolerance=img_width // 20)
+
+    # Step 4: For rows with fewer panels than the best row,
+    # re-examine with relaxed threshold near hint positions
+    for idx, (row_top, row_bottom) in enumerate(rows):
+        if len(row_panels[idx]) >= best_count:
+            continue  # this row is fine
+
+        # Get the actual pixel data for this row (not just bg_mask)
+        row_gray = gray[row_top:row_bottom, :]
+
+        # Try progressively relaxed detection
+        found_better = False
+        for relax_threshold in [0.5, 0.35, 0.2]:
+            # Build a profile using variance — columns with uniform color
+            # (any color, not just bg) are more likely to be gaps
+            row_var = np.var(row_gray.astype(float), axis=0)
+            max_var = np.max(row_var) if np.max(row_var) > 0 else 1
+            # Low variance = uniform color = likely gap
+            uniformity = 1.0 - (row_var / max_var)
+
+            # Also check bg similarity with relaxed tolerance
+            wider_bg = np.abs(row_gray.astype(int) - bg_value) < (tolerance * 2)
+            bg_profile = np.mean(wider_bg, axis=0)
+
+            # Combine: a gap should be either uniform color OR background-like
+            combined = np.maximum(uniformity, bg_profile)
+
+            v_gaps_relaxed = find_gap_runs(combined, threshold=relax_threshold, min_width=min_v_gap)
+
+            # Only accept if we find gaps near the hint positions
+            if len(v_gaps_relaxed) < 2:
+                continue
+
+            panels = []
+            for j in range(len(v_gaps_relaxed) - 1):
+                col_left = v_gaps_relaxed[j][1]
+                col_right = v_gaps_relaxed[j + 1][0]
+                if col_right - col_left >= min_content_w:
+                    panels.append({
+                        'x': int(col_left), 'y': int(row_top),
+                        'width': int(col_right - col_left),
+                        'height': int(row_bottom - row_top)
+                    })
+
+            if len(panels) > len(row_panels[idx]):
+                row_panels[idx] = panels
+                found_better = True
+                break
+
+        # Last resort: use hint positions directly if they align with
+        # ANY detectable transition in the row
+        if not found_better and len(row_panels[idx]) < 2 and len(gap_clusters) >= 2:
+            hint_gaps = []
+            for hint_pos, count in gap_clusters:
+                if count < 2:
+                    continue  # only use well-supported hints
+                # Look for ANY column near hint that has above-average uniformity
+                search_range = img_width // 25
+                left = max(0, hint_pos - search_range)
+                right = min(img_width, hint_pos + search_range)
+
+                row_var = np.var(row_gray.astype(float), axis=0)
+                region_var = row_var[left:right]
+                if len(region_var) == 0:
+                    continue
+
+                # Find the most uniform column in the search region
+                min_var_offset = np.argmin(region_var)
+                best_col = left + int(min_var_offset)
+                hint_gaps.append(best_col)
+
+            if len(hint_gaps) >= 2:
+                hint_gaps.sort()
+                panels = []
+                for j in range(len(hint_gaps) - 1):
+                    col_left = hint_gaps[j]
+                    col_right = hint_gaps[j + 1]
+                    if col_right - col_left >= min_content_w:
+                        panels.append({
+                            'x': int(col_left), 'y': int(row_top),
+                            'width': int(col_right - col_left),
+                            'height': int(row_bottom - row_top)
+                        })
+                if len(panels) > len(row_panels[idx]):
+                    row_panels[idx] = panels
+
+    # Collect all panels
     rectangles = []
-    min_area = (img_width * img_height) * 0.005  # Lower threshold for borderless
-    max_area = (img_width * img_height) * 0.5
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < min_area or area > max_area:
-            continue
-
-        x, y, w, h = cv2.boundingRect(contour)
-
-        aspect = w / h if h > 0 else 0
-        if aspect < 0.3 or aspect > 5.0:
-            continue
-
-        if w < 50 or h < 30:
-            continue
-
-        rectangles.append({'x': int(x), 'y': int(y), 'width': int(w), 'height': int(h)})
+    for idx in sorted(row_panels.keys()):
+        rectangles.extend(row_panels[idx])
 
     return rectangles, bg_value
 
@@ -182,20 +312,16 @@ def deduplicate_rectangles(rectangles):
     """Remove overlapping rectangles, keeping the largest one."""
     if not rectangles:
         return []
-
     rectangles.sort(key=lambda r: r['width'] * r['height'], reverse=True)
-
     kept = []
     for rect in rectangles:
         dominated = False
         for kept_rect in kept:
-            overlap = compute_overlap(rect, kept_rect)
-            if overlap > 0.5:
+            if compute_overlap(rect, kept_rect) > 0.5:
                 dominated = True
                 break
         if not dominated:
             kept.append(rect)
-
     return kept
 
 
@@ -205,15 +331,10 @@ def compute_overlap(r1, r2):
     y1 = max(r1['y'], r2['y'])
     x2 = min(r1['x'] + r1['width'], r2['x'] + r2['width'])
     y2 = min(r1['y'] + r1['height'], r2['y'] + r2['height'])
-
     if x2 <= x1 or y2 <= y1:
         return 0.0
-
     intersection = (x2 - x1) * (y2 - y1)
-    area1 = r1['width'] * r1['height']
-    area2 = r2['width'] * r2['height']
-
-    return intersection / min(area1, area2)
+    return intersection / min(r1['width'] * r1['height'], r2['width'] * r2['height'])
 
 
 def crop_rectangles(image_path, rectangles):
@@ -221,21 +342,16 @@ def crop_rectangles(image_path, rectangles):
     img = cv2.imread(image_path)
     if img is None:
         return []
-
     images = []
     for rect in rectangles:
         x, y, w, h = rect['x'], rect['y'], rect['width'], rect['height']
-
         inset = 3
         cropped = img[y + inset:y + h - inset, x + inset:x + w - inset]
-
         if cropped.size == 0:
             images.append(None)
             continue
-
         _, buffer = cv2.imencode('.jpg', cropped, [cv2.IMWRITE_JPEG_QUALITY, 85])
         images.append(base64.b64encode(buffer).decode('utf-8'))
-
     return images
 
 
@@ -243,10 +359,10 @@ def crop_rectangles(image_path, rectangles):
 
 def detect_rectangles(image_path):
     """
-    Main entry point. Three-path detection:
-      1. bordered: true  → OpenCV grid extraction
-      2. bordered: false, mode: content → deterministic content region detection
-      3. bordered: false, mode: vision  → signal caller to use Vision API
+    Three-path detection:
+      mode: grid    → bordered panels found via grid lines
+      mode: content → borderless panels found via gap detection
+      mode: vision  → neither worked, caller should use Vision API
     """
     img = cv2.imread(image_path)
     if img is None:
@@ -256,7 +372,7 @@ def detect_rectangles(image_path):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Phase 1: Border gate
-    is_bordered, h_lines, v_lines = detect_borders(gray, width, height)[:3]
+    is_bordered, h_lines, v_lines = detect_borders(gray, width, height)
 
     if is_bordered:
         rectangles = extract_bordered_panels(gray, h_lines, v_lines, width, height)
@@ -265,17 +381,15 @@ def detect_rectangles(image_path):
         rectangles.sort(key=lambda r: (r['y'] // row_threshold, r['x']))
         return rectangles, True, 'grid'
 
-    # Phase 2: Borderless — try content region detection
+    # Phase 2: Borderless — gap-based detection
     content_rects, bg_value = extract_borderless_panels(gray, width, height)
-    content_rects = deduplicate_rectangles(content_rects)
 
     if len(content_rects) >= 2:
-        # Found enough content regions — use them
         row_threshold = max(150, height // 10)
         content_rects.sort(key=lambda r: (r['y'] // row_threshold, r['x']))
         return content_rects, False, 'content'
 
-    # Phase 3: Neither approach worked — signal Vision fallback
+    # Phase 3: Neither worked
     return [], False, 'vision'
 
 
@@ -295,10 +409,8 @@ if __name__ == '__main__':
             'mode': mode,
             'rectangles': rects
         }
-
         if do_crop:
             result['images'] = crop_rectangles(image_path, rects)
-
         print(json.dumps(result))
     except Exception as e:
         print(json.dumps({'error': str(e)}))
