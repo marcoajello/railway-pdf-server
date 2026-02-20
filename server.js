@@ -1215,7 +1215,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     }
     
     // Process batches with controlled concurrency (2 concurrent batches max)
-    const CONCURRENCY = 2;
+    const CONCURRENCY = 4;
     const allPageResults = [];
     
     for (let i = 0; i < batches.length; i += CONCURRENCY) {
