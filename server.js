@@ -471,7 +471,7 @@ async function detectRectangles(imagePath) {
         }
         try {
           const result = JSON.parse(stdout);
-          console.log(`[Storyboard] Found ${result.count} rectangles (bordered: ${result.bordered || false})`);
+          console.log(`[Storyboard] Found ${result.count} rectangles (mode: ${result.mode || 'unknown'})`);
           resolve(result);
         } catch (e) {
           console.error('[Storyboard] JSON parse error');
@@ -1256,17 +1256,37 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         
         // Merge results by page, with Vision fallback for tricky boards
         return Promise.all(batch.map(async ({ path: imgPath, pageNum }) => {
-          const detected = rectResults.find(r => r.pageNum === pageNum)?.detected || { count: 0, bordered: false, images: [] };
+          const detected = rectResults.find(r => r.pageNum === pageNum)?.detected || { count: 0, bordered: false, mode: 'vision', images: [] };
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
 
           let images = detected.images || [];
           const textFrameCount = textData.frames?.length || 0;
-          const isBordered = detected.bordered === true;
+          const mode = detected.mode || 'vision';
 
-          // Decision gate: bordered vs borderless
-          if (!isBordered) {
-            // Borderless page — OpenCV can't help, go straight to Vision
-            console.log(`[Storyboard] Page ${pageNum}: No panel borders detected — using Vision extraction`);
+          if (mode === 'grid') {
+            // Path 1: Bordered — OpenCV found grid lines
+            if (textFrameCount >= 2 && images.length < textFrameCount * 0.5) {
+              // Grid detected but OpenCV missed too many panels — Vision fallback
+              console.log(`[Storyboard] Page ${pageNum}: Grid mode but found ${images.length}/${textFrameCount} — Vision fallback`);
+              try {
+                const imageBuffer = await fs.readFile(imgPath);
+                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
+                if (visionImages.length >= textFrameCount * 0.5) {
+                  images = visionImages;
+                  console.log(`[Storyboard] Page ${pageNum}: Vision returned ${images.length} panels`);
+                }
+              } catch (e) {
+                console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
+              }
+            } else {
+              console.log(`[Storyboard] Page ${pageNum}: Grid mode — ${images.length} panels`);
+            }
+          } else if (mode === 'content') {
+            // Path 2: Borderless with uniform background — content regions found deterministically
+            console.log(`[Storyboard] Page ${pageNum}: Content mode — ${images.length} panels (no API needed)`);
+          } else {
+            // Path 3: Unknown layout — Vision fallback
+            console.log(`[Storyboard] Page ${pageNum}: Vision mode — sending to Claude Vision`);
             images = [];
             if (textFrameCount >= 1) {
               try {
@@ -1280,23 +1300,6 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
                 console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
               }
             }
-          } else if (textFrameCount >= 2 && images.length < textFrameCount * 0.5) {
-            // Bordered but OpenCV missed too many — Vision fallback
-            console.log(`[Storyboard] Page ${pageNum}: Bordered but OpenCV found ${images.length}/${textFrameCount} — Vision fallback`);
-            try {
-              const imageBuffer = await fs.readFile(imgPath);
-              const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
-              if (visionImages.length >= textFrameCount * 0.5) {
-                images = visionImages;
-                console.log(`[Storyboard] Page ${pageNum}: Vision fallback returned ${images.length} panels`);
-              } else {
-                console.log(`[Storyboard] Page ${pageNum}: Vision fallback only found ${visionImages.length} — keeping OpenCV results`);
-              }
-            } catch (e) {
-              console.error(`[Storyboard] Page ${pageNum}: Vision fallback error:`, e.message);
-            }
-          } else {
-            console.log(`[Storyboard] Page ${pageNum}: Bordered — OpenCV found ${images.length} panels`);
           }
 
           return { detected: { ...detected, images }, textData, pageNum };
