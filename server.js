@@ -712,10 +712,11 @@ RULES:
 }
 
 /**
- * Vision panel detection using binary mask.
- * 1. Threshold the page into a high-contrast mask (white bg, black panels)
- * 2. Send the mask to Claude Vision — no tonal ambiguity, just rectangles
- * 3. Crop from the original full-resolution image
+ * Vision panel detection using dual-image approach.
+ * Sends both a binary mask AND the original image to Claude Vision.
+ * - Photo boards: mask shows clear black rectangles on white (no tonal confusion)
+ * - Hand-drawn boards: original shows clear border lines (mask would blur borders with content)
+ * Vision uses whichever image gives clearer panel boundaries.
  */
 async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const client = getAnthropicClient();
@@ -726,9 +727,10 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const origW = originalMeta.width;
   const origH = originalMeta.height;
 
-  // Step 1: Generate binary mask — threshold at 240 so panels become black, background stays white
+  // Resize original for Vision
   const resized = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 85 })
     .toBuffer();
 
   const resizedMeta = await sharp(resized).metadata();
@@ -738,28 +740,36 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
 
-  // Threshold: convert to grayscale, then binary (pixel > 240 = white, else black)
-  const mask = await sharp(resized)
+  // Generate binary mask (threshold at 240: anything darker than near-white becomes black)
+  const mask = await sharp(imageBuffer)
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .grayscale()
     .threshold(240)
     .jpeg({ quality: 90 })
     .toBuffer();
 
-  console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} binary mask (expecting ~${expectedCount} panels)`);
+  console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} original + mask (expecting ~${expectedCount} panels)`);
 
-  // Step 2: Send mask to Vision
+  // Send both images to Vision
   const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 2048,
     messages: [{
       role: 'user',
       content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: mask.toString('base64') } },
-        { type: 'text', text: `This is a high-contrast mask of a storyboard page (${imgW}x${imgH} pixels). Each BLACK rectangle is a drawing panel. WHITE areas are gaps/background. Text captions appear below some panels.
+        { type: 'text', text: `Above are two versions of the same storyboard page (${imgW}x${imgH} pixels):
+1. The ORIGINAL storyboard page
+2. A HIGH-CONTRAST MASK where dark content appears black and background is white
+
+Use BOTH images to identify the drawing panels. The original shows the actual content and any border lines. The mask helps distinguish panels from background on photo-heavy boards.
 
 There are approximately ${expectedCount} panels arranged in rows.
 
-Find each BLACK RECTANGLE panel and return its bounding box. Each panel is a SEPARATE rectangle — do NOT merge adjacent panels even if they appear close together.
+Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
+
+Skip headers, titles, text captions, and frame number labels — only return the drawing panels themselves.
 
 Return ONLY JSON:
 {
@@ -769,7 +779,7 @@ Return ONLY JSON:
   ]
 }
 
-x,y = top-left corner of each black rectangle. w,h = width and height in pixels.
+x,y = top-left corner. w,h = width and height in pixels.
 Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
       ]
     }]
@@ -788,7 +798,7 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
       try {
         panels = JSON.parse(objMatch[0]).panels || [];
       } catch (_) {
-        console.error('[Storyboard] Vision: failed to parse mask response');
+        console.error('[Storyboard] Vision: failed to parse response');
         return [];
       }
     } else {
@@ -796,9 +806,9 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
     }
   }
 
-  console.log(`[Storyboard] Vision: found ${panels.length} panels on mask`);
+  console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
 
-  // Step 3: Crop from original resolution image
+  // Crop from original resolution image
   const images = [];
   for (const p of panels) {
     try {
