@@ -77,6 +77,25 @@ function getAnthropicClient() {
   return anthropic;
 }
 
+/**
+ * Retry wrapper for Anthropic API calls with exponential backoff.
+ * Retries on 529 (overloaded) and 500+ errors.
+ */
+async function apiCallWithRetry(fn, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const status = err?.status || 0;
+      const retryable = status === 529 || status >= 500;
+      if (!retryable || attempt === maxRetries) throw err;
+      const delay = 1000 * Math.pow(2, attempt) + Math.random() * 500;
+      console.log(`[API Retry] ${status} error, attempt ${attempt + 1}/${maxRetries}, waiting ${Math.round(delay)}ms`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
 app.use(cors());
 app.use(express.json({ limit: '150mb' }));
 
@@ -711,7 +730,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
 
   console.log(`[Storyboard] Vision fallback: asking Claude for panel boxes (expecting ~${expectedCount})`);
 
-  const response = await client.messages.create({
+  const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 2048,
     messages: [{
@@ -735,7 +754,7 @@ Return ONLY JSON:
 x,y = top-left corner. w,h = width and height in pixels.` }
       ]
     }]
-  });
+  }));
 
   const text = response.content[0]?.text || '';
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
@@ -906,11 +925,11 @@ ${pairList.join('\n')}
 Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
 
   try {
-    const response = await client.messages.create({
+    const response = await apiCallWithRetry(() => client.messages.create({
       model: 'claude-sonnet-4-5-20250929',
       max_tokens: 2048,
       messages: [{ role: 'user', content }]
-    });
+    }));
     return applyPass2Decisions(frames, thumbs, response.content[0]?.text || '');
   } catch (err) {
     console.error('[Storyboard] Pass 2 (Sonnet) error:', err.message);
@@ -1021,21 +1040,21 @@ Frame 3: B — same boots, slightly wider
   // Run all three passes in PARALLEL
   try {
     const [positionRes, pairRes, subjectRes] = await Promise.all([
-      client.messages.create({
+      apiCallWithRetry(() => client.messages.create({
         model: 'claude-sonnet-4-5-20250929',
         max_tokens: 2048,
         messages: [{ role: 'user', content: positionContent }]
-      }),
-      client.messages.create({
+      })),
+      apiCallWithRetry(() => client.messages.create({
         model: 'claude-sonnet-4-5-20250929',
         max_tokens: 2048,
         messages: [{ role: 'user', content: pairContent }]
-      }),
-      client.messages.create({
+      })),
+      apiCallWithRetry(() => client.messages.create({
         model: 'claude-sonnet-4-5-20250929',
         max_tokens: 2048,
         messages: [{ role: 'user', content: subjectContent }]
-      })
+      }))
     ]);
 
     const positionText = positionRes.content[0]?.text || '';
@@ -1215,7 +1234,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     }
     
     // Process batches with controlled concurrency (2 concurrent batches max)
-    const CONCURRENCY = 4;
+    const CONCURRENCY = 2;
     const allPageResults = [];
     
     for (let i = 0; i < batches.length; i += CONCURRENCY) {
@@ -1423,11 +1442,11 @@ RULES:
   
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
-  const response = await client.messages.create({
+  const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 8192,
     messages: [{ role: 'user', content }]
-  });
+  }));
   
   const text = response.content[0].text;
   const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || text.match(/\[[\s\S]*\]/);
