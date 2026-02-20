@@ -18,30 +18,46 @@ import base64
 def detect_borders(gray, img_width, img_height):
     """
     Determine whether this page has bordered panels.
-    Guards against solid dark backgrounds by checking line coverage.
+    Tries multiple thresholds to catch colored borders (blue, purple, etc.)
+    that would be missed by a single high threshold.
+    Returns the result from whichever threshold found the most grid lines.
     """
-    _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    best = None
+    best_line_count = 0
 
-    h_kernel_len = max(img_width // 8, 80)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel_len, 1))
-    h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
+    for thresh in [180, 140, 100]:
+        _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY_INV)
 
-    v_kernel_len = max(img_height // 8, 80)
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_kernel_len))
-    v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
+        h_kernel_len = max(img_width // 8, 80)
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel_len, 1))
+        h_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, h_kernel)
 
-    total_pixels = img_width * img_height
-    line_coverage = (np.count_nonzero(h_lines) + np.count_nonzero(v_lines)) / total_pixels
-    if line_coverage > 0.15:
-        return False, h_lines, v_lines
+        v_kernel_len = max(img_height // 8, 80)
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, v_kernel_len))
+        v_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, v_kernel)
 
-    h_proj = np.sum(h_lines, axis=1) > 0
-    h_line_count = np.sum(np.diff(h_proj.astype(int)) == 1)
-    v_proj = np.sum(v_lines, axis=0) > 0
-    v_line_count = np.sum(np.diff(v_proj.astype(int)) == 1)
+        # Guard: solid dark backgrounds produce massive "line" areas
+        total_pixels = img_width * img_height
+        line_coverage = (np.count_nonzero(h_lines) + np.count_nonzero(v_lines)) / total_pixels
+        if line_coverage > 0.15:
+            continue
 
-    is_bordered = h_line_count >= 2 and v_line_count >= 2
-    return is_bordered, h_lines, v_lines
+        h_proj = np.sum(h_lines, axis=1) > 0
+        h_line_count = np.sum(np.diff(h_proj.astype(int)) == 1)
+        v_proj = np.sum(v_lines, axis=0) > 0
+        v_line_count = np.sum(np.diff(v_proj.astype(int)) == 1)
+
+        total_lines = h_line_count + v_line_count
+        if total_lines > best_line_count:
+            best_line_count = total_lines
+            best = (h_line_count >= 2 and v_line_count >= 2, h_lines, v_lines)
+
+    if best is None:
+        # All thresholds hit the coverage guard — not bordered
+        empty = np.zeros((img_height, img_width), dtype=np.uint8)
+        return False, empty, empty
+
+    return best
 
 
 # ─── Phase 2a: Bordered Panel Extraction ───────────────────────────────────
