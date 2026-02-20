@@ -58,7 +58,7 @@ def detect_rectangles(image_path):
 
 def find_rectangles_in_mask(mask, img_width, img_height):
     """Find valid rectangles in a binary mask."""
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     rectangles = []
     min_area = (img_width * img_height) * 0.01   # At least 1% of image
