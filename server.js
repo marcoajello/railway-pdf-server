@@ -1283,7 +1283,22 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
             }
           } else if (mode === 'content') {
             // Path 2: Borderless with uniform background — content regions found deterministically
-            console.log(`[Storyboard] Page ${pageNum}: Content mode — ${images.length} panels (no API needed)`);
+            if (textFrameCount >= 2 && images.length < textFrameCount * 0.5) {
+              // Content detection merged too many panels together — Vision fallback
+              console.log(`[Storyboard] Page ${pageNum}: Content mode found ${images.length}/${textFrameCount} — Vision fallback`);
+              try {
+                const imageBuffer = await fs.readFile(imgPath);
+                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
+                if (visionImages.length >= textFrameCount * 0.5) {
+                  images = visionImages;
+                  console.log(`[Storyboard] Page ${pageNum}: Vision returned ${images.length} panels`);
+                }
+              } catch (e) {
+                console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
+              }
+            } else {
+              console.log(`[Storyboard] Page ${pageNum}: Content mode — ${images.length} panels (no API needed)`);
+            }
           } else {
             // Path 3: Unknown layout — Vision fallback
             console.log(`[Storyboard] Page ${pageNum}: Vision mode — sending to Claude Vision`);

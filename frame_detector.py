@@ -133,18 +133,22 @@ def extract_borderless_panels(gray, img_width, img_height):
         # Dark background — content is lighter
         _, content_mask = cv2.threshold(gray, bg_value + diff_threshold, 255, cv2.THRESH_BINARY)
 
-    # Dilate to merge nearby content pixels into solid blobs
-    dilate_kernel = np.ones((15, 15), np.uint8)
-    content_mask = cv2.dilate(content_mask, dilate_kernel, iterations=3)
+    # Close small gaps within individual panels (fill holes in photos)
+    close_kernel = np.ones((5, 5), np.uint8)
+    content_mask = cv2.morphologyEx(content_mask, cv2.MORPH_CLOSE, close_kernel, iterations=3)
+
+    # Gentle dilate to solidify panel regions without merging neighbors
+    dilate_kernel = np.ones((5, 5), np.uint8)
+    content_mask = cv2.dilate(content_mask, dilate_kernel, iterations=2)
 
     # Erode to separate text captions from images
     # Text is thin so it gets eroded away; photos are large and survive
-    erode_kernel = np.ones((10, 10), np.uint8)
+    erode_kernel = np.ones((8, 8), np.uint8)
     content_mask = cv2.erode(content_mask, erode_kernel, iterations=2)
 
-    # One more dilate to restore panel boundaries after erosion
-    restore_kernel = np.ones((8, 8), np.uint8)
-    content_mask = cv2.dilate(content_mask, restore_kernel, iterations=2)
+    # Restore panel edges slightly after erosion
+    restore_kernel = np.ones((4, 4), np.uint8)
+    content_mask = cv2.dilate(content_mask, restore_kernel, iterations=1)
 
     # Find contours
     contours, _ = cv2.findContours(content_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
