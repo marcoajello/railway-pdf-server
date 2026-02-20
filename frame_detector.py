@@ -169,7 +169,7 @@ def extract_borderless_panels(img, gray, img_width, img_height):
     3. For difficult rows: use hints from other rows
     """
     bg_color = detect_background_color(img, img_width, img_height)
-    tolerance = 35
+    tolerance = 45
 
     # Background mask: pixel is background only if ALL channels are within tolerance
     diff = np.abs(img.astype(int) - bg_color.astype(int))
@@ -178,7 +178,7 @@ def extract_borderless_panels(img, gray, img_width, img_height):
     h_profile = np.mean(bg_mask, axis=1)
     min_h_gap = max(8, img_height // 80)
     min_content_h = img_height // 15
-    min_v_gap = max(6, img_width // 100)
+    min_v_gap = max(4, img_width // 500)
     min_content_w = img_width // 15
 
     # Step 1: Find row gaps
