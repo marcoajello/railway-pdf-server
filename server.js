@@ -81,7 +81,7 @@ function getAnthropicClient() {
  * Retry wrapper for Anthropic API calls with exponential backoff.
  * Retries on 529 (overloaded) and 500+ errors.
  */
-async function apiCallWithRetry(fn, maxRetries = 3) {
+async function apiCallWithRetry(fn, maxRetries = 5) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
@@ -89,7 +89,7 @@ async function apiCallWithRetry(fn, maxRetries = 3) {
       const status = err?.status || 0;
       const retryable = status === 529 || status >= 500;
       if (!retryable || attempt === maxRetries) throw err;
-      const delay = 1000 * Math.pow(2, attempt) + Math.random() * 500;
+      const delay = 2000 * Math.pow(2, attempt) + Math.random() * 1000;
       console.log(`[API Retry] ${status} error, attempt ${attempt + 1}/${maxRetries}, waiting ${Math.round(delay)}ms`);
       await new Promise(r => setTimeout(r, delay));
     }
@@ -1404,7 +1404,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
   } catch (error) {
     console.error('[Storyboard] Error:', error);
-    res.status(500).json({ error: error.message });
+    const status = error?.status || 500;
+    if (status === 529) {
+      res.status(503).json({ error: 'The AI service is temporarily overloaded. Please try again in a moment.' });
+    } else {
+      res.status(500).json({ error: error.message || 'Unknown error processing storyboard' });
+    }
   } finally {
     // Clean up temp directory
     try { await fs.rm(tempDir, { recursive: true, force: true }); } catch (e) {}
