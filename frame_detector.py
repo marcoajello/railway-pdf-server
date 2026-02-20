@@ -76,16 +76,25 @@ def extract_bordered_panels(gray, h_lines, v_lines, img_width, img_height):
 
 # ─── Phase 2b: Borderless Gap-Based Detection ──────────────────────────────
 
-def detect_background_color(gray, img_width, img_height):
-    """Detect dominant background color by sampling page edges."""
+def detect_background_color(img, img_width, img_height):
+    """
+    Detect dominant background color by sampling page edges.
+    Works in BGR color space to distinguish pastels from white.
+    Returns a 3-element array [B, G, R].
+    """
     margin = max(10, min(img_width, img_height) // 20)
-    samples = np.concatenate([
-        gray[0:margin, :].flatten(),
-        gray[img_height - margin:, :].flatten(),
-        gray[:, 0:margin].flatten(),
-        gray[:, img_width - margin:].flatten()
-    ])
-    return int(np.median(samples))
+
+    # Sample strips along all four edges
+    top = img[0:margin, :].reshape(-1, 3)
+    bottom = img[img_height - margin:, :].reshape(-1, 3)
+    left = img[:, 0:margin].reshape(-1, 3)
+    right = img[:, img_width - margin:].reshape(-1, 3)
+
+    samples = np.vstack([top, bottom, left, right])
+
+    # Median per channel
+    bg_color = np.median(samples, axis=0).astype(int)
+    return bg_color
 
 
 def find_gap_runs(profile, threshold=0.7, min_width=8):
@@ -135,18 +144,20 @@ def cluster_gap_positions(all_gap_midpoints, tolerance):
     return [(int(np.median(c)), len(c)) for c in clusters]
 
 
-def extract_borderless_panels(gray, img_width, img_height):
+def extract_borderless_panels(img, gray, img_width, img_height):
     """
     Find panels by detecting background-colored gaps.
+    Uses BGR color space so pastels (mint, peach) aren't confused with white.
     1. Find row gaps (horizontal strips of background)
     2. Per-row: find column gaps
-    3. For rows with missing gaps: use hints from other rows,
-       look harder near those positions with relaxed threshold
+    3. For difficult rows: use hints from other rows
     """
-    bg_value = detect_background_color(gray, img_width, img_height)
+    bg_color = detect_background_color(img, img_width, img_height)
     tolerance = 35
 
-    bg_mask = np.abs(gray.astype(int) - bg_value) < tolerance
+    # Background mask: pixel is background only if ALL channels are within tolerance
+    diff = np.abs(img.astype(int) - bg_color.astype(int))
+    bg_mask = np.all(diff < tolerance, axis=2)  # shape: (H, W)
 
     h_profile = np.mean(bg_mask, axis=1)
     min_h_gap = max(8, img_height // 80)
@@ -157,7 +168,7 @@ def extract_borderless_panels(gray, img_width, img_height):
     # Step 1: Find row gaps
     h_gaps = find_gap_runs(h_profile, threshold=0.7, min_width=min_h_gap)
     if len(h_gaps) < 2:
-        return [], bg_value
+        return [], bg_color
 
     rows = []
     for i in range(len(h_gaps) - 1):
@@ -167,7 +178,7 @@ def extract_borderless_panels(gray, img_width, img_height):
             rows.append((row_top, row_bottom))
 
     if not rows:
-        return [], bg_value
+        return [], bg_color
 
     # Step 2: Per-row column gap detection
     row_gaps = {}       # row_index -> list of (start, end) gap tuples
@@ -198,7 +209,7 @@ def extract_borderless_panels(gray, img_width, img_height):
     best_count = len(row_panels[best_row_idx])
 
     if best_count == 0:
-        return [], bg_value
+        return [], bg_color
 
     # Collect gap midpoints from all rows that found panels
     all_gap_mids = []
@@ -219,8 +230,9 @@ def extract_borderless_panels(gray, img_width, img_height):
         if len(row_panels[idx]) >= best_count:
             continue  # this row is fine
 
-        # Get the actual pixel data for this row (not just bg_mask)
+        # Get the actual pixel data for this row
         row_gray = gray[row_top:row_bottom, :]
+        row_color = img[row_top:row_bottom, :]
 
         # Try progressively relaxed detection
         found_better = False
@@ -232,8 +244,9 @@ def extract_borderless_panels(gray, img_width, img_height):
             # Low variance = uniform color = likely gap
             uniformity = 1.0 - (row_var / max_var)
 
-            # Also check bg similarity with relaxed tolerance
-            wider_bg = np.abs(row_gray.astype(int) - bg_value) < (tolerance * 2)
+            # Also check bg similarity with relaxed tolerance (in color space)
+            wider_diff = np.abs(row_color.astype(int) - bg_color.astype(int))
+            wider_bg = np.all(wider_diff < (tolerance * 2), axis=2)
             bg_profile = np.mean(wider_bg, axis=0)
 
             # Combine: a gap should be either uniform color OR background-like
@@ -303,7 +316,7 @@ def extract_borderless_panels(gray, img_width, img_height):
     for idx in sorted(row_panels.keys()):
         rectangles.extend(row_panels[idx])
 
-    return rectangles, bg_value
+    return rectangles, bg_color
 
 
 # ─── Shared Utilities ──────────────────────────────────────────────────────
@@ -382,7 +395,7 @@ def detect_rectangles(image_path):
         return rectangles, True, 'grid'
 
     # Phase 2: Borderless — gap-based detection
-    content_rects, bg_value = extract_borderless_panels(gray, width, height)
+    content_rects, bg_color = extract_borderless_panels(img, gray, width, height)
 
     if len(content_rects) >= 2:
         row_threshold = max(150, height // 10)
