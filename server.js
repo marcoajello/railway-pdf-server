@@ -1274,26 +1274,43 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         // Run batched text extraction (one API call for multiple pages)
         const textResults = await extractTextBatched(batch);
         
-        // Vision detection for all pages — always use Claude Vision for panel detection
+        // Detection: try OpenCV first (pixel-perfect for bordered boards), fall back to Vision
         return Promise.all(batch.map(async ({ path: imgPath, pageNum }) => {
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
           const textFrameCount = textData.frames?.length || 0;
 
-          let images = [];
+          let detected = { count: 0, bordered: false, mode: 'none', images: [] };
+          
           if (textFrameCount >= 1) {
+            // Step 1: Try OpenCV (fast, pixel-perfect for bordered storyboards)
             try {
-              const imageBuffer = await fs.readFile(imgPath);
-              const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
-              if (visionImages.length >= 1) {
-                images = visionImages;
-                console.log(`[Storyboard] Page ${pageNum}: Vision found ${images.length} panels`);
+              const cvResult = await detectRectangles(imgPath);
+              if (cvResult.mode === 'grid' || cvResult.mode === 'content') {
+                if (cvResult.count >= 1 && cvResult.images && cvResult.images.length >= 1) {
+                  detected = cvResult;
+                  console.log(`[Storyboard] Page ${pageNum}: OpenCV ${cvResult.mode} found ${cvResult.count} panels`);
+                }
               }
             } catch (e) {
-              console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
+              console.error(`[Storyboard] Page ${pageNum}: OpenCV error:`, e.message);
+            }
+            
+            // Step 2: Fall back to Vision if OpenCV couldn't handle it
+            if (detected.count < 1) {
+              try {
+                const imageBuffer = await fs.readFile(imgPath);
+                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
+                if (visionImages.length >= 1) {
+                  detected = { count: visionImages.length, bordered: false, mode: 'vision', images: visionImages };
+                  console.log(`[Storyboard] Page ${pageNum}: Vision found ${visionImages.length} panels`);
+                }
+              } catch (e) {
+                console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
+              }
             }
           }
 
-          return { detected: { count: images.length, bordered: false, mode: 'vision', images }, textData, pageNum };
+          return { detected, textData, pageNum };
         }));
       }));
       
