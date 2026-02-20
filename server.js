@@ -712,12 +712,17 @@ RULES:
 }
 
 /**
- * Vision fallback: Ask Claude to identify panel bounding boxes when OpenCV fails.
+ * Vision panel detection: Ask Claude to identify panel bounding boxes.
  * Returns array of base64 cropped images in reading order.
  */
 async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const client = getAnthropicClient();
   if (!client) return [];
+
+  // Get original dimensions for high-quality cropping later
+  const originalMeta = await sharp(imageBuffer).metadata();
+  const origW = originalMeta.width;
+  const origH = originalMeta.height;
 
   const resized = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
@@ -728,7 +733,11 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const imgW = metadata.width;
   const imgH = metadata.height;
 
-  console.log(`[Storyboard] Vision fallback: asking Claude for panel boxes (expecting ~${expectedCount})`);
+  // Scale factors to map Vision coordinates back to original resolution
+  const scaleX = origW / imgW;
+  const scaleY = origH / imgH;
+
+  console.log(`[Storyboard] Vision: asking Claude for panel boxes (expecting ~${expectedCount})`);
 
   const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -737,11 +746,18 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
       role: 'user',
       content: [
         { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
-        { type: 'text', text: `This is a storyboard page. Find each DRAWING PANEL (the rectangular areas containing artwork/sketches).
+        { type: 'text', text: `This is a storyboard page with approximately ${expectedCount} drawing panels.
 
-Return the bounding box of each panel as pixel coordinates relative to this ${imgW}x${imgH} image.
-Read panels LEFT-TO-RIGHT, then TOP-TO-BOTTOM (reading order).
-Skip text-only areas, headers, and shot number labels — only return the drawing panels.
+Find each individual DRAWING PANEL — the rectangular image areas containing artwork, photos, or sketches. Each panel is a SEPARATE image, even if panels touch or share borders.
+
+IMPORTANT:
+- Each panel is its own rectangle. Do NOT merge adjacent panels into one box.
+- Panels in the same row may touch — return each one separately.
+- Skip text captions, frame labels, headers, and shot numbers.
+- Crop tightly to the image content of each panel.
+
+Return bounding boxes as pixel coordinates relative to this ${imgW}x${imgH} image.
+Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
 Return ONLY JSON:
 {
@@ -769,7 +785,7 @@ x,y = top-left corner. w,h = width and height in pixels.` }
       try {
         panels = JSON.parse(objMatch[0]).panels || [];
       } catch (_) {
-        console.error('[Storyboard] Vision fallback: failed to parse response');
+        console.error('[Storyboard] Vision: failed to parse response');
         return [];
       }
     } else {
@@ -777,29 +793,30 @@ x,y = top-left corner. w,h = width and height in pixels.` }
     }
   }
 
-  console.log(`[Storyboard] Vision fallback: Claude found ${panels.length} panels`);
+  console.log(`[Storyboard] Vision: Claude found ${panels.length} panels`);
 
+  // Crop from original resolution for better quality
   const images = [];
   for (const p of panels) {
     try {
-      const x = Math.max(0, Math.round(p.x));
-      const y = Math.max(0, Math.round(p.y));
-      const w = Math.min(Math.round(p.w), imgW - x);
-      const h = Math.min(Math.round(p.h), imgH - y);
+      const x = Math.max(0, Math.round(p.x * scaleX));
+      const y = Math.max(0, Math.round(p.y * scaleY));
+      const w = Math.min(Math.round(p.w * scaleX), origW - x);
+      const h = Math.min(Math.round(p.h * scaleY), origH - y);
 
       if (w < 20 || h < 20) {
         images.push(null);
         continue;
       }
 
-      const cropped = await sharp(resized)
+      const cropped = await sharp(imageBuffer)
         .extract({ left: x, top: y, width: w, height: h })
         .jpeg({ quality: 85 })
         .toBuffer();
 
       images.push(cropped.toString('base64'));
     } catch (e) {
-      console.error(`[Storyboard] Vision fallback: crop error for panel:`, e.message);
+      console.error(`[Storyboard] Vision: crop error for panel:`, e.message);
       images.push(null);
     }
   }
@@ -1241,83 +1258,29 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       const batchGroup = batches.slice(i, i + CONCURRENCY);
       
       const batchResults = await Promise.all(batchGroup.map(async (batch) => {
-        // Run rectangle detection in parallel for this batch
-        const rectPromises = batch.map(({ path, pageNum }) => 
-          detectRectangles(path).then(r => ({ pageNum, detected: r }))
-        );
-        
         // Run batched text extraction (one API call for multiple pages)
-        const textPromise = extractTextBatched(batch);
+        const textResults = await extractTextBatched(batch);
         
-        const [rectResults, textResults] = await Promise.all([
-          Promise.all(rectPromises),
-          textPromise
-        ]);
-        
-        // Merge results by page, with Vision fallback for tricky boards
+        // Vision detection for all pages — always use Claude Vision for panel detection
         return Promise.all(batch.map(async ({ path: imgPath, pageNum }) => {
-          const detected = rectResults.find(r => r.pageNum === pageNum)?.detected || { count: 0, bordered: false, mode: 'vision', images: [] };
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
-
-          let images = detected.images || [];
           const textFrameCount = textData.frames?.length || 0;
-          const mode = detected.mode || 'vision';
 
-          if (mode === 'grid') {
-            // Path 1: Bordered — OpenCV found grid lines
-            if (textFrameCount >= 2 && images.length < textFrameCount * 0.5) {
-              // Grid detected but OpenCV missed too many panels — Vision fallback
-              console.log(`[Storyboard] Page ${pageNum}: Grid mode but found ${images.length}/${textFrameCount} — Vision fallback`);
-              try {
-                const imageBuffer = await fs.readFile(imgPath);
-                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
-                if (visionImages.length >= textFrameCount * 0.5) {
-                  images = visionImages;
-                  console.log(`[Storyboard] Page ${pageNum}: Vision returned ${images.length} panels`);
-                }
-              } catch (e) {
-                console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
+          let images = [];
+          if (textFrameCount >= 1) {
+            try {
+              const imageBuffer = await fs.readFile(imgPath);
+              const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
+              if (visionImages.length >= 1) {
+                images = visionImages;
+                console.log(`[Storyboard] Page ${pageNum}: Vision found ${images.length} panels`);
               }
-            } else {
-              console.log(`[Storyboard] Page ${pageNum}: Grid mode — ${images.length} panels`);
-            }
-          } else if (mode === 'content') {
-            // Path 2: Borderless with uniform background — content regions found deterministically
-            if (textFrameCount >= 2 && images.length < textFrameCount * 0.5) {
-              // Content detection merged too many panels together — Vision fallback
-              console.log(`[Storyboard] Page ${pageNum}: Content mode found ${images.length}/${textFrameCount} — Vision fallback`);
-              try {
-                const imageBuffer = await fs.readFile(imgPath);
-                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
-                if (visionImages.length >= textFrameCount * 0.5) {
-                  images = visionImages;
-                  console.log(`[Storyboard] Page ${pageNum}: Vision returned ${images.length} panels`);
-                }
-              } catch (e) {
-                console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
-              }
-            } else {
-              console.log(`[Storyboard] Page ${pageNum}: Content mode — ${images.length} panels (no API needed)`);
-            }
-          } else {
-            // Path 3: Unknown layout — Vision fallback
-            console.log(`[Storyboard] Page ${pageNum}: Vision mode — sending to Claude Vision`);
-            images = [];
-            if (textFrameCount >= 1) {
-              try {
-                const imageBuffer = await fs.readFile(imgPath);
-                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
-                if (visionImages.length >= 1) {
-                  images = visionImages;
-                  console.log(`[Storyboard] Page ${pageNum}: Vision found ${images.length} panels`);
-                }
-              } catch (e) {
-                console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
-              }
+            } catch (e) {
+              console.error(`[Storyboard] Page ${pageNum}: Vision error:`, e.message);
             }
           }
 
-          return { detected: { ...detected, images }, textData, pageNum };
+          return { detected: { count: images.length, bordered: false, mode: 'vision', images }, textData, pageNum };
         }));
       }));
       
