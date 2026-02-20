@@ -871,7 +871,7 @@ async function analyzeGroupingsOpus(frames) {
   }
 
   if (thumbs.length < 2) return frames;
-  console.log(`[Storyboard] Pass 2 (Opus): ${thumbs.length} frames`);
+  console.log(`[Storyboard] Pass 2 (Sonnet): ${thumbs.length} frames`);
 
   const content = [];
   for (let i = 0; i < thumbs.length; i++) {
@@ -907,13 +907,13 @@ Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
 
   try {
     const response = await client.messages.create({
-      model: 'claude-opus-4-6',
+      model: 'claude-sonnet-4-5-20250929',
       max_tokens: 2048,
       messages: [{ role: 'user', content }]
     });
     return applyPass2Decisions(frames, thumbs, response.content[0]?.text || '');
   } catch (err) {
-    console.error('[Storyboard] Pass 2 (Opus) error:', err.message);
+    console.error('[Storyboard] Pass 2 (Sonnet) error:', err.message);
     return frames;
   }
 }
