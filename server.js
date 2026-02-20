@@ -589,7 +589,7 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
       
       await sharp(tempPath)
         .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
-        .jpeg({ quality: 40, progressive: true })
+        .jpeg({ quality: 80, progressive: true })
         .toFile(imgPath);
       
       await fs.unlink(tempPath);
