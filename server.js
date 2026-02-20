@@ -712,52 +712,54 @@ RULES:
 }
 
 /**
- * Vision panel detection: Ask Claude to identify panel bounding boxes.
- * Returns array of base64 cropped images in reading order.
+ * Vision panel detection using binary mask.
+ * 1. Threshold the page into a high-contrast mask (white bg, black panels)
+ * 2. Send the mask to Claude Vision — no tonal ambiguity, just rectangles
+ * 3. Crop from the original full-resolution image
  */
 async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const client = getAnthropicClient();
   if (!client) return [];
 
-  // Get original dimensions for high-quality cropping later
+  // Get original dimensions for cropping later
   const originalMeta = await sharp(imageBuffer).metadata();
   const origW = originalMeta.width;
   const origH = originalMeta.height;
 
+  // Step 1: Generate binary mask — threshold at 240 so panels become black, background stays white
   const resized = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
-    .jpeg({ quality: 85 })
     .toBuffer();
 
-  const metadata = await sharp(resized).metadata();
-  const imgW = metadata.width;
-  const imgH = metadata.height;
+  const resizedMeta = await sharp(resized).metadata();
+  const imgW = resizedMeta.width;
+  const imgH = resizedMeta.height;
 
-  // Scale factors to map Vision coordinates back to original resolution
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
 
-  console.log(`[Storyboard] Vision: asking Claude for panel boxes (expecting ~${expectedCount})`);
+  // Threshold: convert to grayscale, then binary (pixel > 240 = white, else black)
+  const mask = await sharp(resized)
+    .grayscale()
+    .threshold(240)
+    .jpeg({ quality: 90 })
+    .toBuffer();
 
+  console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} binary mask (expecting ~${expectedCount} panels)`);
+
+  // Step 2: Send mask to Vision
   const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 2048,
     messages: [{
       role: 'user',
       content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: resized.toString('base64') } },
-        { type: 'text', text: `This is a storyboard page with approximately ${expectedCount} drawing panels.
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: mask.toString('base64') } },
+        { type: 'text', text: `This is a high-contrast mask of a storyboard page (${imgW}x${imgH} pixels). Each BLACK rectangle is a drawing panel. WHITE areas are gaps/background. Text captions appear below some panels.
 
-Find each individual DRAWING PANEL — the rectangular image areas containing artwork, photos, or sketches. Each panel is a SEPARATE image, even if panels touch or share borders.
+There are approximately ${expectedCount} panels arranged in rows.
 
-IMPORTANT:
-- Each panel is its own rectangle. Do NOT merge adjacent panels into one box.
-- Panels in the same row may touch — return each one separately.
-- Skip text captions, frame labels, headers, and shot numbers.
-- Crop tightly to the image content of each panel.
-
-Return bounding boxes as pixel coordinates relative to this ${imgW}x${imgH} image.
-Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
+Find each BLACK RECTANGLE panel and return its bounding box. Each panel is a SEPARATE rectangle — do NOT merge adjacent panels even if they appear close together.
 
 Return ONLY JSON:
 {
@@ -767,7 +769,8 @@ Return ONLY JSON:
   ]
 }
 
-x,y = top-left corner. w,h = width and height in pixels.` }
+x,y = top-left corner of each black rectangle. w,h = width and height in pixels.
+Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
       ]
     }]
   }));
@@ -785,7 +788,7 @@ x,y = top-left corner. w,h = width and height in pixels.` }
       try {
         panels = JSON.parse(objMatch[0]).panels || [];
       } catch (_) {
-        console.error('[Storyboard] Vision: failed to parse response');
+        console.error('[Storyboard] Vision: failed to parse mask response');
         return [];
       }
     } else {
@@ -793,9 +796,9 @@ x,y = top-left corner. w,h = width and height in pixels.` }
     }
   }
 
-  console.log(`[Storyboard] Vision: Claude found ${panels.length} panels`);
+  console.log(`[Storyboard] Vision: found ${panels.length} panels on mask`);
 
-  // Crop from original resolution for better quality
+  // Step 3: Crop from original resolution image
   const images = [];
   for (const p of panels) {
     try {
