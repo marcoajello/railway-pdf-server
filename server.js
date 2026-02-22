@@ -1287,15 +1287,21 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               const cvResult = await detectRectangles(imgPath);
               if (cvResult.mode === 'grid' || cvResult.mode === 'content') {
                 if (cvResult.count >= 1 && cvResult.images && cvResult.images.length >= 1) {
-                  detected = cvResult;
-                  console.log(`[Storyboard] Page ${pageNum}: OpenCV ${cvResult.mode} found ${cvResult.count} panels`);
+                  // Trust OpenCV only if it found at least 70% of expected panels
+                  const expectedMin = Math.max(1, Math.floor(textFrameCount * 0.7));
+                  if (cvResult.count >= expectedMin) {
+                    detected = cvResult;
+                    console.log(`[Storyboard] Page ${pageNum}: OpenCV ${cvResult.mode} found ${cvResult.count} panels (expected ~${textFrameCount})`);
+                  } else {
+                    console.log(`[Storyboard] Page ${pageNum}: OpenCV ${cvResult.mode} found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
+                  }
                 }
               }
             } catch (e) {
               console.error(`[Storyboard] Page ${pageNum}: OpenCV error:`, e.message);
             }
             
-            // Step 2: Fall back to Vision if OpenCV couldn't handle it
+            // Step 2: Fall back to Vision if OpenCV couldn't handle it or found too few
             if (detected.count < 1) {
               try {
                 const imageBuffer = await fs.readFile(imgPath);
