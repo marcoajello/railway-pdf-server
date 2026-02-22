@@ -816,121 +816,14 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
 
   console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
 
-  // Use mask to trim Vision's bounding boxes to actual artwork content
-  // The mask is in resized resolution (imgW x imgH), same as Vision's coordinates
-  let maskPixels = null;
-  let maskW = 0, maskH = 0;
-  try {
-    const maskRaw = await sharp(mask).grayscale().raw().toBuffer({ resolveWithObject: true });
-    maskPixels = maskRaw.data;
-    maskW = maskRaw.info.width;
-    maskH = maskRaw.info.height;
-  } catch (e) {
-    console.error('[Storyboard] Vision: could not read mask for trimming:', e.message);
-  }
-
   // Crop from original resolution image
   const images = [];
   for (const p of panels) {
     try {
-      let px = Math.round(p.x);
-      let py = Math.round(p.y);
-      let pw = Math.round(p.w);
-      let ph = Math.round(p.h);
-
-      // Trim using mask: find the largest contiguous block of content rows/cols
-      // This separates artwork (big dense block) from text captions (small block below)
-      if (maskPixels && pw > 10 && ph > 10) {
-        // Clamp to mask bounds
-        const left = Math.max(0, px);
-        const top = Math.max(0, py);
-        const right = Math.min(left + pw, maskW);
-        const bottom = Math.min(top + ph, maskH);
-        
-        // Compute row densities (% of dark pixels per row)
-        const rowDensity = [];
-        for (let row = top; row < bottom; row++) {
-          let darkCount = 0;
-          for (let col = left; col < right; col++) {
-            if (maskPixels[row * maskW + col] < 128) darkCount++;
-          }
-          rowDensity.push(darkCount / (right - left));
-        }
-
-        // Find largest contiguous block of "content" rows (>5% dark)
-        const contentThreshold = 0.60;
-        let bestStart = 0, bestLen = 0, curStart = 0, curLen = 0;
-        let inGap = 0; // allow small gaps (up to 3 rows) within artwork
-        for (let i = 0; i < rowDensity.length; i++) {
-          if (rowDensity[i] >= contentThreshold) {
-            if (curLen === 0) curStart = i;
-            curLen += inGap + 1;
-            inGap = 0;
-          } else {
-            inGap++;
-            if (inGap > 3) {
-              if (curLen > bestLen) { bestStart = curStart; bestLen = curLen; }
-              curLen = 0;
-              inGap = 0;
-            }
-          }
-        }
-        if (curLen > bestLen) { bestStart = curStart; bestLen = curLen; }
-
-        // Similarly for columns
-        const colDensity = [];
-        for (let col = left; col < right; col++) {
-          let darkCount = 0;
-          for (let row = top + bestStart; row < top + bestStart + bestLen; row++) {
-            if (row < bottom && maskPixels[row * maskW + col] < 128) darkCount++;
-          }
-          colDensity.push(darkCount / bestLen);
-        }
-
-        let bestColStart = 0, bestColLen = 0, curColStart = 0, curColLen = 0;
-        let colGap = 0;
-        for (let i = 0; i < colDensity.length; i++) {
-          if (colDensity[i] >= contentThreshold) {
-            if (curColLen === 0) curColStart = i;
-            curColLen += colGap + 1;
-            colGap = 0;
-          } else {
-            colGap++;
-            if (colGap > 3) {
-              if (curColLen > bestColLen) { bestColStart = curColStart; bestColLen = curColLen; }
-              curColLen = 0;
-              colGap = 0;
-            }
-          }
-        }
-        if (curColLen > bestColLen) { bestColStart = curColStart; bestColLen = curColLen; }
-
-        const trimTop = top + bestStart;
-        const trimBottom = top + bestStart + bestLen;
-        const trimLeft = left + bestColStart;
-        const trimRight = left + bestColStart + bestColLen;
-
-        const newW = trimRight - trimLeft;
-        const newH = trimBottom - trimTop;
-        
-        // Only apply trim if result is reasonable (at least 50% of original area)
-        if (newW > pw * 0.5 && newH > ph * 0.5) {
-          const trimmed = (trimLeft !== left || trimTop !== top || trimRight !== right || trimBottom !== bottom);
-          if (trimmed) {
-            console.log(`[Storyboard] Vision: mask-trimmed panel from ${pw}x${ph} to ${newW}x${newH}`);
-          }
-          px = trimLeft;
-          py = trimTop;
-          pw = newW;
-          ph = newH;
-        }
-      }
-
-      // Scale to original resolution
-      const x = Math.max(0, Math.round(px * scaleX));
-      const y = Math.max(0, Math.round(py * scaleY));
-      const w = Math.min(Math.round(pw * scaleX), origW - x);
-      const h = Math.min(Math.round(ph * scaleY), origH - y);
+      const x = Math.max(0, Math.round(p.x * scaleX));
+      const y = Math.max(0, Math.round(p.y * scaleY));
+      const w = Math.min(Math.round(p.w * scaleX), origW - x);
+      const h = Math.min(Math.round(p.h * scaleY), origH - y);
 
       if (w < 20 || h < 20) {
         images.push(null);
