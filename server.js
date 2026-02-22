@@ -722,24 +722,35 @@ RULES:
  * Detect panels from a pre-thresholded mask using OpenCV contour detection.
  * Returns array of base64 images cropped from the ORIGINAL full-res image, or null if detection fails.
  */
-async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount) {
+async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount, grayscaleBuffer) {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mask-'));
   const maskPath = path.join(tmpDir, 'mask.jpg');
-  
+
   try {
     await fs.writeFile(maskPath, maskBuffer);
-    
+
+    // Save grayscale original for OCR (tesseract works much better on the
+    // actual image than on the binary mask, especially for photo boards where
+    // photos merge with caption text on the mask)
+    let grayscalePath = null;
+    if (grayscaleBuffer) {
+      grayscalePath = path.join(tmpDir, 'grayscale.jpg');
+      await fs.writeFile(grayscalePath, grayscaleBuffer);
+    }
+
     // Get mask dimensions for coordinate scaling
     const maskMeta = await sharp(maskBuffer).metadata();
     const origMeta = await sharp(originalImageBuffer).metadata();
     const scaleX = origMeta.width / maskMeta.width;
     const scaleY = origMeta.height / maskMeta.height;
-    
+
     // Run Python — just get rectangles, no cropping
     const result = await new Promise((resolve) => {
       const script = path.join(__dirname, 'frame_detector.py');
       // Don't pass 'crop' — we'll crop in Node from full-res
+      // argv[4] = grayscale original for OCR text detection
       const args = [script, maskPath, 'mask', String(expectedCount)];
+      if (grayscalePath) args.push(grayscalePath);
       
       const tryPython = (cmd) => {
         const proc = spawn(cmd, args);
@@ -911,6 +922,14 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   
   console.log(`[Storyboard] Vision: detected background=${bgValue}, using threshold=${dynamicThreshold}`);
 
+  // Generate grayscale (for OCR — tesseract works much better on the actual
+  // image than on the binary mask, especially for photo boards)
+  const grayscale = await sharp(imageBuffer)
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .grayscale()
+    .jpeg({ quality: 90 })
+    .toBuffer();
+
   // Generate binary mask
   const mask = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
@@ -920,7 +939,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
     .toBuffer();
 
   // === HYBRID STEP: Try OpenCV on mask first ===
-  const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount);
+  const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount, grayscale);
   const maskPanels = maskResult?.images;
   const ocrTextBoxes = maskResult?.textBoxes || [];
 
