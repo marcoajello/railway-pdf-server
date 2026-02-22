@@ -670,17 +670,23 @@ These titles indicate DIFFERENT COMMERCIALS/SPOTS in the same PDF.
 Always extract the title exactly as written - even if it's just a number.
 This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within a commercial.
 
-STEP 2 - GRID LAYOUT:
+STEP 2 - BOARD TYPE:
+Classify the drawing panels:
+- "hand_drawn": panels contain hand-drawn illustrations, sketches, pencil/ink drawings, or animatic-style artwork
+- "photo": panels contain photographs, rendered images, composited images, or photographic reference
+
+STEP 3 - GRID LAYOUT:
 Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
-STEP 3 - FRAME NUMBERS:
+STEP 4 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
-STEP 4 - EXTRACT:
+STEP 5 - EXTRACT:
 Return JSON:
 {
   "spotName": "EXACT TITLE FROM PAGE" or null,
+  "boardType": "hand_drawn" or "photo",
   "gridLayout": "2x3",
   "hasVisibleNumbers": true/false,
   "frames": [
@@ -694,6 +700,7 @@ Return JSON:
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
+- boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
 - Skip empty frames` }
@@ -1274,35 +1281,38 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         // Run batched text extraction (one API call for multiple pages)
         const textResults = await extractTextBatched(batch);
         
-        // Detection: try OpenCV first (pixel-perfect for bordered boards), fall back to Vision
+        // Detection: hand-drawn boards → OpenCV grid (pixel-perfect), photo boards → Vision
         return Promise.all(batch.map(async ({ path: imgPath, pageNum }) => {
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
           const textFrameCount = textData.frames?.length || 0;
+          const boardType = textData.boardType || 'photo';
 
           let detected = { count: 0, bordered: false, mode: 'none', images: [] };
           
           if (textFrameCount >= 1) {
-            // Step 1: Try OpenCV (pixel-perfect for bordered/hand-drawn storyboards)
-            try {
-              const cvResult = await detectRectangles(imgPath);
-              // Only trust grid mode (bordered boards like hand-drawn storyboards)
-              // Content mode crops are imprecise — Vision does better on borderless pages
-              if (cvResult.mode === 'grid') {
-                const expectedMin = Math.max(1, Math.floor(textFrameCount * 0.7));
-                if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
-                  detected = cvResult;
-                  console.log(`[Storyboard] Page ${pageNum}: OpenCV grid found ${cvResult.count} panels (expected ~${textFrameCount})`);
+            // Hand-drawn boards: try OpenCV grid first (pixel-perfect for ink/pencil borders)
+            if (boardType === 'hand_drawn') {
+              try {
+                const cvResult = await detectRectangles(imgPath);
+                if (cvResult.mode === 'grid') {
+                  const expectedMin = Math.max(1, Math.ceil(textFrameCount * 0.9));
+                  if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
+                    detected = cvResult;
+                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found ${cvResult.count} panels (expected ~${textFrameCount})`);
+                  } else {
+                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
+                  }
                 } else {
-                  console.log(`[Storyboard] Page ${pageNum}: OpenCV grid found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
+                  console.log(`[Storyboard] Page ${pageNum}: hand-drawn but no grid detected — falling back to Vision`);
                 }
-              } else {
-                console.log(`[Storyboard] Page ${pageNum}: OpenCV mode=${cvResult.mode} — using Vision for better accuracy`);
+              } catch (e) {
+                console.error(`[Storyboard] Page ${pageNum}: OpenCV error:`, e.message);
               }
-            } catch (e) {
-              console.error(`[Storyboard] Page ${pageNum}: OpenCV error:`, e.message);
+            } else {
+              console.log(`[Storyboard] Page ${pageNum}: photo board → using Vision`);
             }
             
-            // Step 2: Fall back to Vision if OpenCV couldn't handle it or found too few
+            // Vision fallback (or primary for photo boards)
             if (detected.count < 1) {
               try {
                 const imageBuffer = await fs.readFile(imgPath);
@@ -1455,19 +1465,25 @@ These titles indicate DIFFERENT COMMERCIALS/SPOTS in the same PDF.
 Always extract the title exactly as written - even if it's just a number.
 This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within a commercial.
 
-STEP 2 - GRID LAYOUT:
+STEP 2 - BOARD TYPE:
+Classify the drawing panels on each page:
+- "hand_drawn": panels contain hand-drawn illustrations, sketches, pencil/ink drawings, or animatic-style artwork
+- "photo": panels contain photographs, rendered images, composited images, or photographic reference
+
+STEP 3 - GRID LAYOUT:
 Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
-STEP 3 - FRAME NUMBERS:
+STEP 4 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
-STEP 4 - EXTRACT:
+STEP 5 - EXTRACT:
 Return a JSON array with one object per page:
 [
   {
     "pageNum": 1,
     "spotName": "EXACT TITLE FROM PAGE" or null,
+    "boardType": "hand_drawn" or "photo",
     "gridLayout": "2x3",
     "hasVisibleNumbers": true/false,
     "frames": [
@@ -1479,6 +1495,7 @@ Return a JSON array with one object per page:
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
+- boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
 - Skip empty frames` });
