@@ -761,6 +761,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 2048,
+    temperature: 0,
     messages: [{
       role: 'user',
       content: [
@@ -776,7 +777,7 @@ There are approximately ${expectedCount} panels arranged in rows.
 
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
-CRITICAL: Return ONLY the artwork/image area. Do NOT include text captions, descriptions, or frame numbers that appear below or beside the artwork. The bounding box should tightly crop the illustration or photo only.
+Skip headers, titles, text captions, and frame number labels — only return the drawing panels themselves.
 
 Return ONLY JSON:
 {
