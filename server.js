@@ -858,7 +858,7 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         }
 
         // Find largest contiguous block of "content" rows (>5% dark)
-        const contentThreshold = 0.05;
+        const contentThreshold = 0.60;
         let bestStart = 0, bestLen = 0, curStart = 0, curLen = 0;
         let inGap = 0; // allow small gaps (up to 3 rows) within artwork
         for (let i = 0; i < rowDensity.length; i++) {
