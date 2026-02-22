@@ -390,11 +390,13 @@ def crop_rectangles(image_path, rectangles):
 def erase_text_from_mask(img, mask_path):
     """
     Run tesseract OCR on the mask to find all text regions, then paint them
-    white (background) on the mask. Returns a cleaned mask with text erased.
+    white (background) on the mask.
 
-    The mask has black text on white background — ideal input for OCR.
-    After erasure, panel detection runs on a text-free mask, so detected
-    panel contours contain only artwork, never caption text.
+    Returns: (cleaned_mask, text_boxes)
+      - cleaned_mask: mask with text regions painted white
+      - text_boxes: list of {x, y, w, h} dicts for every detected text region
+        (in mask pixel coordinates). These are returned even when panel detection
+        fails, so the Vision fallback can use them to trim its crops.
     """
     try:
         result = subprocess.run(
@@ -404,15 +406,15 @@ def erase_text_from_mask(img, mask_path):
         if result.returncode != 0:
             print(f"[OCR] Tesseract failed (code {result.returncode}): {result.stderr[:200]}",
                   file=sys.stderr, flush=True)
-            return img
+            return img, []
 
         lines = result.stdout.strip().split('\n')
         if len(lines) < 2:
             print("[OCR] No text detected by tesseract", file=sys.stderr, flush=True)
-            return img
+            return img, []
 
         cleaned = img.copy()
-        text_count = 0
+        text_boxes = []
         pad = 3  # padding around each text box to catch anti-aliasing
 
         for line in lines[1:]:
@@ -437,20 +439,20 @@ def erase_text_from_mask(img, mask_path):
 
             # Paint white (background = 255)
             cleaned[top:top + h_box, left:left + w] = 255
-            text_count += 1
+            text_boxes.append({'x': left, 'y': top, 'w': w, 'h': h_box})
 
-        print(f"[OCR] Erased {text_count} text regions from mask",
+        print(f"[OCR] Erased {len(text_boxes)} text regions from mask",
               file=sys.stderr, flush=True)
-        return cleaned
+        return cleaned, text_boxes
 
     except FileNotFoundError:
         print("[OCR] Tesseract not installed — skipping text erasure",
               file=sys.stderr, flush=True)
-        return img
+        return img, []
     except subprocess.TimeoutExpired:
         print("[OCR] Tesseract timed out — skipping text erasure",
               file=sys.stderr, flush=True)
-        return img
+        return img, []
 
 
 def detect_from_projection_profile(img_gray, inverted, width, height, img_area, expected_count):
@@ -568,7 +570,7 @@ def detect_from_mask(mask_path, expected_count=0):
     """
     img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        return []
+        return [], []
 
     height, width = img.shape[:2]
     img_area = width * height
@@ -576,7 +578,8 @@ def detect_from_mask(mask_path, expected_count=0):
     # === Step 0: Erase text from mask using OCR ===
     # The mask has black text on white background — ideal for tesseract.
     # After erasure, only artwork remains. Panel detection is text-free.
-    cleaned = erase_text_from_mask(img, mask_path)
+    # text_boxes are preserved so Vision fallback can use them for trimming.
+    cleaned, text_boxes = erase_text_from_mask(img, mask_path)
 
     # Invert cleaned mask: white content on black background
     inverted = cv2.bitwise_not(cleaned)
@@ -596,7 +599,7 @@ def detect_from_mask(mask_path, expected_count=0):
             if expected_count > 0 and len(proj_candidates) == expected_count:
                 # Perfect match — use it (no trim needed, text already erased)
                 best_candidates = finalize_candidates(best_candidates, expected_count, height)
-                return best_candidates
+                return best_candidates, text_boxes
 
     # === Strategies 2-5: Morphology-based ===
     for strategy_name, erode_h, close_size, close_iter in [
@@ -638,14 +641,14 @@ def detect_from_mask(mask_path, expected_count=0):
                 break
 
     if not best_candidates:
-        return []
+        return [], text_boxes
 
     print(f"[Mask] Using strategy '{best_strategy}' with {len(best_candidates)} panels", file=sys.stderr, flush=True)
 
     # No trim_caption_text needed — text was erased from mask before detection
     best_candidates = finalize_candidates(best_candidates, expected_count, height)
 
-    return best_candidates
+    return best_candidates, text_boxes
 
 
 def find_panel_contours(binary_img, width, height, img_area, expected_count):
@@ -758,11 +761,12 @@ if __name__ == '__main__':
             # Returns rectangles only — Node handles full-res cropping
             expected = int(sys.argv[3]) if len(sys.argv) > 3 else 0
             
-            rects = detect_from_mask(image_path, expected)
+            rects, ocr_text_boxes = detect_from_mask(image_path, expected)
             result = {
                 'count': len(rects),
                 'mode': 'mask',
-                'rectangles': rects
+                'rectangles': rects,
+                'textBoxes': ocr_text_boxes
             }
             print(json.dumps(result))
         else:

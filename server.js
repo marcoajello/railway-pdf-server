@@ -780,8 +780,16 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
     
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     
-    if (!result || !result.rectangles || result.count < 1) return null;
-    
+    // Capture OCR text boxes regardless of panel detection success
+    const textBoxes = result?.textBoxes || [];
+    if (textBoxes.length > 0) {
+      console.log(`[Storyboard] Mask-OpenCV: received ${textBoxes.length} OCR text boxes`);
+    }
+
+    if (!result || !result.rectangles || result.count < 1) {
+      return { images: null, textBoxes };
+    }
+
     console.log(`[Storyboard] Mask-OpenCV: found ${result.count} panels`);
     
     // Crop from full-resolution original with scaled coordinates
@@ -816,13 +824,13 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
         images.push(null);
       }
     }
-    
-    return images;
-    
+
+    return { images, textBoxes };
+
   } catch (e) {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     console.error('[Storyboard] Mask-OpenCV error:', e.message);
-    return null;
+    return { images: null, textBoxes: [] };
   }
 }
 
@@ -912,13 +920,15 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
     .toBuffer();
 
   // === HYBRID STEP: Try OpenCV on mask first ===
-  const maskPanels = await detectPanelsFromMask(mask, imageBuffer, expectedCount);
-  
+  const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount);
+  const maskPanels = maskResult?.images;
+  const ocrTextBoxes = maskResult?.textBoxes || [];
+
   if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
     console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
     return maskPanels;
   }
-  
+
   console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
 
   // === FALLBACK: Claude Vision with dual-image ===
@@ -987,6 +997,40 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
   }
 
   console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
+
+  // === Apply OCR text-box trimming to Vision panels ===
+  // Text boxes are in mask coordinates (1400px space), same as Vision panel coordinates
+  if (ocrTextBoxes.length > 0) {
+    console.log(`[Storyboard] Vision: applying OCR text trimming with ${ocrTextBoxes.length} text boxes`);
+    for (let i = 0; i < panels.length; i++) {
+      const p = panels[i];
+      const panelBottom = p.y + p.h;
+      const panelRight = p.x + p.w;
+      // Only consider text boxes in the lower 50% of the panel that overlap horizontally
+      const lowerThreshold = p.y + p.h * 0.5;
+
+      // Find text boxes that fall within this panel's lower region
+      const captionBoxes = ocrTextBoxes.filter(tb => {
+        const tbCenterX = tb.x + tb.w / 2;
+        const tbTop = tb.y;
+        return tbTop >= lowerThreshold &&
+               tbTop < panelBottom + 10 &&  // allow slight overflow
+               tbCenterX >= p.x &&
+               tbCenterX <= panelRight;
+      });
+
+      if (captionBoxes.length > 0) {
+        // Trim panel height to just above the topmost caption text
+        const topMostTextY = Math.min(...captionBoxes.map(tb => tb.y));
+        const trimPad = 4; // small padding above text
+        const newH = Math.max(p.h * 0.4, topMostTextY - p.y - trimPad); // never trim more than 60%
+        if (newH < p.h) {
+          console.log(`[Storyboard] Vision: panel ${i + 1} trimmed from h=${p.h} to h=${Math.round(newH)} (removed ${captionBoxes.length} caption text regions)`);
+          panels[i].h = Math.round(newH);
+        }
+      }
+    }
+  }
 
   // Crop from original resolution image
   const images = [];
