@@ -719,22 +719,125 @@ RULES:
 }
 
 /**
- * Vision panel detection using dual-image approach.
- * Sends both a binary mask AND the original image to Claude Vision.
- * - Photo boards: mask shows clear black rectangles on white (no tonal confusion)
- * - Hand-drawn boards: original shows clear border lines (mask would blur borders with content)
- * Vision uses whichever image gives clearer panel boundaries.
+ * Detect panels from a pre-thresholded mask using OpenCV contour detection.
+ * Returns array of base64 images cropped from the ORIGINAL full-res image, or null if detection fails.
+ */
+async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mask-'));
+  const maskPath = path.join(tmpDir, 'mask.jpg');
+  
+  try {
+    await fs.writeFile(maskPath, maskBuffer);
+    
+    // Get mask dimensions for coordinate scaling
+    const maskMeta = await sharp(maskBuffer).metadata();
+    const origMeta = await sharp(originalImageBuffer).metadata();
+    const scaleX = origMeta.width / maskMeta.width;
+    const scaleY = origMeta.height / maskMeta.height;
+    
+    // Run Python — just get rectangles, no cropping
+    const result = await new Promise((resolve) => {
+      const script = path.join(__dirname, 'frame_detector.py');
+      // Don't pass 'crop' — we'll crop in Node from full-res
+      const args = [script, maskPath, 'mask', String(expectedCount)];
+      
+      const tryPython = (cmd) => {
+        const proc = spawn(cmd, args);
+        let stdout = '';
+        let stderr = '';
+        
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+        
+        proc.on('close', code => {
+          if (code !== 0) {
+            if (cmd === 'python3') {
+              tryPython('python');
+              return;
+            }
+            resolve(null);
+            return;
+          }
+          try {
+            resolve(JSON.parse(stdout));
+          } catch (e) {
+            resolve(null);
+          }
+        });
+        
+        proc.on('error', () => {
+          if (cmd === 'python3') {
+            tryPython('python');
+            return;
+          }
+          resolve(null);
+        });
+      };
+      
+      tryPython('python3');
+    });
+    
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    
+    if (!result || !result.rectangles || result.count < 1) return null;
+    
+    console.log(`[Storyboard] Mask-OpenCV: found ${result.count} panels`);
+    
+    // Crop from full-resolution original with scaled coordinates
+    const images = [];
+    for (const rect of result.rectangles) {
+      try {
+        const x = Math.max(0, Math.round(rect.x * scaleX));
+        const y = Math.max(0, Math.round(rect.y * scaleY));
+        const w = Math.min(Math.round(rect.width * scaleX), origMeta.width - x);
+        const h = Math.min(Math.round(rect.height * scaleY), origMeta.height - y);
+        
+        if (w < 20 || h < 20) {
+          images.push(null);
+          continue;
+        }
+        
+        // 3px inset at original scale to trim border edges
+        const inset = Math.round(3 * scaleX);
+        const cropped = await sharp(originalImageBuffer)
+          .extract({ 
+            left: x + inset, 
+            top: y + inset, 
+            width: Math.max(10, w - inset * 2), 
+            height: Math.max(10, h - inset * 2) 
+          })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+        
+        images.push(cropped.toString('base64'));
+      } catch (e) {
+        console.error('[Storyboard] Mask-OpenCV crop error:', e.message);
+        images.push(null);
+      }
+    }
+    
+    return images;
+    
+  } catch (e) {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    console.error('[Storyboard] Mask-OpenCV error:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Vision panel detection — hybrid approach.
+ * 1. Generate binary mask from the image
+ * 2. Try OpenCV contour detection on the mask (exact pixel edges)
+ * 3. If that fails, fall back to Claude Vision with dual-image (approximate)
  */
 async function detectPanelsWithVision(imageBuffer, expectedCount) {
-  const client = getAnthropicClient();
-  if (!client) return [];
-
   // Get original dimensions for cropping later
   const originalMeta = await sharp(imageBuffer).metadata();
   const origW = originalMeta.width;
   const origH = originalMeta.height;
 
-  // Resize original for Vision
+  // Resize original for processing
   const resized = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 85 })
@@ -743,9 +846,6 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const resizedMeta = await sharp(resized).metadata();
   const imgW = resizedMeta.width;
   const imgH = resizedMeta.height;
-
-  const scaleX = origW / imgW;
-  const scaleY = origH / imgH;
 
   // Detect background color dynamically by sampling at multiple depths from edge
   const grayBuf = await sharp(imageBuffer)
@@ -776,22 +876,19 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   // Bucket into groups of 5, find background color
   const buckets = {};
   for (const v of perimeterValues) {
-    if (v < 150) continue; // skip dark pixels (photo/text content)
+    if (v < 150) continue;
     const bucket = Math.round(v / 5) * 5;
     buckets[bucket] = (buckets[bucket] || 0) + 1;
   }
   const sortedBuckets = Object.entries(buckets).sort((a, b) => b[1] - a[1]);
   
-  // If dominant is pure white (>=250) but there's a secondary light color, use that
-  // This catches beige/cream/gray backgrounds inside white page margins
-  let bgValue = 245; // fallback
+  let bgValue = 245;
   if (sortedBuckets.length > 0) {
     const topValue = parseInt(sortedBuckets[0][0]);
     const topCount = sortedBuckets[0][1];
     if (topValue >= 250 && sortedBuckets.length > 1) {
       const secondValue = parseInt(sortedBuckets[1][0]);
       const secondCount = sortedBuckets[1][1];
-      // Use secondary if it has meaningful representation (>10% of top)
       if (secondValue >= 150 && secondCount > topCount * 0.1) {
         bgValue = secondValue;
       } else {
@@ -805,7 +902,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   
   console.log(`[Storyboard] Vision: detected background=${bgValue}, using threshold=${dynamicThreshold}`);
 
-  // Generate binary mask using detected threshold
+  // Generate binary mask
   const mask = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .grayscale()
@@ -813,9 +910,25 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
     .jpeg({ quality: 90 })
     .toBuffer();
 
+  // === HYBRID STEP: Try OpenCV on mask first ===
+  const maskPanels = await detectPanelsFromMask(mask, imageBuffer, expectedCount);
+  
+  if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
+    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
+    return maskPanels;
+  }
+  
+  console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
+
+  // === FALLBACK: Claude Vision with dual-image ===
+  const client = getAnthropicClient();
+  if (!client) return [];
+
+  const scaleX = origW / imgW;
+  const scaleY = origH / imgH;
+
   console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} original + mask (expecting ~${expectedCount} panels)`);
 
-  // Send both images to Vision
   const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 2048,
