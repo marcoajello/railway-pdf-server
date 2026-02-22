@@ -11,6 +11,7 @@ import numpy as np
 import json
 import sys
 import base64
+import subprocess
 
 
 # ─── Phase 1: Border Detection Gate ────────────────────────────────────────
@@ -386,105 +387,70 @@ def crop_rectangles(image_path, rectangles):
 
 # ─── Phase 3: Mask-Based Detection (for Vision fallback replacement) ──────
 
-def detect_text_lines(mask_region, panel_w, panel_h):
+def erase_text_from_mask(img, mask_path):
     """
-    Detect text lines in a panel region using morphological analysis.
-    Text has a specific shape signature: horizontally connected, thin, wide.
+    Run tesseract OCR on the mask to find all text regions, then paint them
+    white (background) on the mask. Returns a cleaned mask with text erased.
 
-    Input: mask_region where 0=content(dark), 255=background(white)
-    Returns: list of (y_top, y_bottom) tuples for each detected text line,
-             sorted top-to-bottom.
+    The mask has black text on white background — ideal input for OCR.
+    After erasure, panel detection runs on a text-free mask, so detected
+    panel contours contain only artwork, never caption text.
     """
-    if mask_region.size == 0 or panel_h < 40 or panel_w < 40:
-        return []
+    try:
+        result = subprocess.run(
+            ['tesseract', mask_path, 'stdout', '--psm', '3', 'tsv'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            print(f"[OCR] Tesseract failed (code {result.returncode}): {result.stderr[:200]}",
+                  file=sys.stderr, flush=True)
+            return img
 
-    # Invert so content is white on black (standard for morphological ops)
-    content = cv2.bitwise_not(mask_region)
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 2:
+            print("[OCR] No text detected by tesseract", file=sys.stderr, flush=True)
+            return img
 
-    # Step 1: Horizontal closing to connect characters into text line blobs.
-    # Text characters are ~5-15px wide with ~3-8px gaps at 1400px resolution.
-    # A wide horizontal kernel bridges gaps between characters in the same line.
-    h_close_len = max(40, panel_w // 4)
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_close_len, 1))
-    connected = cv2.morphologyEx(content, cv2.MORPH_CLOSE, h_kernel)
+        cleaned = img.copy()
+        text_count = 0
+        pad = 3  # padding around each text box to catch anti-aliasing
 
-    # Step 2: Mild vertical closing to merge multi-line text blocks and
-    # connect descenders/ascenders within a single text line
-    v_close = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
-    connected = cv2.morphologyEx(connected, cv2.MORPH_CLOSE, v_close)
+        for line in lines[1:]:
+            fields = line.split('\t')
+            if len(fields) < 12:
+                continue
 
-    # Step 3: Find connected components and filter for text-shaped blobs
-    contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            try:
+                conf = float(fields[10])
+                text = fields[11].strip()
+            except (ValueError, IndexError):
+                continue
 
-    text_lines = []
-    max_text_height = min(35, int(panel_h * 0.12))  # text lines are thin
+            # Only erase regions tesseract is confident contain text
+            if conf < 30 or not text:
+                continue
 
-    for contour in contours:
-        bx, by, bw, bh = cv2.boundingRect(contour)
+            left = max(0, int(fields[6]) - pad)
+            top = max(0, int(fields[7]) - pad)
+            w = int(fields[8]) + pad * 2
+            h_box = int(fields[9]) + pad * 2
 
-        # Text line criteria:
-        # - Wide: spans a meaningful portion of panel width (>20%)
-        # - Short: thin vertically (<35px at 1400px, or <12% of panel height)
-        # - Aspect ratio: much wider than tall (>3:1)
-        is_wide = bw > panel_w * 0.2
-        is_short = bh <= max_text_height
-        is_text_aspect = (bw / bh if bh > 0 else 0) > 3.0
+            # Paint white (background = 255)
+            cleaned[top:top + h_box, left:left + w] = 255
+            text_count += 1
 
-        if is_wide and is_short and is_text_aspect:
-            text_lines.append((by, by + bh))
+        print(f"[OCR] Erased {text_count} text regions from mask",
+              file=sys.stderr, flush=True)
+        return cleaned
 
-    # Sort top-to-bottom
-    text_lines.sort(key=lambda t: t[0])
-    return text_lines
-
-
-def trim_caption_text(img_gray, rect):
-    """
-    Trim caption text from the bottom of a detected panel rectangle.
-    Uses morphological text detection: finds text-shaped blobs (wide, thin,
-    horizontally connected) and trims the panel above the topmost text line
-    in the lower portion of the panel.
-
-    This directly detects what we want to remove (text) rather than inferring
-    boundaries from whitespace gaps. Works for:
-    - Hand-drawn boards: pen strokes are NOT horizontally connected like text
-    - Photo boards: photo content is tall/irregular, not thin text lines
-    """
-    x, y, w, h = rect['x'], rect['y'], rect['width'], rect['height']
-
-    # img_gray is the original mask: 0=content(dark), 255=background(white)
-    region = img_gray[y:y+h, x:x+w]
-    if region.size == 0 or h < 60:
-        return rect
-
-    # Detect text lines within this panel
-    text_lines = detect_text_lines(region, w, h)
-
-    if not text_lines:
-        return rect
-
-    # Find the topmost text line in the lower portion of the panel (below 40%)
-    # This is where caption text starts — everything above is artwork
-    min_text_y = int(h * 0.4)
-    caption_lines = [(ty, tb) for ty, tb in text_lines if ty >= min_text_y]
-
-    if not caption_lines:
-        return rect
-
-    # Trim to just above the first caption text line
-    # Add a small margin (2px) above the text for clean separation
-    trim_y = max(min_text_y, caption_lines[0][0] - 2)
-
-    print(f"[Trim] rect at y={y}: text detected at row {caption_lines[0][0]}/{h}, "
-          f"trimming to {trim_y} ({len(caption_lines)} text line(s) excluded)",
-          file=sys.stderr, flush=True)
-
-    return {
-        'x': rect['x'], 'y': rect['y'],
-        'width': rect['width'], 'height': trim_y,
-        'area': rect.get('area', rect['width'] * trim_y),
-        'fill': rect.get('fill', 0.5)
-    }
+    except FileNotFoundError:
+        print("[OCR] Tesseract not installed — skipping text erasure",
+              file=sys.stderr, flush=True)
+        return img
+    except subprocess.TimeoutExpired:
+        print("[OCR] Tesseract timed out — skipping text erasure",
+              file=sys.stderr, flush=True)
+        return img
 
 
 def detect_from_projection_profile(img_gray, inverted, width, height, img_area, expected_count):
@@ -592,11 +558,12 @@ def detect_from_mask(mask_path, expected_count=0):
     Detect panels from a pre-thresholded binary mask image.
     The mask has black content on white background (as generated by sharp.threshold()).
 
-    Detection strategies tried in order:
+    Step 0: OCR text erasure — run tesseract on the mask to find text regions,
+            paint them white. All subsequent detection runs on a TEXT-FREE mask.
+
+    Then detection strategies tried in order:
     1. Projection profile — finds panel grid from row/column density profiles.
-       Works for photo boards where content is fragmented but rows are distinct.
-    2. Morphology strategies — vertical erosion to kill text, close to fill holes.
-       Works when panels are solid blobs (hand-drawn boards with clean masks).
+    2. Morphology strategies — vertical erosion to kill remaining noise, close holes.
     3. Light strategy — no erosion, for already-clean masks.
     """
     img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
@@ -606,15 +573,20 @@ def detect_from_mask(mask_path, expected_count=0):
     height, width = img.shape[:2]
     img_area = width * height
 
-    # Invert: white content on black background
-    inverted = cv2.bitwise_not(img)
+    # === Step 0: Erase text from mask using OCR ===
+    # The mask has black text on white background — ideal for tesseract.
+    # After erasure, only artwork remains. Panel detection is text-free.
+    cleaned = erase_text_from_mask(img, mask_path)
+
+    # Invert cleaned mask: white content on black background
+    inverted = cv2.bitwise_not(cleaned)
 
     best_candidates = []
     best_strategy = "none"
 
-    # === Strategy 0: Projection profile (grid geometry from density) ===
+    # === Strategy 1: Projection profile (grid geometry from density) ===
     # Try this first — it handles photo boards that morphology can't
-    proj_candidates = detect_from_projection_profile(img, inverted, width, height, img_area, expected_count)
+    proj_candidates = detect_from_projection_profile(cleaned, inverted, width, height, img_area, expected_count)
     if proj_candidates:
         min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
         if len(proj_candidates) >= min_needed:
@@ -622,21 +594,20 @@ def detect_from_mask(mask_path, expected_count=0):
             best_strategy = "projection"
             print(f"[Mask] Strategy 'projection': found {len(proj_candidates)} candidates (expected ~{expected_count})", file=sys.stderr, flush=True)
             if expected_count > 0 and len(proj_candidates) == expected_count:
-                # Perfect match — use it
-                best_candidates = [trim_caption_text(img, c) for c in best_candidates]
+                # Perfect match — use it (no trim needed, text already erased)
                 best_candidates = finalize_candidates(best_candidates, expected_count, height)
                 return best_candidates
 
-    # === Strategies 1-4: Morphology-based ===
+    # === Strategies 2-5: Morphology-based ===
     for strategy_name, erode_h, close_size, close_iter in [
-        ("erode-20", 20, 30, 3),    # kill text <=20px tall, aggressive close
+        ("erode-20", 20, 30, 3),    # kill remaining noise <=20px tall, aggressive close
         ("erode-15", 15, 25, 3),    # slightly less aggressive
         ("erode-12", 12, 20, 2),    # lighter still
-        ("light",     0,  5, 1),    # no text removal (for already-clean masks)
+        ("light",     0,  5, 1),    # no erosion (for already-clean masks)
     ]:
         working = inverted.copy()
 
-        # Step 1: Vertical erosion to kill text lines
+        # Step 1: Vertical erosion to kill thin noise
         if erode_h > 0:
             v_erode = np.ones((erode_h, 1), np.uint8)
             working = cv2.erode(working, v_erode, iterations=1)
@@ -649,7 +620,6 @@ def detect_from_mask(mask_path, expected_count=0):
             working = cv2.morphologyEx(working, cv2.MORPH_CLOSE, close_kernel, iterations=close_iter)
 
         # Step 3: Open to re-separate panels that may have merged
-        # Horizontal open separates columns, vertical open separates rows
         h_open = np.ones((1, 20), np.uint8)
         working = cv2.morphologyEx(working, cv2.MORPH_OPEN, h_open, iterations=1)
         v_open = np.ones((15, 1), np.uint8)
@@ -659,13 +629,11 @@ def detect_from_mask(mask_path, expected_count=0):
 
         print(f"[Mask] Strategy '{strategy_name}': found {len(candidates)} candidates (expected ~{expected_count})", file=sys.stderr, flush=True)
 
-        # Check if this is good enough
         min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
         if len(candidates) >= min_needed:
             if len(candidates) > len(best_candidates):
                 best_candidates = candidates
                 best_strategy = strategy_name
-            # If we hit exact count, stop trying
             if expected_count > 0 and len(candidates) == expected_count:
                 break
 
@@ -674,8 +642,7 @@ def detect_from_mask(mask_path, expected_count=0):
 
     print(f"[Mask] Using strategy '{best_strategy}' with {len(best_candidates)} panels", file=sys.stderr, flush=True)
 
-    # Trim caption text from each panel using the ORIGINAL mask
-    best_candidates = [trim_caption_text(img, c) for c in best_candidates]
+    # No trim_caption_text needed — text was erased from mask before detection
     best_candidates = finalize_candidates(best_candidates, expected_count, height)
 
     return best_candidates
