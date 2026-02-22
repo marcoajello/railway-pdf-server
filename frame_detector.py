@@ -388,58 +388,40 @@ def crop_rectangles(image_path, rectangles):
 
 # ─── Phase 3: Mask-Based Detection (for Vision fallback replacement) ──────
 
-def erase_text_from_mask(img, mask_path, original_path=None):
+def erase_text_from_mask(img, mask_path):
     """
-    Run tesseract OCR to find all text regions, then paint them
+    Run tesseract OCR on the mask to find all text regions, then paint them
     white (background) on the mask.
-
-    If original_path is provided, OCR runs on the ORIGINAL grayscale image
-    (much better for photo boards where photos merge with text on the binary
-    mask). The detected text boxes are then applied to erase from the mask.
 
     Returns: (cleaned_mask, text_boxes)
       - cleaned_mask: mask with text regions painted white
       - text_boxes: list of {x, y, w, h} dicts for every detected text region
-        (in mask pixel coordinates). These are returned even when panel detection
-        fails, so the Vision fallback can use them to trim its crops.
     """
     try:
-        # Run OCR on original image if available (better text detection on photo boards)
-        # Fall back to mask if no original provided
-        ocr_source = original_path if original_path and os.path.exists(original_path) else mask_path
-        ocr_label = 'original' if ocr_source == original_path else 'mask'
-        print(f"[OCR] Running tesseract on {ocr_label} image", file=sys.stderr, flush=True)
-
         result = subprocess.run(
-            ['tesseract', ocr_source, 'stdout', '--psm', '3', 'tsv'],
+            ['tesseract', mask_path, 'stdout', '--psm', '3', 'tsv'],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
-            print(f"[OCR] Tesseract failed (code {result.returncode}): {result.stderr[:200]}",
-                  file=sys.stderr, flush=True)
             return img, []
 
         lines = result.stdout.strip().split('\n')
         if len(lines) < 2:
-            print("[OCR] No text detected by tesseract", file=sys.stderr, flush=True)
             return img, []
 
         cleaned = img.copy()
         text_boxes = []
-        pad = 3  # padding around each text box to catch anti-aliasing
+        pad = 3
 
         for line in lines[1:]:
             fields = line.split('\t')
             if len(fields) < 12:
                 continue
-
             try:
                 conf = float(fields[10])
                 text = fields[11].strip()
             except (ValueError, IndexError):
                 continue
-
-            # Only erase regions tesseract is confident contain text
             if conf < 30 or not text:
                 continue
 
@@ -448,7 +430,6 @@ def erase_text_from_mask(img, mask_path, original_path=None):
             w = int(fields[8]) + pad * 2
             h_box = int(fields[9]) + pad * 2
 
-            # Paint white (background = 255)
             cleaned[top:top + h_box, left:left + w] = 255
             text_boxes.append({'x': left, 'y': top, 'w': w, 'h': h_box})
 
@@ -456,14 +437,83 @@ def erase_text_from_mask(img, mask_path, original_path=None):
               file=sys.stderr, flush=True)
         return cleaned, text_boxes
 
-    except FileNotFoundError:
-        print("[OCR] Tesseract not installed — skipping text erasure",
-              file=sys.stderr, flush=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return img, []
-    except subprocess.TimeoutExpired:
-        print("[OCR] Tesseract timed out — skipping text erasure",
+
+
+def erase_text_from_crop(image_path):
+    """
+    Erase caption text from a single cropped panel image.
+    Runs tesseract on the crop, finds text in the bottom 40%,
+    and paints those regions with the background color.
+
+    Returns base64-encoded JPEG of the cleaned image.
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    lower_threshold = int(h * 0.60)  # only erase text in bottom 40%
+
+    try:
+        result = subprocess.run(
+            ['tesseract', image_path, 'stdout', '--psm', '6', 'tsv'],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            return None
+
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 2:
+            return None
+
+        # Sample background color from edges of the image
+        # (average of top-left, top-right, bottom-left, bottom-right corners)
+        corners = []
+        for cy in [2, h - 3]:
+            for cx in [2, w - 3]:
+                corners.append(img[cy, cx].tolist())
+        bg_color = [int(np.median([c[ch] for c in corners])) for ch in range(3)]
+
+        pad = 4
+        erased = 0
+        for line in lines[1:]:
+            fields = line.split('\t')
+            if len(fields) < 12:
+                continue
+            try:
+                conf = float(fields[10])
+                text = fields[11].strip()
+            except (ValueError, IndexError):
+                continue
+            if conf < 30 or not text:
+                continue
+
+            top = int(fields[7])
+            if top < lower_threshold:
+                continue  # skip text in upper portion (part of the artwork)
+
+            left = max(0, int(fields[6]) - pad)
+            top = max(0, top - pad)
+            bw = int(fields[8]) + pad * 2
+            bh = int(fields[9]) + pad * 2
+
+            img[top:top + bh, left:left + bw] = bg_color
+            erased += 1
+
+        if erased == 0:
+            return None  # no changes made
+
+        print(f"[OCR-crop] Erased {erased} text regions from panel crop",
               file=sys.stderr, flush=True)
-        return img, []
+
+        # Encode as JPEG and return base64
+        _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf).decode('ascii')
+
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
 
 
 def detect_from_projection_profile(img_gray, inverted, width, height, img_area, expected_count):
@@ -566,16 +616,13 @@ def detect_from_projection_profile(img_gray, inverted, width, height, img_area, 
     return all_panels
 
 
-def detect_from_mask(mask_path, expected_count=0, original_path=None):
+def detect_from_mask(mask_path, expected_count=0):
     """
     Detect panels from a pre-thresholded binary mask image.
     The mask has black content on white background (as generated by sharp.threshold()).
 
-    Step 0: OCR text erasure — run tesseract to find text regions,
-            paint them white on the mask. All subsequent detection runs on a TEXT-FREE mask.
-
-    If original_path is provided, OCR runs on the original grayscale image
-    (much better accuracy for photo boards).
+    Step 0: OCR text erasure — run tesseract on the mask to find text regions,
+            paint them white. All subsequent detection runs on a TEXT-FREE mask.
 
     Then detection strategies tried in order:
     1. Projection profile — finds panel grid from row/column density profiles.
@@ -590,10 +637,9 @@ def detect_from_mask(mask_path, expected_count=0, original_path=None):
     img_area = width * height
 
     # === Step 0: Erase text from mask using OCR ===
-    # If original_path is available, OCR runs on that (better for photo boards
-    # where photos merge with text on the binary mask).
-    # text_boxes are preserved so Vision fallback can use them for trimming.
-    cleaned, text_boxes = erase_text_from_mask(img, mask_path, original_path)
+    # The mask has black text on white background — tesseract finds it well.
+    # text_boxes are preserved for reference.
+    cleaned, text_boxes = erase_text_from_mask(img, mask_path)
 
     # Invert cleaned mask: white content on black background
     inverted = cv2.bitwise_not(cleaned)
@@ -769,15 +815,21 @@ if __name__ == '__main__':
     mode_arg = sys.argv[2] if len(sys.argv) > 2 else 'crop'
     
     try:
-        if mode_arg == 'mask':
+        if mode_arg == 'erase_text':
+            # Erase text mode: run OCR on a single cropped panel image,
+            # find text in the bottom 40%, paint it with background color.
+            # Returns base64 JPEG of cleaned image, or null if no text found.
+            cleaned_b64 = erase_text_from_crop(image_path)
+            result = {'cleaned': cleaned_b64}
+            print(json.dumps(result))
+
+        elif mode_arg == 'mask':
             # Mask mode: detect panels from pre-thresholded mask image
             # argv[3] = expected count (optional)
-            # argv[4] = original grayscale image path for OCR (optional)
             # Returns rectangles only — Node handles full-res cropping
             expected = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-            orig_path = sys.argv[4] if len(sys.argv) > 4 else None
 
-            rects, ocr_text_boxes = detect_from_mask(image_path, expected, orig_path)
+            rects, ocr_text_boxes = detect_from_mask(image_path, expected)
             result = {
                 'count': len(rects),
                 'mode': 'mask',

@@ -722,21 +722,12 @@ RULES:
  * Detect panels from a pre-thresholded mask using OpenCV contour detection.
  * Returns array of base64 images cropped from the ORIGINAL full-res image, or null if detection fails.
  */
-async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount, grayscaleBuffer) {
+async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount) {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mask-'));
   const maskPath = path.join(tmpDir, 'mask.jpg');
 
   try {
     await fs.writeFile(maskPath, maskBuffer);
-
-    // Save grayscale original for OCR (tesseract works much better on the
-    // actual image than on the binary mask, especially for photo boards where
-    // photos merge with caption text on the mask)
-    let grayscalePath = null;
-    if (grayscaleBuffer) {
-      grayscalePath = path.join(tmpDir, 'grayscale.jpg');
-      await fs.writeFile(grayscalePath, grayscaleBuffer);
-    }
 
     // Get mask dimensions for coordinate scaling
     const maskMeta = await sharp(maskBuffer).metadata();
@@ -747,10 +738,7 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
     // Run Python — just get rectangles, no cropping
     const result = await new Promise((resolve) => {
       const script = path.join(__dirname, 'frame_detector.py');
-      // Don't pass 'crop' — we'll crop in Node from full-res
-      // argv[4] = grayscale original for OCR text detection
       const args = [script, maskPath, 'mask', String(expectedCount)];
-      if (grayscalePath) args.push(grayscalePath);
       
       const tryPython = (cmd) => {
         const proc = spawn(cmd, args);
@@ -790,19 +778,11 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
     });
     
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-    
-    // Capture OCR text boxes regardless of panel detection success
-    const textBoxes = result?.textBoxes || [];
-    if (textBoxes.length > 0) {
-      console.log(`[Storyboard] Mask-OpenCV: received ${textBoxes.length} OCR text boxes`);
-    }
 
-    if (!result || !result.rectangles || result.count < 1) {
-      return { images: null, textBoxes };
-    }
+    if (!result || !result.rectangles || result.count < 1) return null;
 
     console.log(`[Storyboard] Mask-OpenCV: found ${result.count} panels`);
-    
+
     // Crop from full-resolution original with scaled coordinates
     const images = [];
     for (const rect of result.rectangles) {
@@ -811,24 +791,24 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
         const y = Math.max(0, Math.round(rect.y * scaleY));
         const w = Math.min(Math.round(rect.width * scaleX), origMeta.width - x);
         const h = Math.min(Math.round(rect.height * scaleY), origMeta.height - y);
-        
+
         if (w < 20 || h < 20) {
           images.push(null);
           continue;
         }
-        
+
         // 3px inset at original scale to trim border edges
         const inset = Math.round(3 * scaleX);
         const cropped = await sharp(originalImageBuffer)
-          .extract({ 
-            left: x + inset, 
-            top: y + inset, 
-            width: Math.max(10, w - inset * 2), 
-            height: Math.max(10, h - inset * 2) 
+          .extract({
+            left: x + inset,
+            top: y + inset,
+            width: Math.max(10, w - inset * 2),
+            height: Math.max(10, h - inset * 2)
           })
           .jpeg({ quality: 85 })
           .toBuffer();
-        
+
         images.push(cropped.toString('base64'));
       } catch (e) {
         console.error('[Storyboard] Mask-OpenCV crop error:', e.message);
@@ -836,12 +816,12 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
       }
     }
 
-    return { images, textBoxes };
+    return images;
 
   } catch (e) {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     console.error('[Storyboard] Mask-OpenCV error:', e.message);
-    return { images: null, textBoxes: [] };
+    return null;
   }
 }
 
@@ -922,14 +902,6 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   
   console.log(`[Storyboard] Vision: detected background=${bgValue}, using threshold=${dynamicThreshold}`);
 
-  // Generate grayscale (for OCR — tesseract works much better on the actual
-  // image than on the binary mask, especially for photo boards)
-  const grayscale = await sharp(imageBuffer)
-    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
-    .grayscale()
-    .jpeg({ quality: 90 })
-    .toBuffer();
-
   // Generate binary mask
   const mask = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
@@ -939,9 +911,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
     .toBuffer();
 
   // === HYBRID STEP: Try OpenCV on mask first ===
-  const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount, grayscale);
-  const maskPanels = maskResult?.images;
-  const ocrTextBoxes = maskResult?.textBoxes || [];
+  const maskPanels = await detectPanelsFromMask(mask, imageBuffer, expectedCount);
 
   if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
     console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
@@ -1017,43 +987,10 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
 
   console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
 
-  // === Apply OCR text-box trimming to Vision panels ===
-  // Text boxes are in mask coordinates (1400px space), same as Vision panel coordinates
-  if (ocrTextBoxes.length > 0) {
-    console.log(`[Storyboard] Vision: applying OCR text trimming with ${ocrTextBoxes.length} text boxes`);
-    for (let i = 0; i < panels.length; i++) {
-      const p = panels[i];
-      const panelBottom = p.y + p.h;
-      const panelRight = p.x + p.w;
-      // Only consider text boxes in the lower 50% of the panel that overlap horizontally
-      const lowerThreshold = p.y + p.h * 0.5;
-
-      // Find text boxes that fall within this panel's lower region
-      const captionBoxes = ocrTextBoxes.filter(tb => {
-        const tbCenterX = tb.x + tb.w / 2;
-        const tbTop = tb.y;
-        return tbTop >= lowerThreshold &&
-               tbTop < panelBottom + 10 &&  // allow slight overflow
-               tbCenterX >= p.x &&
-               tbCenterX <= panelRight;
-      });
-
-      if (captionBoxes.length > 0) {
-        // Trim panel height to just above the topmost caption text
-        const topMostTextY = Math.min(...captionBoxes.map(tb => tb.y));
-        const trimPad = 4; // small padding above text
-        const newH = Math.max(p.h * 0.4, topMostTextY - p.y - trimPad); // never trim more than 60%
-        if (newH < p.h) {
-          console.log(`[Storyboard] Vision: panel ${i + 1} trimmed from h=${p.h} to h=${Math.round(newH)} (removed ${captionBoxes.length} caption text regions)`);
-          panels[i].h = Math.round(newH);
-        }
-      }
-    }
-  }
-
-  // Crop from original resolution image
+  // Crop from original resolution image, then erase caption text from each crop
   const images = [];
-  for (const p of panels) {
+  for (let i = 0; i < panels.length; i++) {
+    const p = panels[i];
     try {
       const x = Math.max(0, Math.round(p.x * scaleX));
       const y = Math.max(0, Math.round(p.y * scaleY));
@@ -1070,7 +1007,10 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         .jpeg({ quality: 85 })
         .toBuffer();
 
-      images.push(cropped.toString('base64'));
+      // Run per-panel OCR text erasure: find text in the bottom 40% of this
+      // individual crop and paint it with the background color
+      const cleaned = await eraseTextFromCrop(cropped, i + 1);
+      images.push(cleaned || cropped.toString('base64'));
     } catch (e) {
       console.error(`[Storyboard] Vision: crop error for panel:`, e.message);
       images.push(null);
@@ -1078,6 +1018,67 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
   }
 
   return images;
+}
+
+/**
+ * Erase caption text from a single cropped panel image.
+ * Calls frame_detector.py in erase_text mode — it runs tesseract on the crop,
+ * finds text in the bottom 40%, and paints it with the background color.
+ * Returns base64 JPEG of cleaned image, or null if no text found / error.
+ */
+async function eraseTextFromCrop(croppedBuffer, panelNum) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocr-'));
+  const cropPath = path.join(tmpDir, 'crop.jpg');
+
+  try {
+    await fs.writeFile(cropPath, croppedBuffer);
+
+    const result = await new Promise((resolve) => {
+      const script = path.join(__dirname, 'frame_detector.py');
+      const args = [script, cropPath, 'erase_text'];
+
+      const tryPython = (cmd) => {
+        const proc = spawn(cmd, args);
+        let stdout = '';
+        let stderr = '';
+
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+
+        proc.on('close', code => {
+          if (stderr) console.log(`[Storyboard] OCR-crop panel ${panelNum}: ${stderr.trim()}`);
+          if (code !== 0) {
+            if (cmd === 'python3') { tryPython('python'); return; }
+            resolve(null);
+            return;
+          }
+          try {
+            resolve(JSON.parse(stdout));
+          } catch (e) {
+            resolve(null);
+          }
+        });
+
+        proc.on('error', () => {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(null);
+        });
+      };
+
+      tryPython('python3');
+    });
+
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+
+    if (result?.cleaned) {
+      return result.cleaned;
+    }
+    return null;
+
+  } catch (e) {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    return null;
+  }
 }
 
 function groupIntoShots(frames) {
