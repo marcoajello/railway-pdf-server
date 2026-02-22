@@ -747,11 +747,69 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
 
-  // Generate binary mask (threshold at 240: anything darker than near-white becomes black)
+  // Detect background color dynamically by sampling at multiple depths from edge
+  const grayBuf = await sharp(imageBuffer)
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  
+  const grayData = grayBuf.data;
+  const gW = grayBuf.info.width;
+  const gH = grayBuf.info.height;
+  
+  // Sample pixels at 0%, 5%, 10%, 15% depth from each edge
+  const perimeterValues = [];
+  for (const depthPct of [0, 5, 10, 15]) {
+    const offX = Math.round(gW * depthPct / 100);
+    const offY = Math.round(gH * depthPct / 100);
+    for (let x = offX; x < gW - offX; x += 5) {
+      perimeterValues.push(grayData[offY * gW + x]);
+      perimeterValues.push(grayData[(gH - 1 - offY) * gW + x]);
+    }
+    for (let y = offY; y < gH - offY; y += 5) {
+      perimeterValues.push(grayData[y * gW + offX]);
+      perimeterValues.push(grayData[y * gW + (gW - 1 - offX)]);
+    }
+  }
+  
+  // Bucket into groups of 5, find background color
+  const buckets = {};
+  for (const v of perimeterValues) {
+    if (v < 150) continue; // skip dark pixels (photo/text content)
+    const bucket = Math.round(v / 5) * 5;
+    buckets[bucket] = (buckets[bucket] || 0) + 1;
+  }
+  const sortedBuckets = Object.entries(buckets).sort((a, b) => b[1] - a[1]);
+  
+  // If dominant is pure white (>=250) but there's a secondary light color, use that
+  // This catches beige/cream/gray backgrounds inside white page margins
+  let bgValue = 245; // fallback
+  if (sortedBuckets.length > 0) {
+    const topValue = parseInt(sortedBuckets[0][0]);
+    const topCount = sortedBuckets[0][1];
+    if (topValue >= 250 && sortedBuckets.length > 1) {
+      const secondValue = parseInt(sortedBuckets[1][0]);
+      const secondCount = sortedBuckets[1][1];
+      // Use secondary if it has meaningful representation (>10% of top)
+      if (secondValue >= 150 && secondCount > topCount * 0.1) {
+        bgValue = secondValue;
+      } else {
+        bgValue = topValue;
+      }
+    } else {
+      bgValue = topValue;
+    }
+  }
+  const dynamicThreshold = Math.max(100, bgValue - 15);
+  
+  console.log(`[Storyboard] Vision: detected background=${bgValue}, using threshold=${dynamicThreshold}`);
+
+  // Generate binary mask using detected threshold
   const mask = await sharp(imageBuffer)
     .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .grayscale()
-    .threshold(240)
+    .threshold(dynamicThreshold)
     .jpeg({ quality: 90 })
     .toBuffer();
 
