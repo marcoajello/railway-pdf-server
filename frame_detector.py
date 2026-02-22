@@ -389,83 +389,191 @@ def crop_rectangles(image_path, rectangles):
 def trim_caption_text(img_gray, rect):
     """
     Trim caption text from the bottom of a detected panel rectangle.
-    Scans vertical density profile to find where dense panel content 
-    ends and sparse text lines begin.
+    Uses whitespace-band detection: scans bottom-up for a full-width horizontal
+    strip of near-zero dark pixel density (the gap between drawing and caption).
+    This works regardless of whether the panel content is dense (photos) or
+    sparse (hand-drawn lines) because the gap is a structural feature of
+    every storyboard layout.
     """
     x, y, w, h = rect['x'], rect['y'], rect['width'], rect['height']
-    
-    # Extract the region from the inverted mask (white = content, black = background)
-    region = img_gray[y:y+h, x:x+w]
-    if region.size == 0 or h < 40:
-        return rect
-    
-    # Calculate row-by-row density (fraction of dark pixels in original = content)
+
     # img_gray is the original mask: 0=content(dark), 255=background(white)
-    # So density = fraction of pixels < 128 per row
-    row_density = []
-    for row_idx in range(h):
-        row = region[row_idx, :]
-        dark_fraction = np.sum(row < 128) / w
-        row_density.append(dark_fraction)
-    
-    if not row_density:
+    region = img_gray[y:y+h, x:x+w]
+    if region.size == 0 or h < 60:
         return rect
-    
-    # Smooth the density signal to avoid noise
-    kernel_size = max(3, h // 30)
+
+    # Calculate row-by-row density (fraction of dark/content pixels per row)
+    row_density = np.sum(region < 128, axis=1) / w
+
+    # Smooth lightly to reduce single-pixel noise but preserve real gaps
+    kernel_size = max(3, h // 50)
     if kernel_size % 2 == 0:
         kernel_size += 1
     smoothed = np.convolve(row_density, np.ones(kernel_size) / kernel_size, mode='same')
-    
-    # Find the main content block: scan from top, find where sustained density drops
-    # Text lines have density ~0.05-0.15, panel content has density ~0.3+
-    # Look for a sustained drop from the bottom up
-    
-    # Start from bottom, find first row with substantial content going upward
-    content_threshold = 0.08  # below this = mostly empty (gap between text lines or blank)
-    text_density_max = 0.20   # text lines are thin, rarely exceed this
-    
-    # Scan from bottom up to find the text region
-    bottom_trim = h  # default: no trim
-    
-    # Check if bottom 30% has notably lower density than top 70%
-    split_point = int(h * 0.7)
-    if split_point > 20 and (h - split_point) > 15:
-        top_avg = np.mean(smoothed[:split_point])
-        bottom_avg = np.mean(smoothed[split_point:])
-        
-        if top_avg > 0.15 and bottom_avg < top_avg * 0.5:
-            # Bottom region is significantly less dense — likely text
-            # Find the exact transition: scan downward from split region
-            search_start = max(int(h * 0.5), 20)
+
+    # Strategy: scan bottom-up looking for a whitespace band (consecutive rows
+    # with very low density spanning the full width). This band separates the
+    # panel artwork above from caption text below.
+    #
+    # On every storyboard, there's a visible gap between the drawing area and
+    # the text caption — typically 3-15px of near-empty rows.
+
+    gap_threshold = 0.02  # rows with <= 2% dark pixels are "whitespace"
+    min_gap_rows = 3      # need at least 3 consecutive whitespace rows
+
+    # Don't look in the top 40% — the gap is always in the lower portion
+    search_top = int(h * 0.4)
+
+    # Scan bottom-up to find the LOWEST whitespace band
+    # (this is the drawing/text boundary, not internal whitespace in the drawing)
+    best_gap_top = None
+    gap_count = 0
+
+    for row_idx in range(h - 1, search_top - 1, -1):
+        if smoothed[row_idx] <= gap_threshold:
+            gap_count += 1
+        else:
+            if gap_count >= min_gap_rows:
+                # Found a whitespace band; its top edge is where we trim
+                best_gap_top = row_idx + 1
+                break
             gap_count = 0
-            for row_idx in range(search_start, h):
-                if smoothed[row_idx] < content_threshold:
-                    gap_count += 1
-                    if gap_count >= 5:  # sustained gap = panel ended
-                        bottom_trim = row_idx - gap_count + 1
-                        break
-                else:
-                    gap_count = 0
-    
-    if bottom_trim < h and bottom_trim > h * 0.4:
+
+    # Edge case: gap extends to or near search_top
+    if gap_count >= min_gap_rows and best_gap_top is None:
+        best_gap_top = search_top
+
+    if best_gap_top is not None and best_gap_top > h * 0.4:
+        # Verify there's actual content (text) below the gap — if not, this
+        # might be trailing whitespace and trimming is still fine
+        below_density = np.mean(smoothed[best_gap_top:]) if best_gap_top < h else 0
+
+        # Only trim if: there IS text below, OR we're trimming trailing whitespace
+        # (both are desirable — we want just the drawing)
+        print(f"[Trim] rect at y={y}: gap found at row {best_gap_top}/{h}, "
+              f"below_density={below_density:.3f}", file=sys.stderr, flush=True)
+
         return {
             'x': rect['x'], 'y': rect['y'],
-            'width': rect['width'], 'height': bottom_trim,
-            'area': rect.get('area', rect['width'] * bottom_trim),
+            'width': rect['width'], 'height': best_gap_top,
+            'area': rect.get('area', rect['width'] * best_gap_top),
             'fill': rect.get('fill', 0.5)
         }
-    
+
     return rect
+
+
+def detect_from_projection_profile(img_gray, inverted, width, height, img_area, expected_count):
+    """
+    Detect panels using horizontal and vertical projection profiles.
+    Works for photo boards where morphology fails because photos become
+    fragmented "Swiss cheese" in the binary mask.
+
+    Approach:
+    1. Compute horizontal projection (row sums) to find row boundaries
+       — rows of panels are separated by whitespace bands (which contain text)
+    2. Within each row, compute vertical projection to find column boundaries
+    3. Build panel rectangles from the grid intersections
+
+    This works because even fragmented photo content has significantly more
+    dark pixels per row than the gap/text rows between panel rows.
+    """
+    # Horizontal projection: sum of white pixels per row (inverted = white=content)
+    h_proj = np.sum(inverted > 128, axis=1).astype(float) / width
+
+    # Smooth to find broad row bands
+    smooth_k = max(5, height // 60)
+    if smooth_k % 2 == 0:
+        smooth_k += 1
+    h_smooth = np.convolve(h_proj, np.ones(smooth_k) / smooth_k, mode='same')
+
+    # Find horizontal gap bands: rows where content density drops significantly
+    # These gaps contain text captions between panel rows
+    gap_threshold = 0.10  # rows with <10% content are gaps
+    min_gap_height = max(5, height // 80)
+    min_content_height = height // 12
+
+    # Identify content rows vs gap rows
+    is_content = h_smooth > gap_threshold
+
+    # Find content bands (runs of content rows)
+    content_bands = []
+    in_band = False
+    band_start = 0
+    for i in range(height):
+        if is_content[i] and not in_band:
+            band_start = i
+            in_band = True
+        elif not is_content[i] and in_band:
+            if i - band_start >= min_content_height:
+                content_bands.append((band_start, i))
+            in_band = False
+    if in_band and height - band_start >= min_content_height:
+        content_bands.append((band_start, height))
+
+    if len(content_bands) < 1:
+        return []
+
+    print(f"[Projection] Found {len(content_bands)} content rows", file=sys.stderr, flush=True)
+
+    # For each content band, find column boundaries using vertical projection
+    all_panels = []
+    for band_top, band_bottom in content_bands:
+        band_slice = inverted[band_top:band_bottom, :]
+        v_proj = np.sum(band_slice > 128, axis=0).astype(float) / (band_bottom - band_top)
+
+        # Smooth vertically
+        v_smooth_k = max(5, width // 60)
+        if v_smooth_k % 2 == 0:
+            v_smooth_k += 1
+        v_smooth = np.convolve(v_proj, np.ones(v_smooth_k) / v_smooth_k, mode='same')
+
+        # Find vertical gaps (columns between panels)
+        v_gap_threshold = 0.08
+        min_v_gap = max(5, width // 100)
+        min_panel_width = width // 12
+
+        is_panel_col = v_smooth > v_gap_threshold
+
+        # Find panel column spans
+        panels_in_row = []
+        in_panel = False
+        panel_start = 0
+        for col in range(width):
+            if is_panel_col[col] and not in_panel:
+                panel_start = col
+                in_panel = True
+            elif not is_panel_col[col] and in_panel:
+                if col - panel_start >= min_panel_width:
+                    panels_in_row.append((panel_start, col))
+                in_panel = False
+        if in_panel and width - panel_start >= min_panel_width:
+            panels_in_row.append((panel_start, width))
+
+        for col_left, col_right in panels_in_row:
+            all_panels.append({
+                'x': int(col_left), 'y': int(band_top),
+                'width': int(col_right - col_left),
+                'height': int(band_bottom - band_top),
+                'area': float((col_right - col_left) * (band_bottom - band_top)),
+                'fill': 0.5
+            })
+
+    print(f"[Projection] Found {len(all_panels)} panels total", file=sys.stderr, flush=True)
+    return all_panels
 
 
 def detect_from_mask(mask_path, expected_count=0):
     """
     Detect panels from a pre-thresholded binary mask image.
     The mask has black content on white background (as generated by sharp.threshold()).
-    
-    Core insight: text lines are THIN (~8-12px tall at 1400px), photos are TALL (200+px).
-    Vertical erosion destroys text while preserving photo content.
+
+    Detection strategies tried in order:
+    1. Projection profile — finds panel grid from row/column density profiles.
+       Works for photo boards where content is fragmented but rows are distinct.
+    2. Morphology strategies — vertical erosion to kill text, close to fill holes.
+       Works when panels are solid blobs (hand-drawn boards with clean masks).
+    3. Light strategy — no erosion, for already-clean masks.
     """
     img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -473,13 +581,29 @@ def detect_from_mask(mask_path, expected_count=0):
 
     height, width = img.shape[:2]
     img_area = width * height
-    
+
     # Invert: white content on black background
     inverted = cv2.bitwise_not(img)
-    
+
     best_candidates = []
     best_strategy = "none"
-    
+
+    # === Strategy 0: Projection profile (grid geometry from density) ===
+    # Try this first — it handles photo boards that morphology can't
+    proj_candidates = detect_from_projection_profile(img, inverted, width, height, img_area, expected_count)
+    if proj_candidates:
+        min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
+        if len(proj_candidates) >= min_needed:
+            best_candidates = proj_candidates
+            best_strategy = "projection"
+            print(f"[Mask] Strategy 'projection': found {len(proj_candidates)} candidates (expected ~{expected_count})", file=sys.stderr, flush=True)
+            if expected_count > 0 and len(proj_candidates) == expected_count:
+                # Perfect match — use it
+                best_candidates = [trim_caption_text(img, c) for c in best_candidates]
+                best_candidates = finalize_candidates(best_candidates, expected_count, height)
+                return best_candidates
+
+    # === Strategies 1-4: Morphology-based ===
     for strategy_name, erode_h, close_size, close_iter in [
         ("erode-20", 20, 30, 3),    # kill text <=20px tall, aggressive close
         ("erode-15", 15, 25, 3),    # slightly less aggressive
@@ -487,30 +611,30 @@ def detect_from_mask(mask_path, expected_count=0):
         ("light",     0,  5, 1),    # no text removal (for already-clean masks)
     ]:
         working = inverted.copy()
-        
+
         # Step 1: Vertical erosion to kill text lines
         if erode_h > 0:
             v_erode = np.ones((erode_h, 1), np.uint8)
             working = cv2.erode(working, v_erode, iterations=1)
             # Dilate back to restore vertical extent
             working = cv2.dilate(working, v_erode, iterations=1)
-        
+
         # Step 2: Close to fill holes inside photos
         if close_size > 0:
             close_kernel = np.ones((close_size, close_size), np.uint8)
             working = cv2.morphologyEx(working, cv2.MORPH_CLOSE, close_kernel, iterations=close_iter)
-        
+
         # Step 3: Open to re-separate panels that may have merged
         # Horizontal open separates columns, vertical open separates rows
         h_open = np.ones((1, 20), np.uint8)
         working = cv2.morphologyEx(working, cv2.MORPH_OPEN, h_open, iterations=1)
         v_open = np.ones((15, 1), np.uint8)
         working = cv2.morphologyEx(working, cv2.MORPH_OPEN, v_open, iterations=1)
-        
+
         candidates = find_panel_contours(working, width, height, img_area, expected_count)
-        
+
         print(f"[Mask] Strategy '{strategy_name}': found {len(candidates)} candidates (expected ~{expected_count})", file=sys.stderr, flush=True)
-        
+
         # Check if this is good enough
         min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
         if len(candidates) >= min_needed:
@@ -520,16 +644,16 @@ def detect_from_mask(mask_path, expected_count=0):
             # If we hit exact count, stop trying
             if expected_count > 0 and len(candidates) == expected_count:
                 break
-    
+
     if not best_candidates:
         return []
-    
+
     print(f"[Mask] Using strategy '{best_strategy}' with {len(best_candidates)} panels", file=sys.stderr, flush=True)
-    
+
     # Trim caption text from each panel using the ORIGINAL mask
     best_candidates = [trim_caption_text(img, c) for c in best_candidates]
     best_candidates = finalize_candidates(best_candidates, expected_count, height)
-    
+
     return best_candidates
 
 
