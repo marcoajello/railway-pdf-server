@@ -1282,20 +1282,21 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           let detected = { count: 0, bordered: false, mode: 'none', images: [] };
           
           if (textFrameCount >= 1) {
-            // Step 1: Try OpenCV (fast, pixel-perfect for bordered storyboards)
+            // Step 1: Try OpenCV (pixel-perfect for bordered/hand-drawn storyboards)
             try {
               const cvResult = await detectRectangles(imgPath);
-              if (cvResult.mode === 'grid' || cvResult.mode === 'content') {
-                if (cvResult.count >= 1 && cvResult.images && cvResult.images.length >= 1) {
-                  // Trust OpenCV only if it found at least 70% of expected panels
-                  const expectedMin = Math.max(1, Math.floor(textFrameCount * 0.7));
-                  if (cvResult.count >= expectedMin) {
-                    detected = cvResult;
-                    console.log(`[Storyboard] Page ${pageNum}: OpenCV ${cvResult.mode} found ${cvResult.count} panels (expected ~${textFrameCount})`);
-                  } else {
-                    console.log(`[Storyboard] Page ${pageNum}: OpenCV ${cvResult.mode} found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
-                  }
+              // Only trust grid mode (bordered boards like hand-drawn storyboards)
+              // Content mode crops are imprecise — Vision does better on borderless pages
+              if (cvResult.mode === 'grid') {
+                const expectedMin = Math.max(1, Math.floor(textFrameCount * 0.7));
+                if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
+                  detected = cvResult;
+                  console.log(`[Storyboard] Page ${pageNum}: OpenCV grid found ${cvResult.count} panels (expected ~${textFrameCount})`);
+                } else {
+                  console.log(`[Storyboard] Page ${pageNum}: OpenCV grid found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
                 }
+              } else {
+                console.log(`[Storyboard] Page ${pageNum}: OpenCV mode=${cvResult.mode} — using Vision for better accuracy`);
               }
             } catch (e) {
               console.error(`[Storyboard] Page ${pageNum}: OpenCV error:`, e.message);
