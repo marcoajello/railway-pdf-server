@@ -386,14 +386,69 @@ def crop_rectangles(image_path, rectangles):
 
 # ─── Phase 3: Mask-Based Detection (for Vision fallback replacement) ──────
 
+def detect_text_lines(mask_region, panel_w, panel_h):
+    """
+    Detect text lines in a panel region using morphological analysis.
+    Text has a specific shape signature: horizontally connected, thin, wide.
+
+    Input: mask_region where 0=content(dark), 255=background(white)
+    Returns: list of (y_top, y_bottom) tuples for each detected text line,
+             sorted top-to-bottom.
+    """
+    if mask_region.size == 0 or panel_h < 40 or panel_w < 40:
+        return []
+
+    # Invert so content is white on black (standard for morphological ops)
+    content = cv2.bitwise_not(mask_region)
+
+    # Step 1: Horizontal closing to connect characters into text line blobs.
+    # Text characters are ~5-15px wide with ~3-8px gaps at 1400px resolution.
+    # A wide horizontal kernel bridges gaps between characters in the same line.
+    h_close_len = max(40, panel_w // 4)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_close_len, 1))
+    connected = cv2.morphologyEx(content, cv2.MORPH_CLOSE, h_kernel)
+
+    # Step 2: Mild vertical closing to merge multi-line text blocks and
+    # connect descenders/ascenders within a single text line
+    v_close = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    connected = cv2.morphologyEx(connected, cv2.MORPH_CLOSE, v_close)
+
+    # Step 3: Find connected components and filter for text-shaped blobs
+    contours, _ = cv2.findContours(connected, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    text_lines = []
+    max_text_height = min(35, int(panel_h * 0.12))  # text lines are thin
+
+    for contour in contours:
+        bx, by, bw, bh = cv2.boundingRect(contour)
+
+        # Text line criteria:
+        # - Wide: spans a meaningful portion of panel width (>20%)
+        # - Short: thin vertically (<35px at 1400px, or <12% of panel height)
+        # - Aspect ratio: much wider than tall (>3:1)
+        is_wide = bw > panel_w * 0.2
+        is_short = bh <= max_text_height
+        is_text_aspect = (bw / bh if bh > 0 else 0) > 3.0
+
+        if is_wide and is_short and is_text_aspect:
+            text_lines.append((by, by + bh))
+
+    # Sort top-to-bottom
+    text_lines.sort(key=lambda t: t[0])
+    return text_lines
+
+
 def trim_caption_text(img_gray, rect):
     """
     Trim caption text from the bottom of a detected panel rectangle.
-    Uses whitespace-band detection: scans bottom-up for a full-width horizontal
-    strip of near-zero dark pixel density (the gap between drawing and caption).
-    This works regardless of whether the panel content is dense (photos) or
-    sparse (hand-drawn lines) because the gap is a structural feature of
-    every storyboard layout.
+    Uses morphological text detection: finds text-shaped blobs (wide, thin,
+    horizontally connected) and trims the panel above the topmost text line
+    in the lower portion of the panel.
+
+    This directly detects what we want to remove (text) rather than inferring
+    boundaries from whitespace gaps. Works for:
+    - Hand-drawn boards: pen strokes are NOT horizontally connected like text
+    - Photo boards: photo content is tall/irregular, not thin text lines
     """
     x, y, w, h = rect['x'], rect['y'], rect['width'], rect['height']
 
@@ -402,65 +457,34 @@ def trim_caption_text(img_gray, rect):
     if region.size == 0 or h < 60:
         return rect
 
-    # Calculate row-by-row density (fraction of dark/content pixels per row)
-    row_density = np.sum(region < 128, axis=1) / w
+    # Detect text lines within this panel
+    text_lines = detect_text_lines(region, w, h)
 
-    # Smooth lightly to reduce single-pixel noise but preserve real gaps
-    kernel_size = max(3, h // 50)
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    smoothed = np.convolve(row_density, np.ones(kernel_size) / kernel_size, mode='same')
+    if not text_lines:
+        return rect
 
-    # Strategy: scan bottom-up looking for a whitespace band (consecutive rows
-    # with very low density spanning the full width). This band separates the
-    # panel artwork above from caption text below.
-    #
-    # On every storyboard, there's a visible gap between the drawing area and
-    # the text caption — typically 3-15px of near-empty rows.
+    # Find the topmost text line in the lower portion of the panel (below 40%)
+    # This is where caption text starts — everything above is artwork
+    min_text_y = int(h * 0.4)
+    caption_lines = [(ty, tb) for ty, tb in text_lines if ty >= min_text_y]
 
-    gap_threshold = 0.02  # rows with <= 2% dark pixels are "whitespace"
-    min_gap_rows = 3      # need at least 3 consecutive whitespace rows
+    if not caption_lines:
+        return rect
 
-    # Don't look in the top 40% — the gap is always in the lower portion
-    search_top = int(h * 0.4)
+    # Trim to just above the first caption text line
+    # Add a small margin (2px) above the text for clean separation
+    trim_y = max(min_text_y, caption_lines[0][0] - 2)
 
-    # Scan bottom-up to find the LOWEST whitespace band
-    # (this is the drawing/text boundary, not internal whitespace in the drawing)
-    best_gap_top = None
-    gap_count = 0
+    print(f"[Trim] rect at y={y}: text detected at row {caption_lines[0][0]}/{h}, "
+          f"trimming to {trim_y} ({len(caption_lines)} text line(s) excluded)",
+          file=sys.stderr, flush=True)
 
-    for row_idx in range(h - 1, search_top - 1, -1):
-        if smoothed[row_idx] <= gap_threshold:
-            gap_count += 1
-        else:
-            if gap_count >= min_gap_rows:
-                # Found a whitespace band; its top edge is where we trim
-                best_gap_top = row_idx + 1
-                break
-            gap_count = 0
-
-    # Edge case: gap extends to or near search_top
-    if gap_count >= min_gap_rows and best_gap_top is None:
-        best_gap_top = search_top
-
-    if best_gap_top is not None and best_gap_top > h * 0.4:
-        # Verify there's actual content (text) below the gap — if not, this
-        # might be trailing whitespace and trimming is still fine
-        below_density = np.mean(smoothed[best_gap_top:]) if best_gap_top < h else 0
-
-        # Only trim if: there IS text below, OR we're trimming trailing whitespace
-        # (both are desirable — we want just the drawing)
-        print(f"[Trim] rect at y={y}: gap found at row {best_gap_top}/{h}, "
-              f"below_density={below_density:.3f}", file=sys.stderr, flush=True)
-
-        return {
-            'x': rect['x'], 'y': rect['y'],
-            'width': rect['width'], 'height': best_gap_top,
-            'area': rect.get('area', rect['width'] * best_gap_top),
-            'fill': rect.get('fill', 0.5)
-        }
-
-    return rect
+    return {
+        'x': rect['x'], 'y': rect['y'],
+        'width': rect['width'], 'height': trim_y,
+        'area': rect.get('area', rect['width'] * trim_y),
+        'fill': rect.get('fill', 0.5)
+    }
 
 
 def detect_from_projection_profile(img_gray, inverted, width, height, img_area, expected_count):
