@@ -750,6 +750,7 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
         proc.stderr.on('data', d => stderr += d);
         
         proc.on('close', code => {
+          if (stderr) console.log(`[Storyboard] Mask-OpenCV debug: ${stderr.trim()}`);
           if (code !== 0) {
             if (cmd === 'python3') {
               tryPython('python');
