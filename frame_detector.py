@@ -458,7 +458,7 @@ def erase_text_from_crop(image_path):
 
     try:
         result = subprocess.run(
-            ['tesseract', image_path, 'stdout', '--psm', '6', 'tsv'],
+            ['tesseract', image_path, 'stdout', '--psm', '11', 'tsv'],
             capture_output=True, text=True, timeout=15
         )
         if result.returncode != 0:
@@ -468,13 +468,17 @@ def erase_text_from_crop(image_path):
         if len(lines) < 2:
             return None
 
-        # Sample background color from edges of the image
-        # (average of top-left, top-right, bottom-left, bottom-right corners)
-        corners = []
-        for cy in [2, h - 3]:
-            for cx in [2, w - 3]:
-                corners.append(img[cy, cx].tolist())
-        bg_color = [int(np.median([c[ch] for c in corners])) for ch in range(3)]
+        # Sample background color from the bottom edge of the image
+        # (where caption text sits on the background color)
+        bottom_pixels = []
+        sample_y = h - 3
+        for cx in range(0, w, max(1, w // 20)):
+            bottom_pixels.append(img[sample_y, min(cx, w - 1)].tolist())
+        # Also sample from the left/right edges in the lower portion
+        for cy in range(lower_threshold, h, max(1, (h - lower_threshold) // 10)):
+            bottom_pixels.append(img[cy, 2].tolist())
+            bottom_pixels.append(img[cy, w - 3].tolist())
+        bg_color = [int(np.median([p[ch] for p in bottom_pixels])) for ch in range(3)]
 
         pad = 4
         erased = 0
