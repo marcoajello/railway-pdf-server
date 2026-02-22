@@ -403,10 +403,15 @@ def detect_from_mask(mask_path, expected_count=0):
     # Invert: we need white panels on black background for findContours
     inverted = cv2.bitwise_not(img)
     
-    # Light morphological close to fill small gaps within panels
-    # (e.g. white text on dark photo panels)
-    close_kernel = np.ones((5, 5), np.uint8)
-    closed = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, close_kernel, iterations=3)
+    # Horizontal-only close to fill gaps WITHIN panels (e.g. light vertical strips)
+    # without bridging vertically to caption text below
+    h_close_kernel = np.ones((1, 15), np.uint8)
+    closed = cv2.morphologyEx(inverted, cv2.MORPH_CLOSE, h_close_kernel, iterations=2)
+    
+    # Light vertical close — just enough to fill small internal gaps (scan lines, etc.)
+    # but NOT enough to bridge the ~10-15px gap to caption text
+    v_close_kernel = np.ones((3, 1), np.uint8)
+    closed = cv2.morphologyEx(closed, cv2.MORPH_CLOSE, v_close_kernel, iterations=1)
     
     # Find contours
     contours, hierarchy = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
