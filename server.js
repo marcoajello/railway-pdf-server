@@ -776,7 +776,7 @@ There are approximately ${expectedCount} panels arranged in rows.
 
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
-Skip headers, titles, text captions, and frame number labels — only return the drawing panels themselves.
+CRITICAL: Return ONLY the artwork/image area. Do NOT include text captions, descriptions, or frame numbers that appear below or beside the artwork. The bounding box should tightly crop the illustration or photo only.
 
 Return ONLY JSON:
 {
