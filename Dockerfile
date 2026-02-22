@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y \
     libgtk-3-0 \
     libxshmfence1 \
     chromium \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Puppeteer to use system Chromium
