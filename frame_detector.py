@@ -463,16 +463,20 @@ def sample_background_color(img, h, w):
 
 def trim_caption_from_crop(img):
     """
-    Content-density bottom trim: find where artwork ends and caption
-    text/whitespace begins by scanning horizontal projection from the
-    bottom up.
+    Content-density trim: removes label text from TOP and caption text from
+    BOTTOM of a cropped panel image.
 
-    Two detection methods:
-    1. Absolute threshold: caption zone has very low density (<15%)
-    2. Relative transition: sharp density drop (>50% decrease) between
-       dense artwork and sparser text — catches bold/dense captions
+    TOP trim (labels like "FRAME 5"):
+      Scan from top down — low-density rows (sparse text) followed by a
+      sharp jump to high-density (artwork) indicates a label zone.
+      Only trims up to 25% from top.
 
-    Returns trimmed image (or original if no caption zone found).
+    BOTTOM trim (captions):
+      Two detection methods:
+      1. Absolute threshold: caption zone has very low density (<15%)
+      2. Relative transition: sharp density drop (>50% decrease)
+
+    Returns trimmed image (or original if no trim zones found).
     """
     h, w = img.shape[:2]
     if h < 60 or w < 60:
@@ -481,8 +485,10 @@ def trim_caption_from_crop(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Compute per-row content density (fraction of non-background pixels)
-    # Use adaptive threshold to handle varying background brightness
-    bg_value = int(np.median(gray[0:3, :]))  # top edge → likely background
+    # Sample background from edges (top and bottom strips)
+    bg_top = int(np.median(gray[0:3, :]))
+    bg_bot = int(np.median(gray[-3:, :]))
+    bg_value = max(bg_top, bg_bot)
     # Pixels significantly darker than background = content
     threshold = max(50, bg_value - 40)
     content_mask = gray < threshold
@@ -496,14 +502,65 @@ def trim_caption_from_crop(img):
         smooth_k += 1
     smoothed = np.convolve(row_density, np.ones(smooth_k) / smooth_k, mode='same')
 
+    # ── TOP TRIM: detect label zone ("FRAME N" text above artwork) ──
+    # Labels are thin text on white background → low density rows at top
+    # followed by artwork → high density rows
+    label_threshold = 0.15   # label rows have sparse text
+    art_entry_threshold = 0.30  # artwork begins at this density
+    min_label_height = max(6, int(h * 0.03))
+    max_label_trim = int(h * 0.25)  # never trim more than 25% from top
+
+    label_end = 0  # default: no label found
+    low_top_run = 0
+    for row in range(0, max_label_trim):
+        if smoothed[row] < label_threshold:
+            low_top_run += 1
+        elif smoothed[row] >= art_entry_threshold:
+            if low_top_run >= min_label_height:
+                label_end = row
+            break
+        else:
+            # Moderate density — could be transition; keep scanning
+            if low_top_run >= min_label_height:
+                # Check if next few rows reach artwork density
+                lookahead = smoothed[row:min(row + 8, max_label_trim)]
+                if len(lookahead) > 0 and np.max(lookahead) >= art_entry_threshold:
+                    label_end = row
+                    break
+
+    # Also check: if top 15% has a clear gap (nearly all background)
+    # followed by content, that's a label + whitespace zone
+    if label_end == 0:
+        top_zone_end = int(h * 0.20)
+        for row in range(min_label_height, top_zone_end):
+            # Check if there's a whitespace band (gap between label and artwork)
+            band = smoothed[max(0, row - 3):row + 3]
+            if len(band) > 0 and np.max(band) < 0.05:
+                # Found a gap — check if there's content below
+                below = smoothed[row:min(row + 15, top_zone_end + 10)]
+                if len(below) > 0 and np.max(below) > art_entry_threshold:
+                    label_end = row
+                    break
+
+    if label_end > 0:
+        print(f"[Trim] Trimming {label_end}px label zone from top "
+              f"({label_end * 100 // h}% of height)",
+              file=sys.stderr, flush=True)
+
+    # ── BOTTOM TRIM: detect caption zone ──
+    # Work on the already-top-trimmed height for percentage calculations
+    effective_h = h - label_end
+
     # Method 1: Absolute threshold scan from bottom up
     caption_threshold = 0.15
     artwork_threshold = 0.25
-    min_caption_height = max(10, int(h * 0.05))
+    min_caption_height = max(10, int(effective_h * 0.05))
 
     caption_start = h  # default: no caption found
     low_run = 0
-    for row in range(h - 1, int(h * 0.40), -1):
+    # Don't scan above 40% of effective image
+    min_scan = label_end + int(effective_h * 0.40)
+    for row in range(h - 1, min_scan, -1):
         if smoothed[row] < caption_threshold:
             low_run += 1
         elif smoothed[row] > artwork_threshold:
@@ -520,21 +577,17 @@ def trim_caption_from_crop(img):
             caption_start = int(h * 0.85)
 
     # Method 2: Relative transition detection
-    # Look for a sharp density drop — photo rows are typically 40%+ density,
-    # text rows are 5-30%. A sustained drop of >50% signals the boundary.
     if caption_start == h:
-        # Compute windowed average density (larger window for stable signal)
-        win = max(5, h // 20)
+        win = max(5, effective_h // 20)
         windowed = np.convolve(smoothed, np.ones(win) / win, mode='same')
 
-        # Scan from 50% down to 85% of image height looking for sharp transitions
-        for row in range(int(h * 0.50), int(h * 0.85)):
+        scan_start = label_end + int(effective_h * 0.50)
+        scan_end = label_end + int(effective_h * 0.85)
+        for row in range(scan_start, min(scan_end, h)):
             above_avg = np.mean(windowed[max(0, row - win * 2):row]) if row > win * 2 else 0
             below_avg = np.mean(windowed[row:min(h, row + win * 2)])
 
-            # Sharp drop: above is dense (>35%), below is much less dense
             if above_avg > 0.35 and below_avg < above_avg * 0.50:
-                # Verify the zone below is sustained (not a brief dip)
                 remaining = smoothed[row:min(h, row + min_caption_height * 3)]
                 if len(remaining) > 0 and np.mean(remaining) < above_avg * 0.50:
                     caption_start = row
@@ -543,12 +596,21 @@ def trim_caption_from_crop(img):
                           file=sys.stderr, flush=True)
                     break
 
-    if caption_start < h and caption_start > int(h * 0.40):
-        trim_amount = h - caption_start
-        print(f"[Trim] Trimming {trim_amount}px caption zone from bottom "
-              f"({trim_amount * 100 // h}% of height)",
-              file=sys.stderr, flush=True)
-        return img[0:caption_start, :]
+    # Validate bottom trim
+    if caption_start < h and caption_start <= min_scan:
+        caption_start = h  # would trim too much
+
+    # Apply trims
+    top_trim = label_end
+    bottom_trim = h - caption_start if caption_start < h else 0
+
+    if top_trim > 0 or bottom_trim > 0:
+        new_bottom = caption_start if caption_start < h else h
+        if bottom_trim > 0:
+            print(f"[Trim] Trimming {bottom_trim}px caption zone from bottom "
+                  f"({bottom_trim * 100 // h}% of height)",
+                  file=sys.stderr, flush=True)
+        return img[top_trim:new_bottom, :]
 
     return img
 
@@ -623,7 +685,8 @@ def erase_text_from_crop(image_path):
 
     # Phase 2: OCR-based erasure on the (possibly trimmed) image
     h, w = trimmed.shape[:2]
-    lower_threshold = int(h * 0.65)  # only erase text in bottom 35%
+    upper_threshold = int(h * 0.15)  # erase text in top 15% (labels)
+    lower_threshold = int(h * 0.65)  # erase text in bottom 35% (captions)
 
     # Write trimmed image for Tesseract
     if was_trimmed:
@@ -641,8 +704,10 @@ def erase_text_from_crop(image_path):
         pad = 4
         erased = 0
         for (left, top, bw, bh, conf, text) in boxes:
-            if top < lower_threshold:
-                continue  # skip text in upper portion (part of artwork)
+            # Erase text in top 15% (frame labels) or bottom 35% (captions)
+            # Skip text in middle artwork zone
+            if top > upper_threshold and top < lower_threshold:
+                continue  # skip text in middle portion (part of artwork)
 
             x1 = max(0, left - pad)
             y1 = max(0, top - pad)
