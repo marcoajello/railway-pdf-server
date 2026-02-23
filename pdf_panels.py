@@ -81,9 +81,12 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
         rows.append(sorted(current_row, key=lambda b: b[0]))
         panels = [p for row in rows for p in row]
     
-    # Render each panel region
+    # Render each panel region and find associated caption text
     mat = fitz.Matrix(zoom, zoom)
     result_panels = []
+    
+    # Get all text blocks for caption matching
+    text_blocks = [b for b in blocks if b["type"] == 0]
     
     for bbox in panels:
         rect = fitz.Rect(bbox)
@@ -93,12 +96,55 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
         img_bytes = pix.tobytes("jpeg")
         b64 = base64.b64encode(img_bytes).decode("ascii")
         
+        # Find caption text below this panel
+        # Caption should start near the bottom edge and overlap horizontally
+        img_bottom = bbox[3]
+        img_left = bbox[0]
+        img_right = bbox[2]
+        
+        caption_block = None
+        best_dist = 999
+        for tb in text_blocks:
+            tb_bbox = tb["bbox"]
+            y_dist = tb_bbox[1] - img_bottom
+            h_overlap = min(tb_bbox[2], img_right) - max(tb_bbox[0], img_left)
+            if -5 <= y_dist < 40 and h_overlap > 30 and y_dist < best_dist:
+                caption_block = tb
+                best_dist = y_dist
+        
+        # Extract formatted text from caption
+        caption_text = ""
+        if caption_block:
+            lines = []
+            for line in caption_block["lines"]:
+                line_text = ""
+                for span in line["spans"]:
+                    text = span["text"]
+                    if not text.strip():
+                        line_text += text
+                        continue
+                    bold = bool(span["flags"] & 16)
+                    italic = bool(span["flags"] & 2)
+                    if bold and italic:
+                        line_text += f"<b><i>{text}</i></b>"
+                    elif bold:
+                        line_text += f"<b>{text}</b>"
+                    elif italic:
+                        line_text += f"<i>{text}</i>"
+                    else:
+                        line_text += text
+                line_text = line_text.strip()
+                if line_text:
+                    lines.append(line_text)
+            caption_text = "\n".join(lines)
+        
         result_panels.append({
             "x": round(bbox[0], 1),
             "y": round(bbox[1], 1),
             "width": round(bbox[2] - bbox[0], 1),
             "height": round(bbox[3] - bbox[1], 1),
-            "image": b64
+            "image": b64,
+            "caption": caption_text
         })
     
     doc.close()

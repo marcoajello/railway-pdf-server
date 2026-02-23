@@ -21,8 +21,8 @@ RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PyMuPDF for PDF structure extraction
-RUN pip3 install --break-system-packages pymupdf
+# Install PyMuPDF for PDF structure extraction, python-pptx for PPTX, Pillow for image conversion
+RUN pip3 install --break-system-packages pymupdf python-pptx Pillow
 
 # Set Puppeteer to use system Chromium
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true

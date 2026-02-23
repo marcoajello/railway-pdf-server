@@ -64,8 +64,10 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
-    cb(null, allowed.includes(file.mimetype));
+    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/vnd.ms-powerpoint'];
+    cb(null, allowed.includes(file.mimetype) || file.originalname?.match(/\.pptx?$/i));
   }
 });
 
@@ -861,6 +863,84 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
 }
 
 /**
+ * Get slide count from a PPTX file.
+ */
+async function getPptxSlideCount(pptxPath) {
+  return new Promise((resolve) => {
+    const script = path.join(__dirname, 'pptx_panels.py');
+    const tryPython = (cmd) => {
+      const proc = spawn(cmd, [script, pptxPath]);
+      let stdout = '';
+      proc.stdout.on('data', d => stdout += d);
+      proc.on('close', code => {
+        if (code !== 0) {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(0);
+          return;
+        }
+        try { resolve(JSON.parse(stdout).slideCount || 0); }
+        catch { resolve(0); }
+      });
+      proc.on('error', () => {
+        if (cmd === 'python3') { tryPython('python'); return; }
+        resolve(0);
+      });
+    };
+    tryPython('python3');
+  });
+}
+
+/**
+ * Extract panel images and captions from a PPTX slide.
+ * Returns { images: [base64...], captions: [string...] } or null.
+ */
+async function extractPanelsFromPptxStructure(pptxPath, slideNum) {
+  return new Promise((resolve) => {
+    const script = path.join(__dirname, 'pptx_panels.py');
+    const args = [script, pptxPath, String(slideNum)];
+
+    const tryPython = (cmd) => {
+      const proc = spawn(cmd, args);
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', d => stdout += d);
+      proc.stderr.on('data', d => stderr += d);
+
+      proc.on('close', code => {
+        if (stderr) console.log(`[Storyboard] PPTX structure: ${stderr.trim()}`);
+        if (code !== 0) {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(null);
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          if (result.error || !result.panels || result.count < 1) {
+            resolve(null);
+            return;
+          }
+          const images = result.panels.map(p => p.image);
+          const captions = result.panels.map(p => p.caption || '');
+          const title = result.title || null;
+          console.log(`[Storyboard] PPTX structure: slide ${slideNum} → ${images.length} panels`);
+          resolve({ images, captions, title });
+        } catch (e) {
+          resolve(null);
+        }
+      });
+
+      proc.on('error', () => {
+        if (cmd === 'python3') { tryPython('python'); return; }
+        resolve(null);
+      });
+    };
+
+    tryPython('python3');
+  });
+}
+
+/**
  * Extract panel images directly from PDF structure.
  * 
  * Instead of rendering the page and trying to find panels with computer vision,
@@ -895,10 +975,11 @@ async function extractPanelsFromPdfStructure(pdfPath, pageNum) {
             resolve(null);
             return;
           }
-          // Extract base64 images in reading order
+          // Extract base64 images and captions in reading order
           const images = result.panels.map(p => p.image);
+          const captions = result.panels.map(p => p.caption || '');
           console.log(`[Storyboard] PDF structure: page ${pageNum} → ${images.length} panels`);
-          resolve(images);
+          resolve({ images, captions });
         } catch (e) {
           resolve(null);
         }
@@ -1240,7 +1321,8 @@ function groupIntoShots(frames) {
         frames: [],
         images: [],
         descriptions: [],
-        dialogs: []
+        dialogs: [],
+        formattedCaptions: []
       };
     }
 
@@ -1248,6 +1330,7 @@ function groupIntoShots(frames) {
     if (f.image) currentShot.images.push(f.image);
     if (f.description) currentShot.descriptions.push(f.description);
     if (f.dialog) currentShot.dialogs.push(f.dialog);
+    if (f.formattedCaption) currentShot.formattedCaptions.push(f.formattedCaption);
   }
 
   // Don't forget the last shot
@@ -1259,9 +1342,11 @@ function groupIntoShots(frames) {
     images: g.images,
     descriptions: g.descriptions,  // Keep per-frame arrays for drag/drop
     dialogs: g.dialogs,            // Keep per-frame arrays for drag/drop
+    formattedCaptions: g.formattedCaptions,  // Per-frame formatted text from PDF structure
     description: g.descriptions.join('\n'),
     dialog: g.dialogs.join('\n'),
-    combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n')
+    combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n'),
+    formattedCaption: g.formattedCaptions.join('\n')
   }));
 }
 
@@ -1614,6 +1699,105 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
     
+    const isPptx = req.file.mimetype?.includes('presentation') || 
+                   req.file.mimetype?.includes('powerpoint') ||
+                   req.file.originalname?.match(/\.pptx?$/i);
+    
+    // ─── PPTX path: extract everything from file structure ───
+    if (isPptx) {
+      const pptxPath = path.join(tempDir, 'input.pptx');
+      await fs.writeFile(pptxPath, req.file.buffer);
+      
+      const slideCount = await getPptxSlideCount(pptxPath);
+      if (slideCount < 1) {
+        return res.status(400).json({ error: 'Could not read PPTX slides' });
+      }
+      console.log(`[Storyboard] PPTX: ${slideCount} slides`);
+      
+      // Extract panels from each slide (2 concurrent)
+      const CONCURRENCY = 2;
+      const allFrames = [];
+      let currentSpot = null;
+      
+      for (let i = 0; i < slideCount; i += CONCURRENCY) {
+        const batch = [];
+        for (let j = i; j < Math.min(i + CONCURRENCY, slideCount); j++) {
+          batch.push(j + 1);
+        }
+        
+        const results = await Promise.all(batch.map(async (slideNum) => {
+          const pptxResult = await extractPanelsFromPptxStructure(pptxPath, slideNum);
+          return { slideNum, pptxResult };
+        }));
+        
+        // Sort by slide number to maintain order
+        results.sort((a, b) => a.slideNum - b.slideNum);
+        
+        for (const { slideNum, pptxResult } of results) {
+          if (!pptxResult || !pptxResult.images || pptxResult.images.length < 1) {
+            console.log(`[Storyboard] PPTX slide ${slideNum}: no panels found, skipping`);
+            continue;
+          }
+          
+          if (pptxResult.title) currentSpot = pptxResult.title;
+          
+          for (let j = 0; j < pptxResult.images.length; j++) {
+            const caption = pptxResult.captions[j] || '';
+            // Split caption: bold text → description, non-bold → dialog
+            const descParts = [];
+            const dialogParts = [];
+            for (const line of caption.split('\n')) {
+              if (line.startsWith('<b>') || line.match(/^<b>/)) {
+                descParts.push(line);
+              } else if (line.trim()) {
+                dialogParts.push(line);
+              }
+            }
+            
+            allFrames.push({
+              frameNumber: String(allFrames.length + 1),
+              hasVisibleNumber: false,
+              description: descParts.join('\n').replace(/<\/?[bi]>/g, ''),
+              dialog: dialogParts.join('\n').replace(/<\/?[bi]>/g, ''),
+              formattedCaption: caption,
+              image: pptxResult.images[j],
+              spotName: currentSpot,
+              pageNum: slideNum
+            });
+          }
+        }
+      }
+      
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images (${elapsed}s)`);
+      
+      // Group frames by spot, renumber, run shot grouping
+      const spotGroups = {};
+      for (const f of allFrames) {
+        const spot = f.spotName || 'Untitled';
+        if (!spotGroups[spot]) spotGroups[spot] = [];
+        spotGroups[spot].push(f);
+      }
+      
+      const spots = [];
+      for (const [name, frames] of Object.entries(spotGroups)) {
+        // Renumber sequentially within each spot
+        console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames`);
+        frames.forEach((f, idx) => { f.frameNumber = String(idx + 1); });
+        
+        // Run shot grouping
+        await analyzeGroupings(frames);
+        
+        spots.push({
+          name,
+          shots: groupIntoShots(frames)
+        });
+      }
+      
+      return res.json({ spots });
+    }
+    
+    // ─── PDF / Image path ───
     let pageImages = [];
     let pdfTempPath = null;
     if (req.file.mimetype === 'application/pdf') {
@@ -1678,12 +1862,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               // Photo boards: extract panels directly from PDF structure
               // The layout tool already knows where every image is placed.
               try {
-                const pdfImages = await extractPanelsFromPdfStructure(pdfPath, pageNum);
-                if (pdfImages && pdfImages.length >= Math.max(1, Math.ceil(textFrameCount * 0.8))) {
-                  detected = { count: pdfImages.length, bordered: false, mode: 'pdf_structure', images: pdfImages };
-                  console.log(`[Storyboard] Page ${pageNum}: PDF structure → ${pdfImages.length} panels (expected ~${textFrameCount})`);
+                const pdfResult = await extractPanelsFromPdfStructure(pdfPath, pageNum);
+                if (pdfResult && pdfResult.images && pdfResult.images.length >= Math.max(1, Math.ceil(textFrameCount * 0.8))) {
+                  detected = { count: pdfResult.images.length, bordered: false, mode: 'pdf_structure', images: pdfResult.images, captions: pdfResult.captions };
+                  console.log(`[Storyboard] Page ${pageNum}: PDF structure → ${pdfResult.images.length} panels (expected ~${textFrameCount})`);
                 } else {
-                  console.log(`[Storyboard] Page ${pageNum}: PDF structure found ${pdfImages ? pdfImages.length : 0} panels (expected ~${textFrameCount}) — falling back to Vision`);
+                  console.log(`[Storyboard] Page ${pageNum}: PDF structure found ${pdfResult ? pdfResult.images.length : 0} panels (expected ~${textFrameCount}) — falling back to Vision`);
                 }
               } catch (e) {
                 console.error(`[Storyboard] Page ${pageNum}: PDF structure error:`, e.message);
@@ -1725,18 +1909,21 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       
       const textFrames = textData.frames || [];
       const images = detected.images || [];
+      const captions = detected.captions || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
       
       const maxLen = Math.max(textFrames.length, images.length);
       for (let j = 0; j < maxLen; j++) {
         const tf = textFrames[j] || {};
         const img = images[j] || null;
+        const formattedCaption = captions[j] || '';
         
         allFrames.push({
           frameNumber: tf.frameNumber || `${j + 1}`,
           hasVisibleNumber: hasVisibleNumbers,
           description: tf.description || '',
           dialog: tf.dialog || '',
+          formattedCaption: formattedCaption || '',
           image: img,
           spotName: currentSpot,
           pageNum: pageNum
