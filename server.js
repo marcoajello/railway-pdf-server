@@ -971,20 +971,17 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
 1. The ORIGINAL storyboard page
 2. A HIGH-CONTRAST MASK where dark content appears black and background is white
 
-Use BOTH images to identify the drawing panels. The original shows the actual content and any border lines. The mask helps distinguish panels from background on photo-heavy boards.
+This is a production storyboard. Each panel cell typically has this vertical structure from top to bottom:
+  1. A label like "FRAME 1" or "FRAME 5" (small text above the artwork) — EXCLUDE this
+  2. The ARTWORK — a photograph, illustration, or rendered image — THIS IS WHAT I WANT
+  3. A whitespace gap
+  4. Caption text (descriptions, VO lines, dialogue) — EXCLUDE this
 
-There are multiple panels arranged in rows on this page. Find ALL of them.
+Your job: return a bounding box for ONLY layer 2 (the artwork) of each panel.
 
-Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
+The artwork typically has crisp edges — either a visible border or a clear transition from image content to white space. The TOP of your bounding box should start where the image/photo begins (below any "FRAME N" label). The BOTTOM should end where the image/photo ends (above the whitespace gap before caption text).
 
-CRITICAL BOUNDING BOX RULES:
-- The BOTTOM EDGE of each bounding box must be where the artwork/photo ENDS.
-- Below each panel there is typically a GAP of whitespace, then CAPTION TEXT (descriptions, dialogue, frame numbers).
-- Your h (height) value must NOT extend into or past that whitespace gap.
-- If the artwork has a visible border, crop to the border's bottom edge.
-- If there is no visible border, crop to where photo/drawing content stops and empty space begins.
-- Do NOT include frame number labels (e.g. "1", "2A", "FR 3").
-- When in doubt, make the panel SHORTER rather than taller — it's better to lose a sliver of artwork than to include caption text.
+Find ALL panels on the page. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels.
 
 Return ONLY JSON:
 {
@@ -994,7 +991,7 @@ Return ONLY JSON:
   ]
 }
 
-x,y = top-left corner. w,h = width and height in pixels.
+x,y = top-left corner of artwork. w,h = width and height of artwork area ONLY.
 Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
       ]
     }]
@@ -1034,13 +1031,13 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
   for (let i = 0; i < panels.length; i++) {
     const p = panels[i];
     try {
-      // Apply 3% margin expansion to compensate for Vision coordinate imprecision
+      // Apply small horizontal margin but NO vertical expansion
+      // Vision tends to include caption text above/below panels, so we keep height tight
       const marginX = Math.round(p.w * 0.03);
-      const marginY = Math.round(p.h * 0.03);
       const ex = Math.max(0, p.x - marginX);
-      const ey = Math.max(0, p.y - marginY);
+      const ey = p.y; // no vertical expansion
       const ew = Math.min(p.w + marginX * 2, imgW - ex);
-      const eh = Math.min(p.h + marginY * 2, imgH - ey);
+      const eh = Math.min(p.h, imgH - ey); // no vertical expansion
 
       const x = Math.max(0, Math.round(ex * scaleX));
       const y = Math.max(0, Math.round(ey * scaleY));
