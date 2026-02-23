@@ -606,9 +606,11 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
       
       await canvas.screenshot({ path: tempPath, type: 'png' });
       
+      // Save at full render resolution — no downscale.
+      // All downstream processing (Vision API, mask) does its own resize as needed.
+      // Crops come from this full-res image for maximum quality.
       await sharp(tempPath)
-        .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
-        .jpeg({ quality: 80, progressive: true })
+        .jpeg({ quality: 92 })
         .toFile(imgPath);
       
       await fs.unlink(tempPath);
