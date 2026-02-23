@@ -467,6 +467,11 @@ def trim_caption_from_crop(img):
     text/whitespace begins by scanning horizontal projection from the
     bottom up.
 
+    Two detection methods:
+    1. Absolute threshold: caption zone has very low density (<15%)
+    2. Relative transition: sharp density drop (>50% decrease) between
+       dense artwork and sparser text — catches bold/dense captions
+
     Returns trimmed image (or original if no caption zone found).
     """
     h, w = img.shape[:2]
@@ -491,29 +496,21 @@ def trim_caption_from_crop(img):
         smooth_k += 1
     smoothed = np.convolve(row_density, np.ones(smooth_k) / smooth_k, mode='same')
 
-    # Find the artwork/caption boundary by scanning from bottom up.
-    # Caption zone: rows with low density (< 15% content — sparse text on background)
-    # Artwork zone: rows with higher density (> 25% content — illustrations)
-    #
-    # We look for the transition: a sustained low-density zone at the bottom
-    # that's at least 5% of image height.
+    # Method 1: Absolute threshold scan from bottom up
     caption_threshold = 0.15
     artwork_threshold = 0.25
     min_caption_height = max(10, int(h * 0.05))
 
-    # Scan from bottom up to find where caption zone starts
     caption_start = h  # default: no caption found
     low_run = 0
-    for row in range(h - 1, int(h * 0.40), -1):  # don't trim more than 60%
+    for row in range(h - 1, int(h * 0.40), -1):
         if smoothed[row] < caption_threshold:
             low_run += 1
         elif smoothed[row] > artwork_threshold:
-            # Hit artwork — if we accumulated enough low-density rows, mark boundary
             if low_run >= min_caption_height:
                 caption_start = row + 1
             break
         else:
-            # Ambiguous zone — keep scanning
             pass
 
     # Also check: if the bottom 15% is nearly all background, trim it
@@ -521,6 +518,30 @@ def trim_caption_from_crop(img):
         bottom_zone = smoothed[int(h * 0.85):]
         if len(bottom_zone) > 0 and np.mean(bottom_zone) < 0.08:
             caption_start = int(h * 0.85)
+
+    # Method 2: Relative transition detection
+    # Look for a sharp density drop — photo rows are typically 40%+ density,
+    # text rows are 5-30%. A sustained drop of >50% signals the boundary.
+    if caption_start == h:
+        # Compute windowed average density (larger window for stable signal)
+        win = max(5, h // 20)
+        windowed = np.convolve(smoothed, np.ones(win) / win, mode='same')
+
+        # Scan from 50% down to 85% of image height looking for sharp transitions
+        for row in range(int(h * 0.50), int(h * 0.85)):
+            above_avg = np.mean(windowed[max(0, row - win * 2):row]) if row > win * 2 else 0
+            below_avg = np.mean(windowed[row:min(h, row + win * 2)])
+
+            # Sharp drop: above is dense (>35%), below is much less dense
+            if above_avg > 0.35 and below_avg < above_avg * 0.50:
+                # Verify the zone below is sustained (not a brief dip)
+                remaining = smoothed[row:min(h, row + min_caption_height * 3)]
+                if len(remaining) > 0 and np.mean(remaining) < above_avg * 0.50:
+                    caption_start = row
+                    print(f"[Trim] Detected density transition at row {row}: "
+                          f"{above_avg:.2f} → {below_avg:.2f}",
+                          file=sys.stderr, flush=True)
+                    break
 
     if caption_start < h and caption_start > int(h * 0.40):
         trim_amount = h - caption_start
@@ -903,7 +924,7 @@ def detect_from_mask(mask_path, expected_count=0):
     # Try this first — it handles photo boards that morphology can't
     proj_candidates = detect_from_projection_profile(cleaned, inverted, width, height, img_area, expected_count)
     if proj_candidates:
-        min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
+        min_needed = max(2, int(expected_count * 0.7)) if expected_count > 0 else 2
         if len(proj_candidates) >= min_needed:
             best_candidates = proj_candidates
             best_strategy = "projection"
@@ -944,7 +965,7 @@ def detect_from_mask(mask_path, expected_count=0):
 
         print(f"[Mask] Strategy '{strategy_name}': found {len(candidates)} candidates (expected ~{expected_count})", file=sys.stderr, flush=True)
 
-        min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
+        min_needed = max(2, int(expected_count * 0.7)) if expected_count > 0 else 2
         if len(candidates) >= min_needed:
             if len(candidates) > len(best_candidates):
                 best_candidates = candidates
@@ -1000,15 +1021,15 @@ def find_panel_contours(binary_img, width, height, img_area, expected_count):
 
 
 def finalize_candidates(candidates, expected_count, height):
-    """Deduplicate, sort by area, trim to expected count, sort reading order."""
+    """Deduplicate, sort by area, sort reading order."""
     if not candidates:
         return []
     
     candidates = deduplicate_rectangles(candidates)
     candidates.sort(key=lambda r: r['area'], reverse=True)
     
-    if expected_count > 0 and len(candidates) > expected_count:
-        candidates = candidates[:expected_count]
+    # No hard trim — let detection find what actually exists
+    # (expected_count is only a hint, not ground truth)
     
     for c in candidates:
         c.pop('area', None)
