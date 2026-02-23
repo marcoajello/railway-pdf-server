@@ -809,7 +809,9 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
           .jpeg({ quality: 85 })
           .toBuffer();
 
-        images.push(cropped.toString('base64'));
+        // Run per-panel text erasure (trim caption zone + OCR cleanup)
+        const cleaned = await eraseTextFromCrop(cropped, images.length + 1);
+        images.push(cleaned || cropped.toString('base64'));
       } catch (e) {
         console.error('[Storyboard] Mask-OpenCV crop error:', e.message);
         images.push(null);
@@ -948,7 +950,12 @@ There are approximately ${expectedCount} panels arranged in rows.
 
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
-Skip headers, titles, text captions, and frame number labels — only return the drawing panels themselves.
+CRITICAL: Return TIGHT bounding boxes around the ILLUSTRATION/ARTWORK ONLY.
+- Do NOT include text captions, descriptions, or dialogue that appears BELOW, BESIDE, or ABOVE each panel.
+- Do NOT include frame number labels (e.g. "1", "2A", "FR 3").
+- The bounding box should END where the drawing/photo ends, NOT where the text below it ends.
+- Caption text is typically printed in a separate zone under each panel with a small gap — exclude that zone entirely.
+- If there is a visible border around the illustration, the bounding box should match the border edges.
 
 Return ONLY JSON:
 {
@@ -1569,6 +1576,24 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       }));
       
       allPageResults.push(...batchResults.flat());
+    }
+    
+    // Post-processing: run text erasure on grid-path images
+    // (Vision and Mask paths already do this during detection)
+    for (const result of allPageResults) {
+      if (result.detected.mode === 'grid' && result.detected.images) {
+        const cleaned = await Promise.all(result.detected.images.map(async (img, i) => {
+          if (!img) return null;
+          try {
+            const buf = Buffer.from(img, 'base64');
+            const cleanedB64 = await eraseTextFromCrop(buf, i + 1);
+            return cleanedB64 || img;
+          } catch (e) {
+            return img;
+          }
+        }));
+        result.detected.images = cleaned;
+      }
     }
     
     // Sort by page number to maintain order

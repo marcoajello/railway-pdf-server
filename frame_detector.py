@@ -392,131 +392,272 @@ def erase_text_from_mask(img, mask_path):
     """
     Run tesseract OCR on the mask to find all text regions, then paint them
     white (background) on the mask.
+    Uses multiple PSM modes for better coverage.
 
     Returns: (cleaned_mask, text_boxes)
       - cleaned_mask: mask with text regions painted white
       - text_boxes: list of {x, y, w, h} dicts for every detected text region
     """
-    try:
-        result = subprocess.run(
-            ['tesseract', mask_path, 'stdout', '--psm', '3', 'tsv'],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            return img, []
+    cleaned = img.copy()
+    text_boxes = {}
+    pad = 3
 
-        lines = result.stdout.strip().split('\n')
-        if len(lines) < 2:
-            return img, []
-
-        cleaned = img.copy()
-        text_boxes = []
-        pad = 3
-
-        for line in lines[1:]:
-            fields = line.split('\t')
-            if len(fields) < 12:
-                continue
-            try:
-                conf = float(fields[10])
-                text = fields[11].strip()
-            except (ValueError, IndexError):
-                continue
-            if conf < 30 or not text:
+    for psm in ['3', '11', '6']:
+        try:
+            result = subprocess.run(
+                ['tesseract', mask_path, 'stdout', '--psm', psm, 'tsv'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
                 continue
 
-            left = max(0, int(fields[6]) - pad)
-            top = max(0, int(fields[7]) - pad)
-            w = int(fields[8]) + pad * 2
-            h_box = int(fields[9]) + pad * 2
+            lines = result.stdout.strip().split('\n')
+            for line in lines[1:]:
+                fields = line.split('\t')
+                if len(fields) < 12:
+                    continue
+                try:
+                    conf = float(fields[10])
+                    text = fields[11].strip()
+                except (ValueError, IndexError):
+                    continue
+                if conf < 25 or not text:
+                    continue
 
-            cleaned[top:top + h_box, left:left + w] = 255
-            text_boxes.append({'x': left, 'y': top, 'w': w, 'h': h_box})
+                left = max(0, int(fields[6]) - pad)
+                top = max(0, int(fields[7]) - pad)
+                w = int(fields[8]) + pad * 2
+                h_box = int(fields[9]) + pad * 2
 
-        print(f"[OCR] Erased {len(text_boxes)} text regions from mask",
+                # Deduplicate by position
+                key = (left // 5, top // 5)
+                if key not in text_boxes:
+                    cleaned[top:top + h_box, left:left + w] = 255
+                    text_boxes[key] = {'x': left, 'y': top, 'w': w, 'h': h_box}
+
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    box_list = list(text_boxes.values())
+    print(f"[OCR] Erased {len(box_list)} text regions from mask",
+          file=sys.stderr, flush=True)
+    return cleaned, box_list
+
+
+def sample_background_color(img, h, w):
+    """
+    Sample background color from image edges (strips, not corners).
+    Corners may be artwork; edge strips are more reliable.
+    """
+    strip = max(3, min(h, w) // 30)
+    samples = []
+    # Top and bottom edge strips
+    samples.append(img[0:strip, :].reshape(-1, 3))
+    samples.append(img[h - strip:, :].reshape(-1, 3))
+    # Left and right edge strips
+    samples.append(img[:, 0:strip].reshape(-1, 3))
+    samples.append(img[:, w - strip:].reshape(-1, 3))
+    all_samples = np.vstack(samples)
+    return np.median(all_samples, axis=0).astype(int).tolist()
+
+
+def trim_caption_from_crop(img):
+    """
+    Content-density bottom trim: find where artwork ends and caption
+    text/whitespace begins by scanning horizontal projection from the
+    bottom up.
+
+    Returns trimmed image (or original if no caption zone found).
+    """
+    h, w = img.shape[:2]
+    if h < 60 or w < 60:
+        return img
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Compute per-row content density (fraction of non-background pixels)
+    # Use adaptive threshold to handle varying background brightness
+    bg_value = int(np.median(gray[0:3, :]))  # top edge → likely background
+    # Pixels significantly darker than background = content
+    threshold = max(50, bg_value - 40)
+    content_mask = gray < threshold
+
+    # Horizontal projection: fraction of content pixels per row
+    row_density = np.sum(content_mask, axis=1).astype(float) / w
+
+    # Smooth with small kernel
+    smooth_k = max(3, h // 40)
+    if smooth_k % 2 == 0:
+        smooth_k += 1
+    smoothed = np.convolve(row_density, np.ones(smooth_k) / smooth_k, mode='same')
+
+    # Find the artwork/caption boundary by scanning from bottom up.
+    # Caption zone: rows with low density (< 15% content — sparse text on background)
+    # Artwork zone: rows with higher density (> 25% content — illustrations)
+    #
+    # We look for the transition: a sustained low-density zone at the bottom
+    # that's at least 5% of image height.
+    caption_threshold = 0.15
+    artwork_threshold = 0.25
+    min_caption_height = max(10, int(h * 0.05))
+
+    # Scan from bottom up to find where caption zone starts
+    caption_start = h  # default: no caption found
+    low_run = 0
+    for row in range(h - 1, int(h * 0.40), -1):  # don't trim more than 60%
+        if smoothed[row] < caption_threshold:
+            low_run += 1
+        elif smoothed[row] > artwork_threshold:
+            # Hit artwork — if we accumulated enough low-density rows, mark boundary
+            if low_run >= min_caption_height:
+                caption_start = row + 1
+            break
+        else:
+            # Ambiguous zone — keep scanning
+            pass
+
+    # Also check: if the bottom 15% is nearly all background, trim it
+    if caption_start == h:
+        bottom_zone = smoothed[int(h * 0.85):]
+        if len(bottom_zone) > 0 and np.mean(bottom_zone) < 0.08:
+            caption_start = int(h * 0.85)
+
+    if caption_start < h and caption_start > int(h * 0.40):
+        trim_amount = h - caption_start
+        print(f"[Trim] Trimming {trim_amount}px caption zone from bottom "
+              f"({trim_amount * 100 // h}% of height)",
               file=sys.stderr, flush=True)
-        return cleaned, text_boxes
+        return img[0:caption_start, :]
 
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return img, []
+    return img
+
+
+def run_tesseract_multi(image_path, timeout=15):
+    """
+    Run Tesseract with multiple PSM modes and union the results.
+    PSM 6 (uniform block) + PSM 11 (sparse text) catches more caption styles.
+    Returns list of (left, top, width, height, confidence, text) tuples.
+    """
+    all_boxes = {}
+
+    for psm in ['6', '11']:
+        try:
+            result = subprocess.run(
+                ['tesseract', image_path, 'stdout', '--psm', psm, 'tsv'],
+                capture_output=True, text=True, timeout=timeout
+            )
+            if result.returncode != 0:
+                continue
+
+            lines = result.stdout.strip().split('\n')
+            for line in lines[1:]:
+                fields = line.split('\t')
+                if len(fields) < 12:
+                    continue
+                try:
+                    conf = float(fields[10])
+                    text = fields[11].strip()
+                except (ValueError, IndexError):
+                    continue
+                if conf < 25 or not text:
+                    continue
+
+                left = int(fields[6])
+                top = int(fields[7])
+                bw = int(fields[8])
+                bh = int(fields[9])
+
+                # Deduplicate by position (within 5px tolerance)
+                key = (left // 5, top // 5)
+                existing = all_boxes.get(key)
+                if not existing or conf > existing[4]:
+                    all_boxes[key] = (left, top, bw, bh, conf, text)
+
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    return list(all_boxes.values())
 
 
 def erase_text_from_crop(image_path):
     """
     Erase caption text from a single cropped panel image.
-    Runs tesseract on the crop, finds text in the bottom 40%,
-    and paints those regions with the background color.
+    Two-phase approach:
+      1. Content-density trim: detect where artwork ends and caption
+         whitespace/text begins, crop it off entirely
+      2. OCR cleanup: run multi-pass Tesseract on the remaining image
+         to catch any residual text in the bottom 35%
 
-    Returns base64-encoded JPEG of the cleaned image.
+    Returns base64-encoded JPEG of the cleaned image, or None if no changes.
     """
     img = cv2.imread(image_path)
     if img is None:
         return None
 
-    h, w = img.shape[:2]
-    lower_threshold = int(h * 0.60)  # only erase text in bottom 40%
+    orig_h, orig_w = img.shape[:2]
+
+    # Phase 1: Content-density trim (removes obvious caption zones)
+    trimmed = trim_caption_from_crop(img)
+    was_trimmed = trimmed.shape[0] < orig_h
+
+    # Phase 2: OCR-based erasure on the (possibly trimmed) image
+    h, w = trimmed.shape[:2]
+    lower_threshold = int(h * 0.65)  # only erase text in bottom 35%
+
+    # Write trimmed image for Tesseract
+    if was_trimmed:
+        tmp_path = image_path + '.trimmed.jpg'
+        cv2.imwrite(tmp_path, trimmed)
+        ocr_path = tmp_path
+    else:
+        ocr_path = image_path
 
     try:
-        result = subprocess.run(
-            ['tesseract', image_path, 'stdout', '--psm', '11', 'tsv'],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode != 0:
-            return None
+        boxes = run_tesseract_multi(ocr_path, timeout=15)
 
-        lines = result.stdout.strip().split('\n')
-        if len(lines) < 2:
-            return None
-
-        # Sample background color from the bottom edge of the image
-        # (where caption text sits on the background color)
-        bottom_pixels = []
-        sample_y = h - 3
-        for cx in range(0, w, max(1, w // 20)):
-            bottom_pixels.append(img[sample_y, min(cx, w - 1)].tolist())
-        # Also sample from the left/right edges in the lower portion
-        for cy in range(lower_threshold, h, max(1, (h - lower_threshold) // 10)):
-            bottom_pixels.append(img[cy, 2].tolist())
-            bottom_pixels.append(img[cy, w - 3].tolist())
-        bg_color = [int(np.median([p[ch] for p in bottom_pixels])) for ch in range(3)]
+        bg_color = sample_background_color(trimmed, h, w)
 
         pad = 4
         erased = 0
-        for line in lines[1:]:
-            fields = line.split('\t')
-            if len(fields) < 12:
-                continue
-            try:
-                conf = float(fields[10])
-                text = fields[11].strip()
-            except (ValueError, IndexError):
-                continue
-            if conf < 30 or not text:
-                continue
-
-            top = int(fields[7])
+        for (left, top, bw, bh, conf, text) in boxes:
             if top < lower_threshold:
-                continue  # skip text in upper portion (part of the artwork)
+                continue  # skip text in upper portion (part of artwork)
 
-            left = max(0, int(fields[6]) - pad)
-            top = max(0, top - pad)
-            bw = int(fields[8]) + pad * 2
-            bh = int(fields[9]) + pad * 2
+            x1 = max(0, left - pad)
+            y1 = max(0, top - pad)
+            x2 = min(w, left + bw + pad)
+            y2 = min(h, top + bh + pad)
 
-            img[top:top + bh, left:left + bw] = bg_color
+            trimmed[y1:y2, x1:x2] = bg_color
             erased += 1
 
-        if erased == 0:
+        # Clean up temp file
+        if was_trimmed:
+            try:
+                os.remove(ocr_path)
+            except OSError:
+                pass
+
+        if not was_trimmed and erased == 0:
             return None  # no changes made
 
-        print(f"[OCR-crop] Erased {erased} text regions from panel crop",
-              file=sys.stderr, flush=True)
+        changes = []
+        if was_trimmed:
+            changes.append(f"trimmed {orig_h - h}px")
+        if erased > 0:
+            changes.append(f"erased {erased} text regions")
+        print(f"[OCR-crop] {', '.join(changes)}", file=sys.stderr, flush=True)
 
-        # Encode as JPEG and return base64
-        _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        _, buf = cv2.imencode('.jpg', trimmed, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return base64.b64encode(buf).decode('ascii')
 
     except (FileNotFoundError, subprocess.TimeoutExpired):
+        if was_trimmed:
+            # Still return the trimmed version even if OCR failed
+            _, buf = cv2.imencode('.jpg', trimmed, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            print(f"[OCR-crop] trimmed {orig_h - h}px (OCR unavailable)",
+                  file=sys.stderr, flush=True)
+            return base64.b64encode(buf).decode('ascii')
         return None
 
 
@@ -573,9 +714,53 @@ def detect_from_projection_profile(img_gray, inverted, width, height, img_area, 
 
     print(f"[Projection] Found {len(content_bands)} content rows", file=sys.stderr, flush=True)
 
-    # For each content band, find column boundaries using vertical projection
-    all_panels = []
+    # Refine each content band: trim bottom text/caption zone
+    # Caption text below panels has lower, more uniform density than artwork
+    refined_bands = []
     for band_top, band_bottom in content_bands:
+        band_h = band_bottom - band_top
+        if band_h < min_content_height:
+            refined_bands.append((band_top, band_bottom))
+            continue
+
+        # Compute fine-grained horizontal projection within this band
+        band_slice = inverted[band_top:band_bottom, :]
+        band_proj = np.sum(band_slice > 128, axis=1).astype(float) / width
+
+        # Smooth lightly
+        bk = max(3, band_h // 30)
+        if bk % 2 == 0:
+            bk += 1
+        band_smooth = np.convolve(band_proj, np.ones(bk) / bk, mode='same')
+
+        # Scan from bottom of band upward to find where text zone begins
+        # Text zone: sustained low density (< 12%) at bottom of band
+        text_thresh = 0.12
+        art_thresh = 0.20
+        min_text_zone = max(8, band_h // 10)
+
+        trim_row = band_h  # relative to band_top
+        low_run = 0
+        for row in range(band_h - 1, band_h // 3, -1):
+            if band_smooth[row] < text_thresh:
+                low_run += 1
+            elif band_smooth[row] > art_thresh:
+                if low_run >= min_text_zone:
+                    trim_row = row + 1
+                break
+            # else ambiguous, keep scanning
+
+        if trim_row < band_h:
+            print(f"[Projection] Band {band_top}-{band_bottom}: trimmed "
+                  f"{band_h - trim_row}px caption zone from bottom",
+                  file=sys.stderr, flush=True)
+            refined_bands.append((band_top, band_top + trim_row))
+        else:
+            refined_bands.append((band_top, band_bottom))
+
+    # For each refined content band, find column boundaries using vertical projection
+    all_panels = []
+    for band_top, band_bottom in refined_bands:
         band_slice = inverted[band_top:band_bottom, :]
         v_proj = np.sum(band_slice > 128, axis=0).astype(float) / (band_bottom - band_top)
 
