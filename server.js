@@ -683,8 +683,6 @@ STEP 4 - FRAME NUMBERS:
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
-For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).
-
 Return JSON:
 {
   "spotName": "EXACT TITLE FROM PAGE" or null,
@@ -695,23 +693,19 @@ Return JSON:
     {
       "frameNumber": "1",
       "description": "Action/direction text",
-      "dialog": "CHARACTER: Spoken lines...",
-      "panelX": 25,
-      "panelY": 35
+      "dialog": "CHARACTER: Spoken lines..."
     }
   ]
 }
-
-panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- CRITICAL: Count ALL image panels on the page. The number of frames you return MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.
-- Include frames even if they have no text (use empty strings for description/dialog)
-- Text may appear below, beside, or near its panel — pair each text block with its nearest image` }
+- NEVER skip frames - include ALL frames even if they have no text (use empty strings)
+- The number of frames you return MUST match the grid layout (e.g. 2x3 = 6 frames)
+- Each caption/description belongs to the image DIRECTLY ABOVE it` }
       ]
     }]
   });
@@ -937,12 +931,12 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
   const maskPanels = maskResult ? maskResult.images : null;
   const maskCentroids = maskResult ? maskResult.panelCentroids : null;
 
-  if (maskPanels && maskPanels.length >= Math.max(2, Math.ceil(expectedCount * 0.7))) {
-    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels`);
+  if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
+    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
     return { images: maskPanels, panelCentroids: maskCentroids };
   }
 
-  console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}) — falling back to Vision`);
+  console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
 
   // === FALLBACK: Claude Vision with dual-image ===
   const client = getAnthropicClient();
@@ -951,7 +945,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
 
-  console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} original + mask`);
+  console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} original + mask (expecting ~${expectedCount} panels)`);
 
   const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -968,6 +962,8 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
 
 Use BOTH images to identify the drawing panels. The original shows the actual content and any border lines. The mask helps distinguish panels from background on photo-heavy boards.
 
+There are approximately ${expectedCount} panels arranged in rows.
+
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
 CRITICAL: Return TIGHT bounding boxes around the ILLUSTRATION/ARTWORK ONLY.
@@ -976,8 +972,6 @@ CRITICAL: Return TIGHT bounding boxes around the ILLUSTRATION/ARTWORK ONLY.
 - The bounding box should END where the drawing/photo ends, NOT where the text below it ends.
 - Caption text is typically printed in a separate zone under each panel with a small gap — exclude that zone entirely.
 - If there is a visible border around the illustration, the bounding box should match the border edges.
-- Do NOT include blank/white areas, title text blocks, or non-image content as panels.
-- Only return panels that contain actual artwork, photographs, or illustrations.
 
 Return ONLY JSON:
 {
@@ -1579,7 +1573,8 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               try {
                 const cvResult = await detectRectangles(imgPath);
                 if (cvResult.mode === 'grid') {
-                  if (cvResult.count >= 2 && cvResult.images && cvResult.images.length >= 1) {
+                  const expectedMin = Math.max(1, Math.ceil(textFrameCount * 0.9));
+                  if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
                     // Compute normalized centroids from grid rectangles
                     const imgMeta = await sharp(await fs.readFile(imgPath)).metadata();
                     const gridCentroids = (cvResult.rectangles || []).map(r => ({
@@ -1656,111 +1651,26 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       
       const textFrames = textData.frames || [];
       const images = detected.images || [];
-      const panelCentroids = detected.panelCentroids || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
       
-      // === PROXIMITY MATCHING ===
-      // Match text frames to detected panels by spatial position instead of blind index
-      // ONLY use proximity when counts differ — when equal, both sides are in reading order
-      const hasPanelPositions = panelCentroids.length === images.length && panelCentroids.length > 0;
-      const hasTextPositions = textFrames.some(tf => tf.panelX != null && tf.panelY != null);
-      const countsDiffer = textFrames.length !== images.length;
+      if (textFrames.length !== images.length && textFrames.length > 0 && images.length > 0) {
+        console.log(`[Storyboard] Page ${pageNum}: COUNT MISMATCH — text ${textFrames.length}, panels ${images.length}`);
+      }
       
-      if (countsDiffer && hasPanelPositions && hasTextPositions && textFrames.length > 0 && images.length > 0) {
-        // Proximity matching: pair each panel with its nearest text frame
-        const usedTextIndices = new Set();
-        const panelToText = new Array(images.length).fill(null);
+      const maxLen = Math.max(textFrames.length, images.length);
+      for (let j = 0; j < maxLen; j++) {
+        const tf = textFrames[j] || {};
+        const img = images[j] || null;
         
-        // For each panel, find closest unmatched text frame
-        // Sort panels by Y then X (reading order) for deterministic matching
-        const panelOrder = panelCentroids.map((c, i) => ({ idx: i, cx: c.cx, cy: c.cy }));
-        panelOrder.sort((a, b) => {
-          const rowDiff = Math.abs(a.cy - b.cy);
-          if (rowDiff < 0.08) return a.cx - b.cx; // Same row: sort by X
-          return a.cy - b.cy; // Different rows: sort by Y
+        allFrames.push({
+          frameNumber: tf.frameNumber || `${j + 1}`,
+          hasVisibleNumber: hasVisibleNumbers,
+          description: tf.description || '',
+          dialog: tf.dialog || '',
+          image: img,
+          spotName: currentSpot,
+          pageNum: pageNum
         });
-        
-        for (const panel of panelOrder) {
-          let bestDist = Infinity;
-          let bestIdx = -1;
-          
-          for (let t = 0; t < textFrames.length; t++) {
-            if (usedTextIndices.has(t)) continue;
-            const tf = textFrames[t];
-            if (tf.panelX == null || tf.panelY == null) continue;
-            
-            // Distance between panel centroid and text-reported panel position
-            const dx = panel.cx - (tf.panelX / 100);
-            const dy = panel.cy - (tf.panelY / 100);
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            
-            if (dist < bestDist) {
-              bestDist = dist;
-              bestIdx = t;
-            }
-          }
-          
-          if (bestIdx >= 0 && bestDist < 0.4) { // Max 40% of page distance
-            panelToText[panel.idx] = bestIdx;
-            usedTextIndices.add(bestIdx);
-          }
-        }
-        
-        // Also handle text frames without panelX/panelY — match by remaining index order
-        const unmatchedPanels = [];
-        for (let i = 0; i < images.length; i++) {
-          if (panelToText[i] === null) unmatchedPanels.push(i);
-        }
-        const unmatchedTexts = [];
-        for (let t = 0; t < textFrames.length; t++) {
-          if (!usedTextIndices.has(t)) unmatchedTexts.push(t);
-        }
-        // Match remaining by order
-        for (let k = 0; k < Math.min(unmatchedPanels.length, unmatchedTexts.length); k++) {
-          panelToText[unmatchedPanels[k]] = unmatchedTexts[k];
-        }
-        
-        // Build frames from matched pairs
-        for (let i = 0; i < images.length; i++) {
-          const tIdx = panelToText[i];
-          const tf = tIdx !== null ? textFrames[tIdx] : {};
-          allFrames.push({
-            frameNumber: tf.frameNumber || `${i + 1}`,
-            hasVisibleNumber: hasVisibleNumbers,
-            description: tf.description || '',
-            dialog: tf.dialog || '',
-            image: images[i],
-            spotName: currentSpot,
-            pageNum: pageNum
-          });
-        }
-        
-        const matched = panelToText.filter(t => t !== null).length;
-        console.log(`[Storyboard] Page ${pageNum}: PROXIMITY matched ${matched}/${images.length} panels to ${textFrames.length} text frames`);
-        
-      } else {
-        // Index-based matching: counts match (reading order) or positions unavailable
-        if (textFrames.length !== images.length && textFrames.length > 0 && images.length > 0) {
-          console.log(`[Storyboard] Page ${pageNum}: COUNT MISMATCH — text ${textFrames.length}, panels ${images.length} (index fallback)`);
-        } else if (textFrames.length === images.length && textFrames.length > 0) {
-          console.log(`[Storyboard] Page ${pageNum}: INDEX matched ${images.length} panels to ${textFrames.length} text frames (counts equal)`);
-        }
-        
-        const maxLen = Math.max(textFrames.length, images.length);
-        for (let j = 0; j < maxLen; j++) {
-          const tf = textFrames[j] || {};
-          const img = images[j] || null;
-          
-          allFrames.push({
-            frameNumber: tf.frameNumber || `${j + 1}`,
-            hasVisibleNumber: hasVisibleNumbers,
-            description: tf.description || '',
-            dialog: tf.dialog || '',
-            image: img,
-            spotName: currentSpot,
-            pageNum: pageNum
-          });
-        }
       }
     }
     
@@ -1878,8 +1788,6 @@ STEP 4 - FRAME NUMBERS:
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
-For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).
-
 Return a JSON array with one object per page:
 [
   {
@@ -1889,22 +1797,20 @@ Return a JSON array with one object per page:
     "gridLayout": "2x3",
     "hasVisibleNumbers": true/false,
     "frames": [
-      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 }
+      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines..." }
     ]
   },
   { "pageNum": 2, ... }
 ]
-
-panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- CRITICAL: Count ALL image panels on each page. The number of frames you return per page MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.
-- Include frames even if they have no text (use empty strings for description/dialog)
-- Text may appear below, beside, or near its panel — pair each text block with its nearest image` });
+- NEVER skip frames - include ALL frames even if they have no text (use empty strings)
+- The number of frames you return MUST match the grid layout (e.g. 2x3 = 6 frames)
+- Each caption/description belongs to the image DIRECTLY ABOVE it` });
   
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
