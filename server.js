@@ -709,9 +709,9 @@ RULES:
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Text may appear below, beside, or near its panel — pair each text block with its nearest image
+- CRITICAL: Count ALL image panels on the page. The number of frames you return MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.
 - Include frames even if they have no text (use empty strings for description/dialog)
-- If a panel has no associated text, still include it with empty strings` }
+- Text may appear below, beside, or near its panel — pair each text block with its nearest image` }
       ]
     }]
   });
@@ -1662,10 +1662,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       
       // === PROXIMITY MATCHING ===
       // Match text frames to detected panels by spatial position instead of blind index
+      // ONLY use proximity when counts differ — when equal, both sides are in reading order
       const hasPanelPositions = panelCentroids.length === images.length && panelCentroids.length > 0;
       const hasTextPositions = textFrames.some(tf => tf.panelX != null && tf.panelY != null);
+      const countsDiffer = textFrames.length !== images.length;
       
-      if (hasPanelPositions && hasTextPositions && textFrames.length > 0 && images.length > 0) {
+      if (countsDiffer && hasPanelPositions && hasTextPositions && textFrames.length > 0 && images.length > 0) {
         // Proximity matching: pair each panel with its nearest text frame
         const usedTextIndices = new Set();
         const panelToText = new Array(images.length).fill(null);
@@ -1738,9 +1740,11 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         console.log(`[Storyboard] Page ${pageNum}: PROXIMITY matched ${matched}/${images.length} panels to ${textFrames.length} text frames`);
         
       } else {
-        // Fallback: index-based matching (when positions unavailable)
+        // Index-based matching: counts match (reading order) or positions unavailable
         if (textFrames.length !== images.length && textFrames.length > 0 && images.length > 0) {
           console.log(`[Storyboard] Page ${pageNum}: COUNT MISMATCH — text ${textFrames.length}, panels ${images.length} (index fallback)`);
+        } else if (textFrames.length === images.length && textFrames.length > 0) {
+          console.log(`[Storyboard] Page ${pageNum}: INDEX matched ${images.length} panels to ${textFrames.length} text frames (counts equal)`);
         }
         
         const maxLen = Math.max(textFrames.length, images.length);
@@ -1899,9 +1903,9 @@ RULES:
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Text may appear below, beside, or near its panel — pair each text block with its nearest image
+- CRITICAL: Count ALL image panels on each page. The number of frames you return per page MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.
 - Include frames even if they have no text (use empty strings for description/dialog)
-- If a panel has no associated text, still include it with empty strings` });
+- Text may appear below, beside, or near its panel — pair each text block with its nearest image` });
   
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
