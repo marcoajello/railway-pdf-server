@@ -861,6 +861,181 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
 }
 
 /**
+ * Grid-guided panel detection — uses Vision's semantic layout knowledge
+ * to guide pixel-level OpenCV operations.
+ *
+ * Instead of asking Vision for approximate bounding boxes, we:
+ * 1. Use the grid layout Vision already identified (e.g., "2x3")
+ * 2. Generate a binary mask and pass it to Python with the grid dimensions
+ * 3. Python uses OCR text erasure + projection profiles + valley detection
+ *    to find precise panel boundaries
+ *
+ * This bridges the gap between Vision's semantic understanding and
+ * OpenCV's pixel precision.
+ */
+async function detectPanelsGridGuided(imageBuffer, numRows, numCols) {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'grid-'));
+  const maskPath = path.join(tmpDir, 'mask.jpg');
+
+  try {
+    // Get original dimensions for coordinate scaling
+    const origMeta = await sharp(imageBuffer).metadata();
+
+    // Detect background color dynamically (same logic as detectPanelsWithVision)
+    const grayBuf = await sharp(imageBuffer)
+      .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+      .grayscale()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const grayData = grayBuf.data;
+    const gW = grayBuf.info.width;
+    const gH = grayBuf.info.height;
+
+    const perimeterValues = [];
+    for (const depthPct of [0, 5, 10, 15]) {
+      const offX = Math.round(gW * depthPct / 100);
+      const offY = Math.round(gH * depthPct / 100);
+      for (let x = offX; x < gW - offX; x += 5) {
+        perimeterValues.push(grayData[offY * gW + x]);
+        perimeterValues.push(grayData[(gH - 1 - offY) * gW + x]);
+      }
+      for (let y = offY; y < gH - offY; y += 5) {
+        perimeterValues.push(grayData[y * gW + offX]);
+        perimeterValues.push(grayData[y * gW + (gW - 1 - offX)]);
+      }
+    }
+
+    const buckets = {};
+    for (const v of perimeterValues) {
+      if (v < 150) continue;
+      const bucket = Math.round(v / 5) * 5;
+      buckets[bucket] = (buckets[bucket] || 0) + 1;
+    }
+    const sortedBuckets = Object.entries(buckets).sort((a, b) => b[1] - a[1]);
+
+    let bgValue = 245;
+    if (sortedBuckets.length > 0) {
+      const topValue = parseInt(sortedBuckets[0][0]);
+      const topCount = sortedBuckets[0][1];
+      if (topValue >= 250 && sortedBuckets.length > 1) {
+        const secondValue = parseInt(sortedBuckets[1][0]);
+        const secondCount = sortedBuckets[1][1];
+        if (secondValue >= 150 && secondCount > topCount * 0.1) {
+          bgValue = secondValue;
+        } else {
+          bgValue = topValue;
+        }
+      } else {
+        bgValue = topValue;
+      }
+    }
+    const dynamicThreshold = Math.max(100, bgValue - 15);
+
+    console.log(`[Storyboard] Grid-guided: bg=${bgValue}, threshold=${dynamicThreshold}, grid=${numRows}x${numCols}`);
+
+    // Generate binary mask
+    const mask = await sharp(imageBuffer)
+      .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+      .grayscale()
+      .threshold(dynamicThreshold)
+      .jpeg({ quality: 90 })
+      .toBuffer();
+
+    const maskMeta = await sharp(mask).metadata();
+    const scaleX = origMeta.width / maskMeta.width;
+    const scaleY = origMeta.height / maskMeta.height;
+
+    await fs.writeFile(maskPath, mask);
+
+    // Call Python grid-guided mode
+    const result = await new Promise((resolve) => {
+      const script = path.join(__dirname, 'frame_detector.py');
+      const args = [script, maskPath, 'grid', String(numRows), String(numCols)];
+
+      const tryPython = (cmd) => {
+        const proc = spawn(cmd, args);
+        let stdout = '';
+        let stderr = '';
+
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+
+        proc.on('close', code => {
+          if (stderr) console.log(`[Storyboard] Grid-guided debug: ${stderr.trim()}`);
+          if (code !== 0) {
+            if (cmd === 'python3') { tryPython('python'); return; }
+            resolve(null);
+            return;
+          }
+          try {
+            resolve(JSON.parse(stdout));
+          } catch (e) {
+            resolve(null);
+          }
+        });
+
+        proc.on('error', () => {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(null);
+        });
+      };
+
+      tryPython('python3');
+    });
+
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+
+    if (!result || !result.rectangles || result.count < 1) {
+      console.log(`[Storyboard] Grid-guided: no panels found, will fall back`);
+      return null;
+    }
+
+    console.log(`[Storyboard] Grid-guided: found ${result.count} panels`);
+
+    // Crop from full-resolution original with scaled coordinates
+    const images = [];
+    for (const rect of result.rectangles) {
+      try {
+        const x = Math.max(0, Math.round(rect.x * scaleX));
+        const y = Math.max(0, Math.round(rect.y * scaleY));
+        const w = Math.min(Math.round(rect.width * scaleX), origMeta.width - x);
+        const h = Math.min(Math.round(rect.height * scaleY), origMeta.height - y);
+
+        if (w < 20 || h < 20) {
+          images.push(null);
+          continue;
+        }
+
+        // 3px inset at original scale to trim border edges
+        const inset = Math.round(3 * scaleX);
+        const cropped = await sharp(imageBuffer)
+          .extract({
+            left: x + inset,
+            top: y + inset,
+            width: Math.max(10, w - inset * 2),
+            height: Math.max(10, h - inset * 2)
+          })
+          .jpeg({ quality: 85 })
+          .toBuffer();
+
+        images.push(cropped.toString('base64'));
+      } catch (e) {
+        console.error('[Storyboard] Grid-guided crop error:', e.message);
+        images.push(null);
+      }
+    }
+
+    return images;
+
+  } catch (e) {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    console.error('[Storyboard] Grid-guided error:', e.message);
+    return null;
+  }
+}
+
+/**
  * Vision panel detection — hybrid approach.
  * 1. Generate binary mask from the image
  * 2. Try OpenCV contour detection on the mask (exact pixel edges)
@@ -1620,6 +1795,27 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               console.log(`[Storyboard] Page ${pageNum}: photo board → using Vision`);
             }
             
+            // Grid-guided detection for photo boards (uses Vision's semantic layout)
+            if (detected.count < 1 && textData.gridLayout) {
+              const gridMatch = String(textData.gridLayout).match(/(\d+)\s*[x×]\s*(\d+)/i);
+              if (gridMatch) {
+                const numRows = parseInt(gridMatch[1]);
+                const numCols = parseInt(gridMatch[2]);
+                if (numRows >= 1 && numRows <= 6 && numCols >= 1 && numCols <= 6) {
+                  try {
+                    const imageBuffer = await fs.readFile(imgPath);
+                    const gridImages = await detectPanelsGridGuided(imageBuffer, numRows, numCols);
+                    if (gridImages && gridImages.length >= Math.max(1, numRows * numCols * 0.7)) {
+                      detected = { count: gridImages.length, bordered: false, mode: 'grid_guided', images: gridImages };
+                      console.log(`[Storyboard] Page ${pageNum}: Grid-guided found ${gridImages.length} panels (${numRows}x${numCols})`);
+                    }
+                  } catch (e) {
+                    console.error(`[Storyboard] Page ${pageNum}: Grid-guided error:`, e.message);
+                  }
+                }
+              }
+            }
+
             // Vision fallback (or primary for photo boards)
             if (detected.count < 1) {
               try {
