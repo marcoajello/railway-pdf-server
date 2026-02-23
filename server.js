@@ -931,17 +931,27 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
   const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount, boardType);
   const maskPanels = maskResult ? maskResult.images : null;
   const maskCentroids = maskResult ? maskResult.panelCentroids : null;
+  const maskCount = maskPanels ? maskPanels.length : 0;
 
-  if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
-    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
+  // Always try Vision too (unless mask already found a strong result)
+  // "Strong" = found at least expectedCount panels, or found >= 8 panels with no expected hint
+  const maskIsStrong = maskCount >= Math.max(expectedCount, 4);
+  
+  if (maskIsStrong) {
+    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskCount} panels (expected ~${expectedCount})`);
     return { images: maskPanels, panelCentroids: maskCentroids };
   }
 
-  console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
+  // Mask found something but not enough — try Vision for a better result
+  console.log(`[Storyboard] Mask-OpenCV found ${maskCount} panels (expected ~${expectedCount}) — also trying Vision`);
 
   // === FALLBACK: Claude Vision with dual-image ===
   const client = getAnthropicClient();
-  if (!client) return { images: [], panelCentroids: [] };
+  if (!client) {
+    // No API key — return mask result even if partial
+    if (maskCount >= 1) return { images: maskPanels, panelCentroids: maskCentroids };
+    return { images: [], panelCentroids: [] };
+  }
 
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
@@ -963,7 +973,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
 
 Use BOTH images to identify the drawing panels. The original shows the actual content and any border lines. The mask helps distinguish panels from background on photo-heavy boards.
 
-There are approximately ${expectedCount} panels arranged in rows.
+There are multiple panels arranged in rows on this page. Find ALL of them.
 
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
@@ -1061,6 +1071,15 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
     }
   }
 
+  const visionCount = images.filter(i => i !== null).length;
+  
+  // Compare Vision result with mask result — pick whichever found more panels
+  if (maskCount >= 1 && maskCount > visionCount) {
+    console.log(`[Storyboard] Mask had more panels (${maskCount}) than Vision (${visionCount}) — using mask`);
+    return { images: maskPanels, panelCentroids: maskCentroids };
+  }
+  
+  console.log(`[Storyboard] Using Vision result: ${visionCount} panels (mask had ${maskCount})`);
   return { images, panelCentroids };
 }
 
