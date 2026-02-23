@@ -924,7 +924,7 @@ def detect_from_mask(mask_path, expected_count=0):
     # Try this first — it handles photo boards that morphology can't
     proj_candidates = detect_from_projection_profile(cleaned, inverted, width, height, img_area, expected_count)
     if proj_candidates:
-        min_needed = max(2, int(expected_count * 0.7)) if expected_count > 0 else 2
+        min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
         if len(proj_candidates) >= min_needed:
             best_candidates = proj_candidates
             best_strategy = "projection"
@@ -965,7 +965,7 @@ def detect_from_mask(mask_path, expected_count=0):
 
         print(f"[Mask] Strategy '{strategy_name}': found {len(candidates)} candidates (expected ~{expected_count})", file=sys.stderr, flush=True)
 
-        min_needed = max(2, int(expected_count * 0.7)) if expected_count > 0 else 2
+        min_needed = max(1, int(expected_count * 0.7)) if expected_count > 0 else 1
         if len(candidates) >= min_needed:
             if len(candidates) > len(best_candidates):
                 best_candidates = candidates
@@ -1021,15 +1021,15 @@ def find_panel_contours(binary_img, width, height, img_area, expected_count):
 
 
 def finalize_candidates(candidates, expected_count, height):
-    """Deduplicate, sort by area, sort reading order."""
+    """Deduplicate, sort by area, trim to expected count, sort reading order."""
     if not candidates:
         return []
     
     candidates = deduplicate_rectangles(candidates)
     candidates.sort(key=lambda r: r['area'], reverse=True)
     
-    # No hard trim — let detection find what actually exists
-    # (expected_count is only a hint, not ground truth)
+    if expected_count > 0 and len(candidates) > expected_count:
+        candidates = candidates[:expected_count]
     
     for c in candidates:
         c.pop('area', None)
