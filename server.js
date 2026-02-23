@@ -937,12 +937,12 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
   const maskPanels = maskResult ? maskResult.images : null;
   const maskCentroids = maskResult ? maskResult.panelCentroids : null;
 
-  if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
-    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
+  if (maskPanels && maskPanels.length >= Math.max(2, Math.ceil(expectedCount * 0.7))) {
+    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels`);
     return { images: maskPanels, panelCentroids: maskCentroids };
   }
 
-  console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
+  console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}) — falling back to Vision`);
 
   // === FALLBACK: Claude Vision with dual-image ===
   const client = getAnthropicClient();
@@ -951,7 +951,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
 
-  console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} original + mask (expecting ~${expectedCount} panels)`);
+  console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} original + mask`);
 
   const response = await apiCallWithRetry(() => client.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -968,8 +968,6 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
 
 Use BOTH images to identify the drawing panels. The original shows the actual content and any border lines. The mask helps distinguish panels from background on photo-heavy boards.
 
-There are approximately ${expectedCount} panels arranged in rows.
-
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
 CRITICAL: Return TIGHT bounding boxes around the ILLUSTRATION/ARTWORK ONLY.
@@ -978,6 +976,8 @@ CRITICAL: Return TIGHT bounding boxes around the ILLUSTRATION/ARTWORK ONLY.
 - The bounding box should END where the drawing/photo ends, NOT where the text below it ends.
 - Caption text is typically printed in a separate zone under each panel with a small gap — exclude that zone entirely.
 - If there is a visible border around the illustration, the bounding box should match the border edges.
+- Do NOT include blank/white areas, title text blocks, or non-image content as panels.
+- Only return panels that contain actual artwork, photographs, or illustrations.
 
 Return ONLY JSON:
 {
@@ -1579,8 +1579,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               try {
                 const cvResult = await detectRectangles(imgPath);
                 if (cvResult.mode === 'grid') {
-                  const expectedMin = Math.max(1, Math.ceil(textFrameCount * 0.9));
-                  if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
+                  if (cvResult.count >= 2 && cvResult.images && cvResult.images.length >= 1) {
                     // Compute normalized centroids from grid rectangles
                     const imgMeta = await sharp(await fs.readFile(imgPath)).metadata();
                     const gridCentroids = (cvResult.rectangles || []).map(r => ({
