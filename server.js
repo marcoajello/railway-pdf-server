@@ -785,6 +785,39 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
 
     console.log(`[Storyboard] Mask-OpenCV: found ${result.count} panels`);
 
+    // Row-height normalization (same logic as Vision path)
+    const rects = result.rectangles;
+    if (rects.length >= 2) {
+      const maskH = maskMeta.height;
+      const sorted = rects.slice().sort((a, b) => a.y - b.y);
+      const rowGap = maskH * 0.08;
+      const rows = [];
+      let currentRow = [sorted[0]];
+      for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i].y - currentRow[0].y > rowGap) {
+          rows.push(currentRow);
+          currentRow = [sorted[i]];
+        } else {
+          currentRow.push(sorted[i]);
+        }
+      }
+      rows.push(currentRow);
+
+      for (const row of rows) {
+        if (row.length < 2) continue;
+        const minH = Math.min(...row.map(r => r.height));
+        const maxH = Math.max(...row.map(r => r.height));
+        if ((maxH - minH) / minH > 0.10) {
+          for (const r of row) {
+            if (r.height > minH) {
+              console.log(`[Storyboard] Row-norm (mask): panel at (${r.x},${r.y}) height ${r.height}→${minH}`);
+              r.height = minH;
+            }
+          }
+        }
+      }
+    }
+
     // Crop from full-resolution original with scaled coordinates
     const images = [];
     for (const rect of result.rectangles) {
@@ -988,6 +1021,42 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
   }
 
   console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
+
+  // Row-height normalization: storyboard panels in the same row are always the
+  // same height. Vision sometimes includes caption text below a panel, making
+  // that bbox taller than its neighbors. Group by row, use the minimum height.
+  if (panels.length >= 2) {
+    // Sort by y to cluster into rows
+    const sorted = panels.slice().sort((a, b) => a.y - b.y);
+    const rowGap = imgH * 0.08; // panels within 8% of page height are same row
+    const rows = [];
+    let currentRow = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i].y - currentRow[0].y > rowGap) {
+        rows.push(currentRow);
+        currentRow = [sorted[i]];
+      } else {
+        currentRow.push(sorted[i]);
+      }
+    }
+    rows.push(currentRow);
+
+    for (const row of rows) {
+      if (row.length < 2) continue;
+      const minH = Math.min(...row.map(p => p.h));
+      const maxH = Math.max(...row.map(p => p.h));
+      // Only clamp if there's meaningful variance (>10% difference)
+      if ((maxH - minH) / minH > 0.10) {
+        const clampH = minH;
+        for (const p of row) {
+          if (p.h > clampH) {
+            console.log(`[Storyboard] Row-norm: panel at (${p.x},${p.y}) height ${p.h}→${clampH} (trimmed ${p.h - clampH}px caption)`);
+            p.h = clampH;
+          }
+        }
+      }
+    }
+  }
 
   // Crop from original resolution image, then erase caption text from each crop
   const images = [];
