@@ -616,6 +616,217 @@ def detect_from_projection_profile(img_gray, inverted, width, height, img_area, 
     return all_panels
 
 
+def find_columns_by_valleys(v_smooth, width, num_cols):
+    """
+    Find column boundaries by locating the N-1 deepest valleys
+    in the vertical projection profile. Unlike threshold-based detection,
+    this works even when gaps between photo panels don't fully drop to zero.
+    """
+    if num_cols <= 1:
+        for i in range(width):
+            if v_smooth[i] > 0.05:
+                left = i
+                break
+        else:
+            left = 0
+        for i in range(width - 1, -1, -1):
+            if v_smooth[i] > 0.05:
+                right = i + 1
+                break
+        else:
+            right = width
+        return [(left, right)]
+
+    needed_valleys = num_cols - 1
+
+    # Find all local minima with a reasonably wide window
+    window = max(8, width // 60)
+    minima = []
+    for i in range(window, width - window):
+        is_min = True
+        for j in range(i - window, i + window + 1):
+            if j != i and v_smooth[j] < v_smooth[i]:
+                is_min = False
+                break
+        if is_min:
+            minima.append((i, float(v_smooth[i])))
+
+    if len(minima) < needed_valleys:
+        # Not enough valleys — divide content extent equally
+        for i in range(width):
+            if v_smooth[i] > 0.03:
+                left = i
+                break
+        else:
+            left = 0
+        for i in range(width - 1, -1, -1):
+            if v_smooth[i] > 0.03:
+                right = i + 1
+                break
+        else:
+            right = width
+        step = (right - left) // num_cols
+        return [(left + i * step, left + (i + 1) * step) for i in range(num_cols)]
+
+    # Sort by depth (lowest value = deepest valley = best gap)
+    minima.sort(key=lambda m: m[1])
+
+    # Take the deepest N-1 valleys, sorted by x position
+    valley_xs = sorted([m[0] for m in minima[:needed_valleys]])
+
+    # Find overall content extent
+    for i in range(width):
+        if v_smooth[i] > 0.03:
+            left_edge = i
+            break
+    else:
+        left_edge = 0
+    for i in range(width - 1, -1, -1):
+        if v_smooth[i] > 0.03:
+            right_edge = i + 1
+            break
+    else:
+        right_edge = width
+
+    # Build column spans using valley centers as dividers
+    spans = []
+    prev = left_edge
+    for vx in valley_xs:
+        spans.append((prev, vx))
+        prev = vx
+    spans.append((prev, right_edge))
+
+    return spans
+
+
+def detect_grid_guided(mask_path, num_rows, num_cols):
+    """
+    Grid-guided panel detection. Vision has already told us the layout
+    (e.g., 2 rows × 3 columns). We use that semantic knowledge to guide
+    pixel-level operations:
+
+    1. OCR-erase text from mask (captions become background)
+    2. Horizontal projection → find row bands (text-free = tight photo bounds)
+    3. Within each row, find column gaps by locating deepest valleys
+       (no threshold needed — we know exactly how many gaps to find)
+    4. Within each cell, find tight content bounds on the cleaned mask
+    """
+    img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return [], []
+
+    height, width = img.shape[:2]
+
+    # Step 0: OCR erase text from mask
+    cleaned, text_boxes = erase_text_from_mask(img, mask_path)
+    inverted = cv2.bitwise_not(cleaned)
+
+    # Step 1: Horizontal projection → row bands
+    h_proj = np.mean(inverted > 128, axis=1)
+    smooth_k = max(5, height // 60)
+    if smooth_k % 2 == 0:
+        smooth_k += 1
+    h_smooth = np.convolve(h_proj, np.ones(smooth_k) / smooth_k, mode='same')
+
+    # Find content bands (after text erasure, these should be just photo rows)
+    gap_threshold = 0.08
+    min_content_height = height // (num_rows * 4)
+
+    is_content = h_smooth > gap_threshold
+    content_bands = []
+    in_band = False
+    band_start = 0
+    for i in range(height):
+        if is_content[i] and not in_band:
+            band_start = i
+            in_band = True
+        elif not is_content[i] and in_band:
+            if i - band_start >= min_content_height:
+                content_bands.append((band_start, i))
+            in_band = False
+    if in_band and height - band_start >= min_content_height:
+        content_bands.append((band_start, height))
+
+    # We expect num_rows bands — take the largest if we found more
+    if len(content_bands) > num_rows:
+        content_bands = sorted(content_bands, key=lambda b: b[1] - b[0], reverse=True)[:num_rows]
+        content_bands.sort(key=lambda b: b[0])
+
+    if len(content_bands) < num_rows:
+        print(f"[Grid] Found only {len(content_bands)} row bands, expected {num_rows} — cannot proceed",
+              file=sys.stderr, flush=True)
+        return [], text_boxes
+
+    print(f"[Grid] Found {len(content_bands)} row bands: {content_bands}",
+          file=sys.stderr, flush=True)
+
+    # Step 2: Within each row, find column boundaries using valley detection
+    panels = []
+    for row_idx, (band_top, band_bottom) in enumerate(content_bands):
+        row_inv = inverted[band_top:band_bottom, :]
+        v_proj = np.mean(row_inv > 128, axis=0)
+
+        smooth_v = max(3, width // 100)
+        if smooth_v % 2 == 0:
+            smooth_v += 1
+        v_smooth = np.convolve(v_proj, np.ones(smooth_v) / smooth_v, mode='same')
+
+        col_spans = find_columns_by_valleys(v_smooth, width, num_cols)
+
+        for col_left, col_right in col_spans:
+            # Step 3: Tight content bounds within each cell
+            cell = inverted[band_top:band_bottom, col_left:col_right]
+            cell_h, cell_w = cell.shape[:2]
+            if cell_h < 5 or cell_w < 5:
+                continue
+
+            # Tight vertical bounds
+            row_density = np.mean(cell > 128, axis=1)
+            content_top = 0
+            content_bottom = cell_h
+            for i in range(cell_h):
+                if row_density[i] > 0.05:
+                    content_top = i
+                    break
+            for i in range(cell_h - 1, -1, -1):
+                if row_density[i] > 0.05:
+                    content_bottom = i + 1
+                    break
+
+            # Tight horizontal bounds
+            col_density = np.mean(cell > 128, axis=0)
+            content_left = 0
+            content_right = cell_w
+            for i in range(cell_w):
+                if col_density[i] > 0.05:
+                    content_left = i
+                    break
+            for i in range(cell_w - 1, -1, -1):
+                if col_density[i] > 0.05:
+                    content_right = i + 1
+                    break
+
+            panels.append({
+                'x': int(col_left + content_left),
+                'y': int(band_top + content_top),
+                'width': int(content_right - content_left),
+                'height': int(content_bottom - content_top)
+            })
+
+        panel_desc = [f"({p['x']},{p['y']} {p['width']}x{p['height']})" for p in panels[-len(col_spans):]]
+        print(f"[Grid] Row {row_idx + 1}: {len(col_spans)} columns → {panel_desc}",
+              file=sys.stderr, flush=True)
+
+    # Sort reading order
+    row_threshold = max(150, height // 10)
+    panels.sort(key=lambda r: (r['y'] // row_threshold, r['x']))
+
+    print(f"[Grid] Total: {len(panels)} panels from {num_rows}x{num_cols} grid",
+          file=sys.stderr, flush=True)
+
+    return panels, text_boxes
+
+
 def detect_from_mask(mask_path, expected_count=0):
     """
     Detect panels from a pre-thresholded binary mask image.
@@ -821,6 +1032,21 @@ if __name__ == '__main__':
             # Returns base64 JPEG of cleaned image, or null if no text found.
             cleaned_b64 = erase_text_from_crop(image_path)
             result = {'cleaned': cleaned_b64}
+            print(json.dumps(result))
+
+        elif mode_arg == 'grid':
+            # Grid-guided mode: Vision told us the layout (e.g., 2x3)
+            # argv[3] = rows, argv[4] = cols
+            num_rows = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+            num_cols = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+
+            rects, ocr_text_boxes = detect_grid_guided(image_path, num_rows, num_cols)
+            result = {
+                'count': len(rects),
+                'mode': 'grid_guided',
+                'rectangles': rects,
+                'textBoxes': ocr_text_boxes
+            }
             print(json.dumps(result))
 
         elif mode_arg == 'mask':
