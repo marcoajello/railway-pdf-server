@@ -802,6 +802,67 @@ def detect_from_projection_profile(img_gray, inverted, width, height, img_area, 
             })
 
     print(f"[Projection] Found {len(all_panels)} panels total", file=sys.stderr, flush=True)
+
+    # Merge narrow outliers: if we found more panels than expected,
+    # check each row for panels significantly narrower than their neighbors.
+    # This catches false vertical splits from artwork detail or compression artifacts.
+    if expected_count > 0 and len(all_panels) > expected_count:
+        # Group panels by row (same y coordinate)
+        rows = {}
+        for p in all_panels:
+            key = p['y']
+            if key not in rows:
+                rows[key] = []
+            rows[key].append(p)
+
+        merged_panels = []
+        for y_key in sorted(rows.keys()):
+            row_panels = sorted(rows[y_key], key=lambda p: p['x'])
+            if len(row_panels) <= 1:
+                merged_panels.extend(row_panels)
+                continue
+
+            # Compute median width for this row
+            row_widths = [p['width'] for p in row_panels]
+            median_w = sorted(row_widths)[len(row_widths) // 2]
+
+            # Merge any panel that's less than 40% of median width with its neighbor
+            i = 0
+            while i < len(row_panels):
+                p = row_panels[i]
+                if p['width'] < median_w * 0.4 and i + 1 < len(row_panels):
+                    # Merge with next panel
+                    nxt = row_panels[i + 1]
+                    merged = {
+                        'x': p['x'],
+                        'y': p['y'],
+                        'width': (nxt['x'] + nxt['width']) - p['x'],
+                        'height': max(p['height'], nxt['height']),
+                        'area': float(((nxt['x'] + nxt['width']) - p['x']) * max(p['height'], nxt['height'])),
+                        'fill': 0.5
+                    }
+                    merged_panels.append(merged)
+                    print(f"[Projection] Merged narrow panel ({p['width']}px) with neighbor → {merged['width']}px",
+                          file=sys.stderr, flush=True)
+                    i += 2
+                elif p['width'] < median_w * 0.4 and i > 0:
+                    # Merge with previous (already added) — extend it
+                    prev = merged_panels[-1]
+                    new_right = p['x'] + p['width']
+                    prev['width'] = new_right - prev['x']
+                    prev['area'] = float(prev['width'] * prev['height'])
+                    print(f"[Projection] Merged narrow panel ({p['width']}px) into previous → {prev['width']}px",
+                          file=sys.stderr, flush=True)
+                    i += 1
+                else:
+                    merged_panels.append(p)
+                    i += 1
+
+        if len(merged_panels) < len(all_panels):
+            print(f"[Projection] After merge: {len(merged_panels)} panels (was {len(all_panels)})",
+                  file=sys.stderr, flush=True)
+            all_panels = merged_panels
+
     return all_panels
 
 
