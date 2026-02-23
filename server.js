@@ -703,9 +703,10 @@ RULES:
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- NEVER skip frames - include ALL frames even if they have no text (use empty strings)
-- The number of frames you return MUST match the grid layout (e.g. 2x3 = 6 frames)
-- Each caption/description belongs to the image DIRECTLY ABOVE it` }
+- Include frames even if they have no text (use empty strings)
+- If a single caption spans multiple panels, create one frame entry per PANEL (duplicate the caption text)
+- Each caption/description belongs to the image DIRECTLY ABOVE it
+- Count the actual PANELS in the grid visually — the number of frames should match the number of visual panels` }
       ]
     }]
   });
@@ -966,12 +967,14 @@ There are approximately ${expectedCount} panels arranged in rows.
 
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
-CRITICAL: Return TIGHT bounding boxes around the ILLUSTRATION/ARTWORK ONLY.
-- Do NOT include text captions, descriptions, or dialogue that appears BELOW, BESIDE, or ABOVE each panel.
+CRITICAL BOUNDING BOX RULES:
+- The BOTTOM EDGE of each bounding box must be where the artwork/photo ENDS.
+- Below each panel there is typically a GAP of whitespace, then CAPTION TEXT (descriptions, dialogue, frame numbers).
+- Your h (height) value must NOT extend into or past that whitespace gap.
+- If the artwork has a visible border, crop to the border's bottom edge.
+- If there is no visible border, crop to where photo/drawing content stops and empty space begins.
 - Do NOT include frame number labels (e.g. "1", "2A", "FR 3").
-- The bounding box should END where the drawing/photo ends, NOT where the text below it ends.
-- Caption text is typically printed in a separate zone under each panel with a small gap — exclude that zone entirely.
-- If there is a visible border around the illustration, the bounding box should match the border edges.
+- When in doubt, make the panel SHORTER rather than taller — it's better to lose a sliver of artwork than to include caption text.
 
 Return ONLY JSON:
 {
@@ -1564,16 +1567,32 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
           const textFrameCount = textData.frames?.length || 0;
           const boardType = textData.boardType || 'photo';
+          
+          // Compute expected panel count from grid layout (more reliable than text frame count)
+          // gridLayout like "3x5" means 3 columns x 5 rows = 15 panels
+          let expectedPanelCount = textFrameCount;
+          if (textData.gridLayout) {
+            const gridMatch = textData.gridLayout.match(/(\d+)\s*x\s*(\d+)/i);
+            if (gridMatch) {
+              const gridCount = parseInt(gridMatch[1]) * parseInt(gridMatch[2]);
+              if (gridCount >= 1) {
+                expectedPanelCount = gridCount;
+                if (gridCount !== textFrameCount) {
+                  console.log(`[Storyboard] Page ${pageNum}: grid ${textData.gridLayout}=${gridCount} panels, text extracted ${textFrameCount} frames — using grid count`);
+                }
+              }
+            }
+          }
 
           let detected = { count: 0, bordered: false, mode: 'none', images: [], panelCentroids: [] };
           
-          if (textFrameCount >= 1) {
+          if (expectedPanelCount >= 1) {
             // Hand-drawn boards: try OpenCV grid first (pixel-perfect for ink/pencil borders)
             if (boardType === 'hand_drawn') {
               try {
                 const cvResult = await detectRectangles(imgPath);
                 if (cvResult.mode === 'grid') {
-                  const expectedMin = Math.max(1, Math.ceil(textFrameCount * 0.9));
+                  const expectedMin = Math.max(1, Math.ceil(expectedPanelCount * 0.9));
                   if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
                     // Compute normalized centroids from grid rectangles
                     const imgMeta = await sharp(await fs.readFile(imgPath)).metadata();
@@ -1582,9 +1601,9 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
                       cy: (r.y + r.height / 2) / imgMeta.height
                     }));
                     detected = { ...cvResult, panelCentroids: gridCentroids };
-                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found ${cvResult.count} panels (expected ~${textFrameCount})`);
+                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found ${cvResult.count} panels (expected ~${expectedPanelCount})`);
                   } else {
-                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
+                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found only ${cvResult.count}/${expectedPanelCount} panels — falling back to Vision`);
                   }
                 } else {
                   console.log(`[Storyboard] Page ${pageNum}: hand-drawn but no grid detected — falling back to Vision`);
@@ -1600,7 +1619,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
             if (detected.count < 1) {
               try {
                 const imageBuffer = await fs.readFile(imgPath);
-                const visionResult = await detectPanelsWithVision(imageBuffer, textFrameCount, boardType);
+                const visionResult = await detectPanelsWithVision(imageBuffer, expectedPanelCount, boardType);
                 const visionImages = visionResult.images || [];
                 const visionCentroids = visionResult.panelCentroids || [];
                 if (visionImages.length >= 1) {
@@ -1808,9 +1827,10 @@ RULES:
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- NEVER skip frames - include ALL frames even if they have no text (use empty strings)
-- The number of frames you return MUST match the grid layout (e.g. 2x3 = 6 frames)
-- Each caption/description belongs to the image DIRECTLY ABOVE it` });
+- Include frames even if they have no text (use empty strings)
+- If a single caption spans multiple panels, create one frame entry per PANEL (duplicate the caption text)
+- Each caption/description belongs to the image DIRECTLY ABOVE it
+- Count the actual PANELS in the grid visually — the number of frames should match the number of visual panels` });
   
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
