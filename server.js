@@ -683,6 +683,8 @@ STEP 4 - FRAME NUMBERS:
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
+For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).
+
 Return JSON:
 {
   "spotName": "EXACT TITLE FROM PAGE" or null,
@@ -693,17 +695,23 @@ Return JSON:
     {
       "frameNumber": "1",
       "description": "Action/direction text",
-      "dialog": "CHARACTER: Spoken lines..."
+      "dialog": "CHARACTER: Spoken lines...",
+      "panelX": 25,
+      "panelY": 35
     }
   ]
 }
+
+panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Skip empty frames` }
+- Text may appear below, beside, or near its panel — pair each text block with its nearest image
+- Include frames even if they have no text (use empty strings for description/dialog)
+- If a panel has no associated text, still include it with empty strings` }
       ]
     }]
   });
@@ -785,12 +793,19 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
 
     // Crop from full-resolution original with scaled coordinates
     const images = [];
+    const panelCentroids = []; // Normalized 0-1 centroids for proximity matching
     for (const rect of result.rectangles) {
       try {
         const x = Math.max(0, Math.round(rect.x * scaleX));
         const y = Math.max(0, Math.round(rect.y * scaleY));
         const w = Math.min(Math.round(rect.width * scaleX), origMeta.width - x);
         const h = Math.min(Math.round(rect.height * scaleY), origMeta.height - y);
+
+        // Store normalized centroid (0-1 relative to page)
+        panelCentroids.push({
+          cx: (rect.x + rect.width / 2) / maskMeta.width,
+          cy: (rect.y + rect.height / 2) / maskMeta.height
+        });
 
         if (w < 20 || h < 20) {
           images.push(null);
@@ -823,7 +838,7 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
       }
     }
 
-    return images;
+    return { images, panelCentroids };
 
   } catch (e) {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -918,18 +933,20 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
     .toBuffer();
 
   // === HYBRID STEP: Try OpenCV on mask first ===
-  const maskPanels = await detectPanelsFromMask(mask, imageBuffer, expectedCount, boardType);
+  const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount, boardType);
+  const maskPanels = maskResult ? maskResult.images : null;
+  const maskCentroids = maskResult ? maskResult.panelCentroids : null;
 
   if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
     console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
-    return maskPanels;
+    return { images: maskPanels, panelCentroids: maskCentroids };
   }
 
   console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
 
   // === FALLBACK: Claude Vision with dual-image ===
   const client = getAnthropicClient();
-  if (!client) return [];
+  if (!client) return { images: [], panelCentroids: [] };
 
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
@@ -990,14 +1007,20 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         panels = JSON.parse(objMatch[0]).panels || [];
       } catch (_) {
         console.error('[Storyboard] Vision: failed to parse response');
-        return [];
+        return { images: [], panelCentroids: [] };
       }
     } else {
-      return [];
+      return { images: [], panelCentroids: [] };
     }
   }
 
   console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
+
+  // Compute normalized centroids from Vision-reported panel positions
+  const panelCentroids = panels.map(p => ({
+    cx: (p.x + p.w / 2) / imgW,
+    cy: (p.y + p.h / 2) / imgH
+  }));
 
   // Crop from original resolution image
   const images = [];
@@ -1041,7 +1064,7 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
     }
   }
 
-  return images;
+  return { images, panelCentroids };
 }
 
 /**
@@ -1548,7 +1571,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           const textFrameCount = textData.frames?.length || 0;
           const boardType = textData.boardType || 'photo';
 
-          let detected = { count: 0, bordered: false, mode: 'none', images: [] };
+          let detected = { count: 0, bordered: false, mode: 'none', images: [], panelCentroids: [] };
           
           if (textFrameCount >= 1) {
             // Hand-drawn boards: try OpenCV grid first (pixel-perfect for ink/pencil borders)
@@ -1558,7 +1581,13 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
                 if (cvResult.mode === 'grid') {
                   const expectedMin = Math.max(1, Math.ceil(textFrameCount * 0.9));
                   if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
-                    detected = cvResult;
+                    // Compute normalized centroids from grid rectangles
+                    const imgMeta = await sharp(await fs.readFile(imgPath)).metadata();
+                    const gridCentroids = (cvResult.rectangles || []).map(r => ({
+                      cx: (r.x + r.width / 2) / imgMeta.width,
+                      cy: (r.y + r.height / 2) / imgMeta.height
+                    }));
+                    detected = { ...cvResult, panelCentroids: gridCentroids };
                     console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found ${cvResult.count} panels (expected ~${textFrameCount})`);
                   } else {
                     console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
@@ -1577,9 +1606,11 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
             if (detected.count < 1) {
               try {
                 const imageBuffer = await fs.readFile(imgPath);
-                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount, boardType);
+                const visionResult = await detectPanelsWithVision(imageBuffer, textFrameCount, boardType);
+                const visionImages = visionResult.images || [];
+                const visionCentroids = visionResult.panelCentroids || [];
                 if (visionImages.length >= 1) {
-                  detected = { count: visionImages.length, bordered: false, mode: 'vision', images: visionImages };
+                  detected = { count: visionImages.length, bordered: false, mode: 'vision', images: visionImages, panelCentroids: visionCentroids };
                   console.log(`[Storyboard] Page ${pageNum}: Vision found ${visionImages.length} panels`);
                 }
               } catch (e) {
@@ -1626,22 +1657,107 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       
       const textFrames = textData.frames || [];
       const images = detected.images || [];
+      const panelCentroids = detected.panelCentroids || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
       
-      const maxLen = Math.max(textFrames.length, images.length);
-      for (let j = 0; j < maxLen; j++) {
-        const tf = textFrames[j] || {};
-        const img = images[j] || null;
+      // === PROXIMITY MATCHING ===
+      // Match text frames to detected panels by spatial position instead of blind index
+      const hasPanelPositions = panelCentroids.length === images.length && panelCentroids.length > 0;
+      const hasTextPositions = textFrames.some(tf => tf.panelX != null && tf.panelY != null);
+      
+      if (hasPanelPositions && hasTextPositions && textFrames.length > 0 && images.length > 0) {
+        // Proximity matching: pair each panel with its nearest text frame
+        const usedTextIndices = new Set();
+        const panelToText = new Array(images.length).fill(null);
         
-        allFrames.push({
-          frameNumber: tf.frameNumber || `${j + 1}`,
-          hasVisibleNumber: hasVisibleNumbers,
-          description: tf.description || '',
-          dialog: tf.dialog || '',
-          image: img,
-          spotName: currentSpot,
-          pageNum: pageNum
+        // For each panel, find closest unmatched text frame
+        // Sort panels by Y then X (reading order) for deterministic matching
+        const panelOrder = panelCentroids.map((c, i) => ({ idx: i, cx: c.cx, cy: c.cy }));
+        panelOrder.sort((a, b) => {
+          const rowDiff = Math.abs(a.cy - b.cy);
+          if (rowDiff < 0.08) return a.cx - b.cx; // Same row: sort by X
+          return a.cy - b.cy; // Different rows: sort by Y
         });
+        
+        for (const panel of panelOrder) {
+          let bestDist = Infinity;
+          let bestIdx = -1;
+          
+          for (let t = 0; t < textFrames.length; t++) {
+            if (usedTextIndices.has(t)) continue;
+            const tf = textFrames[t];
+            if (tf.panelX == null || tf.panelY == null) continue;
+            
+            // Distance between panel centroid and text-reported panel position
+            const dx = panel.cx - (tf.panelX / 100);
+            const dy = panel.cy - (tf.panelY / 100);
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestIdx = t;
+            }
+          }
+          
+          if (bestIdx >= 0 && bestDist < 0.4) { // Max 40% of page distance
+            panelToText[panel.idx] = bestIdx;
+            usedTextIndices.add(bestIdx);
+          }
+        }
+        
+        // Also handle text frames without panelX/panelY — match by remaining index order
+        const unmatchedPanels = [];
+        for (let i = 0; i < images.length; i++) {
+          if (panelToText[i] === null) unmatchedPanels.push(i);
+        }
+        const unmatchedTexts = [];
+        for (let t = 0; t < textFrames.length; t++) {
+          if (!usedTextIndices.has(t)) unmatchedTexts.push(t);
+        }
+        // Match remaining by order
+        for (let k = 0; k < Math.min(unmatchedPanels.length, unmatchedTexts.length); k++) {
+          panelToText[unmatchedPanels[k]] = unmatchedTexts[k];
+        }
+        
+        // Build frames from matched pairs
+        for (let i = 0; i < images.length; i++) {
+          const tIdx = panelToText[i];
+          const tf = tIdx !== null ? textFrames[tIdx] : {};
+          allFrames.push({
+            frameNumber: tf.frameNumber || `${i + 1}`,
+            hasVisibleNumber: hasVisibleNumbers,
+            description: tf.description || '',
+            dialog: tf.dialog || '',
+            image: images[i],
+            spotName: currentSpot,
+            pageNum: pageNum
+          });
+        }
+        
+        const matched = panelToText.filter(t => t !== null).length;
+        console.log(`[Storyboard] Page ${pageNum}: PROXIMITY matched ${matched}/${images.length} panels to ${textFrames.length} text frames`);
+        
+      } else {
+        // Fallback: index-based matching (when positions unavailable)
+        if (textFrames.length !== images.length && textFrames.length > 0 && images.length > 0) {
+          console.log(`[Storyboard] Page ${pageNum}: COUNT MISMATCH — text ${textFrames.length}, panels ${images.length} (index fallback)`);
+        }
+        
+        const maxLen = Math.max(textFrames.length, images.length);
+        for (let j = 0; j < maxLen; j++) {
+          const tf = textFrames[j] || {};
+          const img = images[j] || null;
+          
+          allFrames.push({
+            frameNumber: tf.frameNumber || `${j + 1}`,
+            hasVisibleNumber: hasVisibleNumbers,
+            description: tf.description || '',
+            dialog: tf.dialog || '',
+            image: img,
+            spotName: currentSpot,
+            pageNum: pageNum
+          });
+        }
       }
     }
     
@@ -1759,6 +1875,8 @@ STEP 4 - FRAME NUMBERS:
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
+For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).
+
 Return a JSON array with one object per page:
 [
   {
@@ -1768,18 +1886,22 @@ Return a JSON array with one object per page:
     "gridLayout": "2x3",
     "hasVisibleNumbers": true/false,
     "frames": [
-      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines..." }
+      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 }
     ]
   },
   { "pageNum": 2, ... }
 ]
+
+panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Skip empty frames` });
+- Text may appear below, beside, or near its panel — pair each text block with its nearest image
+- Include frames even if they have no text (use empty strings for description/dialog)
+- If a panel has no associated text, still include it with empty strings` });
   
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
