@@ -511,7 +511,7 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(180000);
     page.setDefaultTimeout(180000);
-    await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 2 });
+    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 2 });
     
     const base64Pdf = pdfBuffer.toString('base64');
     
@@ -553,7 +553,7 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
           const pdf = await pdfjsLib.getDocument({data: a}).promise;
           if (n > pdf.numPages) return null;
           const pg = await pdf.getPage(n);
-          const vp = pg.getViewport({scale: 3});
+          const vp = pg.getViewport({scale: 2});
           const c = document.getElementById('canvas');
           c.width = vp.width;
           c.height = vp.height;
@@ -607,8 +607,8 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
       await canvas.screenshot({ path: tempPath, type: 'png' });
       
       await sharp(tempPath)
-        .resize(2400, 2400, { fit: 'inside', withoutEnlargement: true })
-        .jpeg({ quality: 90, progressive: true })
+        .resize(1200, 1200, { fit: 'inside', withoutEnlargement: false })
+        .jpeg({ quality: 80, progressive: true })
         .toFile(imgPath);
       
       await fs.unlink(tempPath);
@@ -703,10 +703,7 @@ RULES:
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Include frames even if they have no text (use empty strings)
-- If a single caption spans multiple panels, create one frame entry per PANEL (duplicate the caption text)
-- Each caption/description belongs to the image DIRECTLY ABOVE it
-- Count the actual PANELS in the grid visually — the number of frames should match the number of visual panels` }
+- Skip empty frames` }
       ]
     }]
   });
@@ -725,7 +722,7 @@ RULES:
  * Detect panels from a pre-thresholded mask using OpenCV contour detection.
  * Returns array of base64 images cropped from the ORIGINAL full-res image, or null if detection fails.
  */
-async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount, boardType = 'photo') {
+async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount) {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mask-'));
   const maskPath = path.join(tmpDir, 'mask.jpg');
 
@@ -788,19 +785,12 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
 
     // Crop from full-resolution original with scaled coordinates
     const images = [];
-    const panelCentroids = []; // Normalized 0-1 centroids for proximity matching
     for (const rect of result.rectangles) {
       try {
         const x = Math.max(0, Math.round(rect.x * scaleX));
         const y = Math.max(0, Math.round(rect.y * scaleY));
         const w = Math.min(Math.round(rect.width * scaleX), origMeta.width - x);
         const h = Math.min(Math.round(rect.height * scaleY), origMeta.height - y);
-
-        // Store normalized centroid (0-1 relative to page)
-        panelCentroids.push({
-          cx: (rect.x + rect.width / 2) / maskMeta.width,
-          cy: (rect.y + rect.height / 2) / maskMeta.height
-        });
 
         if (w < 20 || h < 20) {
           images.push(null);
@@ -819,21 +809,14 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
           .jpeg({ quality: 85 })
           .toBuffer();
 
-        // Run per-panel text erasure (trim caption zone + OCR cleanup)
-        // Skip OCR for hand-drawn boards (Tesseract misreads artwork)
-        if (boardType === 'hand_drawn') {
-          images.push(cropped.toString('base64'));
-        } else {
-          const cleaned = await eraseTextFromCrop(cropped, images.length + 1);
-          images.push(cleaned || cropped.toString('base64'));
-        }
+        images.push(cropped.toString('base64'));
       } catch (e) {
         console.error('[Storyboard] Mask-OpenCV crop error:', e.message);
         images.push(null);
       }
     }
 
-    return { images, panelCentroids };
+    return images;
 
   } catch (e) {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -848,15 +831,15 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
  * 2. Try OpenCV contour detection on the mask (exact pixel edges)
  * 3. If that fails, fall back to Claude Vision with dual-image (approximate)
  */
-async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'photo') {
+async function detectPanelsWithVision(imageBuffer, expectedCount) {
   // Get original dimensions for cropping later
   const originalMeta = await sharp(imageBuffer).metadata();
   const origW = originalMeta.width;
   const origH = originalMeta.height;
 
-  // Resize original for processing (2000px for better Vision bbox precision)
+  // Resize original for processing
   const resized = await sharp(imageBuffer)
-    .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 85 })
     .toBuffer();
 
@@ -866,7 +849,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
 
   // Detect background color dynamically by sampling at multiple depths from edge
   const grayBuf = await sharp(imageBuffer)
-    .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .grayscale()
     .raw()
     .toBuffer({ resolveWithObject: true });
@@ -921,37 +904,25 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
 
   // Generate binary mask
   const mask = await sharp(imageBuffer)
-    .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
+    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
     .grayscale()
     .threshold(dynamicThreshold)
     .jpeg({ quality: 90 })
     .toBuffer();
 
   // === HYBRID STEP: Try OpenCV on mask first ===
-  const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount, boardType);
-  const maskPanels = maskResult ? maskResult.images : null;
-  const maskCentroids = maskResult ? maskResult.panelCentroids : null;
-  const maskCount = maskPanels ? maskPanels.length : 0;
+  const maskPanels = await detectPanelsFromMask(mask, imageBuffer, expectedCount);
 
-  // Always try Vision too (unless mask already found a strong result)
-  // "Strong" = found at least expectedCount panels, or found >= 8 panels with no expected hint
-  const maskIsStrong = maskCount >= Math.max(expectedCount, 4);
-  
-  if (maskIsStrong) {
-    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskCount} panels (expected ~${expectedCount})`);
-    return { images: maskPanels, panelCentroids: maskCentroids };
+  if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
+    console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
+    return maskPanels;
   }
 
-  // Mask found something but not enough — try Vision for a better result
-  console.log(`[Storyboard] Mask-OpenCV found ${maskCount} panels (expected ~${expectedCount}) — also trying Vision`);
+  console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
 
   // === FALLBACK: Claude Vision with dual-image ===
   const client = getAnthropicClient();
-  if (!client) {
-    // No API key — return mask result even if partial
-    if (maskCount >= 1) return { images: maskPanels, panelCentroids: maskCentroids };
-    return { images: [], panelCentroids: [] };
-  }
+  if (!client) return [];
 
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
@@ -971,17 +942,13 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
 1. The ORIGINAL storyboard page
 2. A HIGH-CONTRAST MASK where dark content appears black and background is white
 
-This is a production storyboard. Each panel cell typically has this vertical structure from top to bottom:
-  1. A label like "FRAME 1" or "FRAME 5" (small text above the artwork) — EXCLUDE this
-  2. The ARTWORK — a photograph, illustration, or rendered image — THIS IS WHAT I WANT
-  3. A whitespace gap
-  4. Caption text (descriptions, VO lines, dialogue) — EXCLUDE this
+Use BOTH images to identify the drawing panels. The original shows the actual content and any border lines. The mask helps distinguish panels from background on photo-heavy boards.
 
-Your job: return a bounding box for ONLY layer 2 (the artwork) of each panel.
+There are approximately ${expectedCount} panels arranged in rows.
 
-The artwork typically has crisp edges — either a visible border or a clear transition from image content to white space. The TOP of your bounding box should start where the image/photo begins (below any "FRAME N" label). The BOTTOM should end where the image/photo ends (above the whitespace gap before caption text).
+Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
-Find ALL panels on the page. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels.
+Skip headers, titles, text captions, and frame number labels — only return the drawing panels themselves.
 
 Return ONLY JSON:
 {
@@ -991,7 +958,7 @@ Return ONLY JSON:
   ]
 }
 
-x,y = top-left corner of artwork. w,h = width and height of artwork area ONLY.
+x,y = top-left corner. w,h = width and height in pixels.
 Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
       ]
     }]
@@ -1011,38 +978,24 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         panels = JSON.parse(objMatch[0]).panels || [];
       } catch (_) {
         console.error('[Storyboard] Vision: failed to parse response');
-        return { images: [], panelCentroids: [] };
+        return [];
       }
     } else {
-      return { images: [], panelCentroids: [] };
+      return [];
     }
   }
 
   console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
 
-  // Compute normalized centroids from Vision-reported panel positions
-  const panelCentroids = panels.map(p => ({
-    cx: (p.x + p.w / 2) / imgW,
-    cy: (p.y + p.h / 2) / imgH
-  }));
-
-  // Crop from original resolution image
+  // Crop from original resolution image, then erase caption text from each crop
   const images = [];
   for (let i = 0; i < panels.length; i++) {
     const p = panels[i];
     try {
-      // Apply small horizontal margin but NO vertical expansion
-      // Vision tends to include caption text above/below panels, so we keep height tight
-      const marginX = Math.round(p.w * 0.03);
-      const ex = Math.max(0, p.x - marginX);
-      const ey = p.y; // no vertical expansion
-      const ew = Math.min(p.w + marginX * 2, imgW - ex);
-      const eh = Math.min(p.h, imgH - ey); // no vertical expansion
-
-      const x = Math.max(0, Math.round(ex * scaleX));
-      const y = Math.max(0, Math.round(ey * scaleY));
-      const w = Math.min(Math.round(ew * scaleX), origW - x);
-      const h = Math.min(Math.round(eh * scaleY), origH - y);
+      const x = Math.max(0, Math.round(p.x * scaleX));
+      const y = Math.max(0, Math.round(p.y * scaleY));
+      const w = Math.min(Math.round(p.w * scaleX), origW - x);
+      const h = Math.min(Math.round(p.h * scaleY), origH - y);
 
       if (w < 20 || h < 20) {
         images.push(null);
@@ -1054,30 +1007,17 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         .jpeg({ quality: 85 })
         .toBuffer();
 
-      // Run per-panel text erasure — but skip OCR for hand-drawn boards
-      // (Tesseract misreads ink strokes as text, damaging artwork)
-      if (boardType === 'hand_drawn') {
-        images.push(cropped.toString('base64'));
-      } else {
-        const cleaned = await eraseTextFromCrop(cropped, i + 1);
-        images.push(cleaned || cropped.toString('base64'));
-      }
+      // Run per-panel OCR text erasure: find text in the bottom 40% of this
+      // individual crop and paint it with the background color
+      const cleaned = await eraseTextFromCrop(cropped, i + 1);
+      images.push(cleaned || cropped.toString('base64'));
     } catch (e) {
       console.error(`[Storyboard] Vision: crop error for panel:`, e.message);
       images.push(null);
     }
   }
 
-  const visionCount = images.filter(i => i !== null).length;
-  
-  // Compare Vision result with mask result — pick whichever found more panels
-  if (maskCount >= 1 && maskCount > visionCount) {
-    console.log(`[Storyboard] Mask had more panels (${maskCount}) than Vision (${visionCount}) — using mask`);
-    return { images: maskPanels, panelCentroids: maskCentroids };
-  }
-  
-  console.log(`[Storyboard] Using Vision result: ${visionCount} panels (mask had ${maskCount})`);
-  return { images, panelCentroids };
+  return images;
 }
 
 /**
@@ -1583,43 +1523,21 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
           const textFrameCount = textData.frames?.length || 0;
           const boardType = textData.boardType || 'photo';
-          
-          // Compute expected panel count from grid layout (more reliable than text frame count)
-          // gridLayout like "3x5" means 3 columns x 5 rows = 15 panels
-          let expectedPanelCount = textFrameCount;
-          if (textData.gridLayout) {
-            const gridMatch = textData.gridLayout.match(/(\d+)\s*x\s*(\d+)/i);
-            if (gridMatch) {
-              const gridCount = parseInt(gridMatch[1]) * parseInt(gridMatch[2]);
-              if (gridCount >= 1) {
-                expectedPanelCount = gridCount;
-                if (gridCount !== textFrameCount) {
-                  console.log(`[Storyboard] Page ${pageNum}: grid ${textData.gridLayout}=${gridCount} panels, text extracted ${textFrameCount} frames — using grid count`);
-                }
-              }
-            }
-          }
 
-          let detected = { count: 0, bordered: false, mode: 'none', images: [], panelCentroids: [] };
+          let detected = { count: 0, bordered: false, mode: 'none', images: [] };
           
-          if (expectedPanelCount >= 1) {
+          if (textFrameCount >= 1) {
             // Hand-drawn boards: try OpenCV grid first (pixel-perfect for ink/pencil borders)
             if (boardType === 'hand_drawn') {
               try {
                 const cvResult = await detectRectangles(imgPath);
                 if (cvResult.mode === 'grid') {
-                  const expectedMin = Math.max(1, Math.ceil(expectedPanelCount * 0.9));
+                  const expectedMin = Math.max(1, Math.ceil(textFrameCount * 0.9));
                   if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
-                    // Compute normalized centroids from grid rectangles
-                    const imgMeta = await sharp(await fs.readFile(imgPath)).metadata();
-                    const gridCentroids = (cvResult.rectangles || []).map(r => ({
-                      cx: (r.x + r.width / 2) / imgMeta.width,
-                      cy: (r.y + r.height / 2) / imgMeta.height
-                    }));
-                    detected = { ...cvResult, panelCentroids: gridCentroids };
-                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found ${cvResult.count} panels (expected ~${expectedPanelCount})`);
+                    detected = cvResult;
+                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found ${cvResult.count} panels (expected ~${textFrameCount})`);
                   } else {
-                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found only ${cvResult.count}/${expectedPanelCount} panels — falling back to Vision`);
+                    console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
                   }
                 } else {
                   console.log(`[Storyboard] Page ${pageNum}: hand-drawn but no grid detected — falling back to Vision`);
@@ -1635,11 +1553,9 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
             if (detected.count < 1) {
               try {
                 const imageBuffer = await fs.readFile(imgPath);
-                const visionResult = await detectPanelsWithVision(imageBuffer, expectedPanelCount, boardType);
-                const visionImages = visionResult.images || [];
-                const visionCentroids = visionResult.panelCentroids || [];
+                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
                 if (visionImages.length >= 1) {
-                  detected = { count: visionImages.length, bordered: false, mode: 'vision', images: visionImages, panelCentroids: visionCentroids };
+                  detected = { count: visionImages.length, bordered: false, mode: 'vision', images: visionImages };
                   console.log(`[Storyboard] Page ${pageNum}: Vision found ${visionImages.length} panels`);
                 }
               } catch (e) {
@@ -1655,26 +1571,6 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       allPageResults.push(...batchResults.flat());
     }
     
-    // Post-processing: run text erasure on grid-path images
-    // (Vision and Mask paths already do this during detection)
-    // Skip for hand-drawn boards — Tesseract misreads ink strokes as text
-    for (const result of allPageResults) {
-      const boardType = result.textData?.boardType || 'photo';
-      if (result.detected.mode === 'grid' && result.detected.images && boardType !== 'hand_drawn') {
-        const cleaned = await Promise.all(result.detected.images.map(async (img, i) => {
-          if (!img) return null;
-          try {
-            const buf = Buffer.from(img, 'base64');
-            const cleanedB64 = await eraseTextFromCrop(buf, i + 1);
-            return cleanedB64 || img;
-          } catch (e) {
-            return img;
-          }
-        }));
-        result.detected.images = cleaned;
-      }
-    }
-    
     // Sort by page number to maintain order
     allPageResults.sort((a, b) => a.pageNum - b.pageNum);
     
@@ -1687,10 +1583,6 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       const textFrames = textData.frames || [];
       const images = detected.images || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
-      
-      if (textFrames.length !== images.length && textFrames.length > 0 && images.length > 0) {
-        console.log(`[Storyboard] Page ${pageNum}: COUNT MISMATCH — text ${textFrames.length}, panels ${images.length}`);
-      }
       
       const maxLen = Math.max(textFrames.length, images.length);
       for (let j = 0; j < maxLen; j++) {
@@ -1843,10 +1735,7 @@ RULES:
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Include frames even if they have no text (use empty strings)
-- If a single caption spans multiple panels, create one frame entry per PANEL (duplicate the caption text)
-- Each caption/description belongs to the image DIRECTLY ABOVE it
-- Count the actual PANELS in the grid visually — the number of frames should match the number of visual panels` });
+- Skip empty frames` });
   
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
