@@ -1883,7 +1883,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       for (let i = 0; i < textBatches.length; i += CONCURRENCY) {
         const batchGroup = textBatches.slice(i, i + CONCURRENCY);
         await Promise.all(batchGroup.map(async (batch) => {
-          const textResults = await extractTextBatched(batch);
+          const textResults = await extractTextBatched(batch, { includeStructure: true });
 
           for (const textData of textResults) {
             const existing = allPageResults.find(r => r.pageNum === textData.pageNum && r.fromPdfStructure);
@@ -2269,7 +2269,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
 /**
  * Extract text from multiple pages in a single API call
  */
-async function extractTextBatched(pages) {
+async function extractTextBatched(pages, { includeStructure = false } = {}) {
   const client = getAnthropicClient();
   if (!client) throw new Error('ANTHROPIC_API_KEY not set');
   
@@ -2297,6 +2297,38 @@ async function extractTextBatched(pages) {
     content.push(imgContent);
   });
   
+  // Build the prompt — two variants:
+  // 1. includeStructure=true (Vision-first path): Claude determines multi-image groupings via imageCount
+  // 2. includeStructure=false (fallback path): simpler prompt, panel detection handled by OpenCV/Vision
+  const structureStep = includeStructure ? `
+STEP 5 - STRUCTURE DETECTION (CRITICAL):
+For each DISTINCT FRAME, determine how many separate IMAGE PANELS compose it:
+- imageCount: 1 = single image (normal frame — one image, one description)
+- imageCount: 2 = diptych or two-image sequence (pan, tilt, track, push, pull)
+- imageCount: 3 = triptych or three-image sequence
+- imageCount: 4+ = longer sequence (rare)
+
+Multi-image sequences are frames where 2+ adjacent images share ONE description/caption and show continuous camera motion (pan left/right, tilt up/down, track in/out, dolly, crane, etc.). The images are side-by-side in the same row.
+
+If images have SEPARATE descriptions or captions, they are SEPARATE frames with imageCount: 1 each — even if they sit next to each other in the same row.
+
+STEP 6 - EXTRACT:
+For each frame, extract text and estimate the PRIMARY image's center position on the page as a percentage (0-100).` : `
+STEP 5 - EXTRACT:
+For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).`;
+
+  const structureJsonExample = includeStructure
+    ? `{ "frameNumber": "1", "imageCount": 1, "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 }`
+    : `{ "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 }`;
+
+  const structureRules = includeStructure ? `
+- imageCount: MUST be present for every frame. Default is 1 (single image).
+- totalImageCount: sum of all imageCount values for the page. This MUST equal the total number of distinct image panels visible on the page.
+- CRITICAL: The sum of all imageCount values across frames MUST equal the total number of IMAGE PANELS on the page. For example: a 2x3 grid with 6 separate shots = 6 frames each with imageCount:1. A page with 4 separate shots and 1 three-image pan = 4 frames with imageCount:1 + 1 frame with imageCount:3 = totalImageCount:7.` : `
+- CRITICAL: Count ALL image panels on each page. The number of frames you return per page MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.`;
+
+  const totalImageCountField = includeStructure ? `\n    "totalImageCount": 6,` : '';
+
   content.push({ type: 'text', text: `Extract storyboard data from each page above.
 
 STEP 1 - SPOT/SCRIPT NAME (CRITICAL):
@@ -2317,20 +2349,7 @@ STEP 4 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, 1.1, 1.2, 3.1, etc.), use those EXACTLY as written
 - Decimal numbers like 1.1, 1.2, 2.1, 3.1 are common in storyboards — preserve the decimal format exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
-
-STEP 5 - STRUCTURE DETECTION (CRITICAL):
-For each DISTINCT FRAME, determine how many separate IMAGE PANELS compose it:
-- imageCount: 1 = single image (normal frame — one image, one description)
-- imageCount: 2 = diptych or two-image sequence (pan, tilt, track, push, pull)
-- imageCount: 3 = triptych or three-image sequence
-- imageCount: 4+ = longer sequence (rare)
-
-Multi-image sequences are frames where 2+ adjacent images share ONE description/caption and show continuous camera motion (pan left/right, tilt up/down, track in/out, dolly, crane, etc.). The images are side-by-side in the same row.
-
-If images have SEPARATE descriptions or captions, they are SEPARATE frames with imageCount: 1 each — even if they sit next to each other in the same row.
-
-STEP 6 - EXTRACT:
-For each frame, extract text and estimate the PRIMARY image's center position on the page as a percentage (0-100).
+${structureStep}
 
 Return a JSON array with one object per page:
 [
@@ -2339,26 +2358,21 @@ Return a JSON array with one object per page:
     "spotName": "EXACT TITLE FROM PAGE" or null,
     "boardType": "hand_drawn" or "photo",
     "gridLayout": "2x3",
-    "hasVisibleNumbers": true/false,
-    "totalImageCount": 6,
+    "hasVisibleNumbers": true/false,${totalImageCountField}
     "frames": [
-      { "frameNumber": "1", "imageCount": 1, "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 },
-      { "frameNumber": "2", "imageCount": 3, "description": "Pan across kitchen — camera tracks left to right", "dialog": "", "panelX": 50, "panelY": 65 }
+      ${structureJsonExample}
     ]
   },
   { "pageNum": 2, ... }
 ]
 
-panelX/panelY = approximate CENTER of the PRIMARY IMAGE (first image for multi-image sequences) as percentage of page width/height (0=left/top, 100=right/bottom).
+panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
-- dialog: spoken lines with character prefix
-- imageCount: MUST be present for every frame. Default is 1 (single image).
-- totalImageCount: sum of all imageCount values for the page. This MUST equal the total number of distinct image panels visible on the page.
-- CRITICAL: The sum of all imageCount values across frames MUST equal the total number of IMAGE PANELS on the page. For example: a 2x3 grid with 6 separate shots = 6 frames each with imageCount:1. A page with 4 separate shots and 1 three-image pan = 4 frames with imageCount:1 + 1 frame with imageCount:3 = totalImageCount:7.
+- dialog: spoken lines with character prefix${structureRules}
 - Include frames even if they have no text (use empty strings for description/dialog)
 - Text may appear below, beside, or near its panel — pair each text block with its nearest image` });
   
