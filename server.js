@@ -1244,6 +1244,88 @@ async function eraseTextFromCrop(croppedBuffer, panelNum) {
   }
 }
 
+/**
+ * Match Claude's frame structure to pdf_panels.py's images using imageCount.
+ *
+ * Claude says: [{imageCount:1}, {imageCount:1}, {imageCount:3}, {imageCount:1}]
+ * pdf_panels.py found: [img0, img1, img2, img3, img4, img5]
+ *
+ * Result:
+ * - Frame 0 → img0 (single)
+ * - Frame 1 → img1 (single)
+ * - Frame 2 → [img2, img3, img4] (3-image pan/triptych → subImages)
+ * - Frame 3 → img5 (single)
+ */
+function matchClaudeFramesToPdfImages(claudeFrames, pdfImages) {
+  const matched = [];
+  let imgIndex = 0;
+
+  for (const cf of claudeFrames) {
+    const imageCount = cf.imageCount || 1;
+
+    if (imgIndex >= pdfImages.length) {
+      // No more images — push frame with no image
+      matched.push({
+        frameNumber: cf.frameNumber || `${matched.length + 1}`,
+        description: cf.description || '',
+        dialog: cf.dialog || '',
+        panelX: cf.panelX ?? null,
+        panelY: cf.panelY ?? null,
+        image: null,
+        subImages: null
+      });
+      continue;
+    }
+
+    if (imageCount === 1) {
+      matched.push({
+        frameNumber: cf.frameNumber || `${matched.length + 1}`,
+        description: cf.description || '',
+        dialog: cf.dialog || '',
+        panelX: cf.panelX ?? null,
+        panelY: cf.panelY ?? null,
+        image: pdfImages[imgIndex].image,
+        subImages: null
+      });
+      imgIndex++;
+    } else {
+      // Multi-image frame (pan/tilt/track sequence)
+      const available = Math.min(imageCount, pdfImages.length - imgIndex);
+      const subImages = [];
+      for (let i = 0; i < available; i++) {
+        subImages.push(pdfImages[imgIndex + i].image);
+      }
+      matched.push({
+        frameNumber: cf.frameNumber || `${matched.length + 1}`,
+        description: cf.description || '',
+        dialog: cf.dialog || '',
+        panelX: cf.panelX ?? null,
+        panelY: cf.panelY ?? null,
+        image: subImages[0],
+        subImages: subImages
+      });
+      imgIndex += available;
+    }
+  }
+
+  // If there are leftover images pdf_panels.py found that Claude didn't account for,
+  // append them as extra single-image frames
+  while (imgIndex < pdfImages.length) {
+    matched.push({
+      frameNumber: `${matched.length + 1}`,
+      description: '',
+      dialog: '',
+      panelX: null,
+      panelY: null,
+      image: pdfImages[imgIndex].image,
+      subImages: null
+    });
+    imgIndex++;
+  }
+
+  return matched;
+}
+
 function groupIntoShots(frames) {
   const shots = [];
   let currentShot = null;
@@ -1679,13 +1761,29 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         if (pdfStructureResults) {
           for (const { pageNum, data } of pdfStructureResults.pages) {
             if (data && data.count > 0) {
-              // HYBRID APPROACH: pdf_panels.py handles images, Claude handles ALL text.
-              // Mark every page where pdf_panels.py found panel images as "handled".
-              // Text extraction quality doesn't matter — Claude Vision will read the
-              // rendered page image for frame numbers, descriptions, dialog, etc.
+              // VISION-FIRST: pdf_panels.py extracts images, Claude determines structure.
+              // Mark every page where pdf_panels.py found real panel images as "handled".
+              //
+              // EXCEPTION: Scanned PDFs have ONE huge image per page (the scan itself).
+              // If a page has only 1 image covering >70% of the page, it's probably a
+              // scan — skip it so Vision/OpenCV can detect individual panels within.
+              const images = data.images || data.panels || [];
+              if (images.length === 1) {
+                const img = images[0];
+                const pageW = data.pageWidth || 0;
+                const pageH = data.pageHeight || 0;
+                if (pageW > 0 && pageH > 0) {
+                  const imgArea = img.width * img.height;
+                  const pageArea = pageW * pageH;
+                  const coverage = imgArea / pageArea;
+                  if (coverage > 0.7) {
+                    console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py found 1 image covering ${Math.round(coverage * 100)}% of page — likely a scan, falling back to Vision/OpenCV`);
+                    continue;
+                  }
+                }
+              }
               pdfStructurePagesHandled.add(pageNum);
-              const triptychCount = data.panels.filter(p => p.triptych).length;
-              console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels (${triptychCount} triptychs) — using pdf images + Claude text`);
+              console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${images.length} images — Claude will determine structure`);
             }
           }
         }
@@ -1716,90 +1814,40 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const CONCURRENCY = 2;
     const allPageResults = [];
 
-    // First, build results for pdf_panels.py pages (no API calls needed for panel detection)
-    // Only process pages that were marked as "handled" (have both images AND text)
+    // First, build results for pdf_panels.py pages (images only — Claude handles all text/structure)
     if (pdfStructureResults) {
       for (const { pageNum, data } of pdfStructureResults.pages) {
         if (!data || data.count < 1) continue;
-        if (!pdfStructurePagesHandled.has(pageNum)) continue;  // Skip pages without text (hand-drawn)
+        if (!pdfStructurePagesHandled.has(pageNum)) continue;
 
-        // Build images and captions from pdf_panels.py output
-        const images = [];
-        const captions = [];
-        const panelCentroids = [];
-
-        for (const panel of data.panels) {
-          // For triptychs, use ALL sub-images; for regular panels, single image
-          // The images array holds arrays: [[img1,img2,img3], [img4], ...]
-          // so each panel slot can carry multiple images
-          if (panel.triptych && panel.images && panel.images.length > 1) {
-            images.push(panel.images);  // Array of sub-images
-          } else {
-            images.push(panel.image || null);  // Single image string
-          }
-          captions.push(panel.caption || '');
-
-          // Compute normalized centroids for matching
-          // pdf_panels.py returns coordinates in PDF points; we normalize to 0-1
-          const pageWidth = data.panels.reduce((max, p) => Math.max(max, p.x + p.width), 0);
-          const pageHeight = data.panels.reduce((max, p) => Math.max(max, p.y + p.height), 0);
-          if (pageWidth > 0 && pageHeight > 0) {
-            panelCentroids.push({
-              cx: (panel.x + panel.width / 2) / pageWidth,
-              cy: (panel.y + panel.height / 2) / pageHeight
-            });
-          }
-        }
+        // pdf_panels.py now returns simple {images: [{x, y, width, height, image}]}
+        const pdfImages = data.images || [];
 
         allPageResults.push({
           detected: {
-            count: images.length,
+            count: pdfImages.length,
             bordered: false,
             mode: 'pdf_structure',
-            images,
-            panelCentroids,
-            triptychs: data.panels.filter(p => p.triptych).map((p, i) => ({
-              panelIndex: data.panels.indexOf(p),
-              subImages: p.images || [p.image]
-            }))
+            pdfImages,  // Raw image list from pdf_panels.py (reading order)
+            images: pdfImages.map(img => img.image),  // Base64 strings for downstream compatibility
+            panelCentroids: pdfImages.map(img => {
+              const pageW = data.pageWidth || 1;
+              const pageH = data.pageHeight || 1;
+              return {
+                cx: (img.x + img.width / 2) / pageW,
+                cy: (img.y + img.height / 2) / pageH
+              };
+            })
           },
           textData: {
-            frames: data.panels.map((panel, idx) => {
-              // Extract frame number from frameLabel (standalone label above image)
-              const label = (panel.frameLabel || '').replace(/<[^>]*>/g, '').trim();
-              let frameNum = label.match(/^[\d.]+[A-Za-z]?$/)?.[0] || '';
-
-              // If no standalone label, try parsing number from start of caption
-              // e.g., "01: Wide, camera moves..." → "01"
-              // e.g., "Frame 3 - Description" → "3"
-              let description = (panel.caption || '').replace(/<[^>]*>/g, '').trim();
-              if (!frameNum && description) {
-                const captionNumMatch = description.match(/^(?:(?:FR|FRAME|SHOT)\s*)?(\d+(?:\.\d+)?[A-Za-z]?)\s*[:.\-–—]\s*/i);
-                if (captionNumMatch) {
-                  frameNum = captionNumMatch[1];
-                  // Remove the number prefix from description so it doesn't repeat
-                  description = description.slice(captionNumMatch[0].length).trim();
-                }
-              }
-
-              return {
-                frameNumber: frameNum,
-                description: description,
-                dialog: '',
-                panelX: panelCentroids[idx] ? Math.round(panelCentroids[idx].cx * 100) : null,
-                panelY: panelCentroids[idx] ? Math.round(panelCentroids[idx].cy * 100) : null
-              };
-            }),
-            boardType: 'photo',  // pdf_panels.py is mostly used for photo boards
+            // Placeholder — Claude will fill this in via Vision-first matching
+            frames: pdfImages.map(() => ({
+              frameNumber: '', description: '', dialog: '',
+              panelX: null, panelY: null
+            })),
+            boardType: 'photo',
             spotName: null,
-            hasVisibleNumbers: data.panels.some(p => {
-              const label = (p.frameLabel || '').replace(/<[^>]*>/g, '').trim();
-              if (label.match(/^[\d.]+[A-Za-z]?$/)) return true;
-              // Also check for numbers at start of caption
-              const cap = (p.caption || '').replace(/<[^>]*>/g, '').trim();
-              return !!cap.match(/^(?:(?:FR|FRAME|SHOT)\s*)?\d+(?:\.\d+)?[A-Za-z]?\s*[:.\-–—]/i);
-            }),
-            pdfStructureCaptions: captions  // Keep raw captions for reference
+            hasVisibleNumbers: false
           },
           pageNum,
           fromPdfStructure: true
@@ -1816,21 +1864,20 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       }
     }
 
-    // HYBRID: Send ALL pdf_panels.py pages to Claude for text extraction.
-    // Claude is the sole source of truth for frame numbers, descriptions, dialog, spotName.
-    const pdfStructurePagesThatNeedText = [];
+    // VISION-FIRST: Send ALL pdf_panels.py pages to Claude for structure + text.
+    // Claude determines which images are separate frames vs multi-image sequences.
+    const pdfStructurePagesForClaude = [];
     for (let i = 0; i < pageImages.length; i++) {
       const pageNum = i + 1;
       if (pdfStructurePagesHandled.has(pageNum)) {
-        pdfStructurePagesThatNeedText.push({ path: pageImages[i], pageNum });
+        pdfStructurePagesForClaude.push({ path: pageImages[i], pageNum });
       }
     }
 
-    // Run text extraction for pdf_panels.py pages (we need frame numbers, spotName, etc.)
-    if (pdfStructurePagesThatNeedText.length > 0) {
+    if (pdfStructurePagesForClaude.length > 0) {
       const textBatches = [];
-      for (let i = 0; i < pdfStructurePagesThatNeedText.length; i += BATCH_SIZE) {
-        textBatches.push(pdfStructurePagesThatNeedText.slice(i, i + BATCH_SIZE));
+      for (let i = 0; i < pdfStructurePagesForClaude.length; i += BATCH_SIZE) {
+        textBatches.push(pdfStructurePagesForClaude.slice(i, i + BATCH_SIZE));
       }
 
       for (let i = 0; i < textBatches.length; i += CONCURRENCY) {
@@ -1839,41 +1886,71 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           const textResults = await extractTextBatched(batch);
 
           for (const textData of textResults) {
-            // Find the matching pdf_panels.py result and merge text data
             const existing = allPageResults.find(r => r.pageNum === textData.pageNum && r.fromPdfStructure);
-            if (existing) {
-              // Merge Claude's text extraction with pdf_panels.py's panel images
-              existing.textData.spotName = textData.spotName || existing.textData.spotName;
-              existing.textData.boardType = textData.boardType || existing.textData.boardType;
-              existing.textData.hasVisibleNumbers = textData.hasVisibleNumbers || false;
-              existing.textData.gridLayout = textData.gridLayout;
+            if (!existing) continue;
 
-              // HYBRID APPROACH: Always use Claude's text over pdf_panels.py's.
-              // pdf_panels.py panel count is the source of truth for images.
-              // Claude Vision is the source of truth for ALL text (frame numbers,
-              // descriptions, dialog, scene headings).
-              const pdfPanelCount = existing.detected.count;
-              const claudeFrameCount = textData.frames?.length || 0;
+            // Update metadata from Claude
+            existing.textData.spotName = textData.spotName || null;
+            existing.textData.boardType = textData.boardType || 'photo';
+            existing.textData.hasVisibleNumbers = textData.hasVisibleNumbers || false;
+            existing.textData.gridLayout = textData.gridLayout;
 
-              if (claudeFrameCount > 0) {
-                // Build merged frames: Claude's text, padded/trimmed to pdf panel count
-                const mergedFrames = [];
-                for (let fi = 0; fi < pdfPanelCount; fi++) {
-                  const cf = (fi < claudeFrameCount) ? textData.frames[fi] : {};
-                  const existingFrame = existing.textData.frames[fi] || {};
-                  mergedFrames.push({
-                    frameNumber: cf.frameNumber || '',
-                    description: cf.description || '',
-                    dialog: cf.dialog || '',
-                    panelX: existingFrame.panelX ?? null,
-                    panelY: existingFrame.panelY ?? null
-                  });
-                }
-                existing.textData.frames = mergedFrames;
-                console.log(`[Storyboard] Page ${textData.pageNum}: using Claude text (${claudeFrameCount} frames) with pdf_panels.py images (${pdfPanelCount} panels)`);
-              } else {
-                console.log(`[Storyboard] Page ${textData.pageNum}: Claude returned no frames — keeping pdf_panels.py text as fallback`);
+            const pdfImages = existing.detected.pdfImages || [];
+            const claudeFrames = textData.frames || [];
+            const claudeFrameCount = claudeFrames.length;
+
+            if (claudeFrameCount === 0) {
+              console.log(`[Storyboard] Page ${textData.pageNum}: Claude returned no frames — keeping ${pdfImages.length} images as individual frames`);
+              continue;
+            }
+
+            // Calculate total imageCount from Claude's structure
+            const totalImageCount = claudeFrames.reduce((sum, f) => sum + (f.imageCount || 1), 0);
+            const pdfImageCount = pdfImages.length;
+
+            if (totalImageCount === pdfImageCount) {
+              // Perfect match — use Vision-first matching
+              const matched = matchClaudeFramesToPdfImages(claudeFrames, pdfImages);
+
+              // Update detected images to reflect Claude's grouping
+              existing.detected.count = matched.length;
+              existing.detected.images = matched.map(f => {
+                if (f.subImages) return f.subImages;  // Array for multi-image frames
+                return f.image;  // String for single-image frames
+              });
+
+              // Update text data
+              existing.textData.frames = matched.map(f => ({
+                frameNumber: f.frameNumber,
+                description: f.description,
+                dialog: f.dialog,
+                panelX: f.panelX,
+                panelY: f.panelY
+              }));
+
+              const multiImageFrames = matched.filter(f => f.subImages);
+              console.log(`[Storyboard] Page ${textData.pageNum}: Vision-first matched ${claudeFrameCount} frames to ${pdfImageCount} images` +
+                (multiImageFrames.length > 0 ? ` (${multiImageFrames.length} multi-image sequences)` : ''));
+            } else {
+              // Count mismatch — fall back to index matching
+              console.log(`[Storyboard] Page ${textData.pageNum}: imageCount mismatch (Claude total: ${totalImageCount}, pdf images: ${pdfImageCount}) — falling back to index matching`);
+              const maxLen = Math.max(claudeFrameCount, pdfImageCount);
+              const mergedFrames = [];
+              const mergedImages = [];
+              for (let fi = 0; fi < maxLen; fi++) {
+                const cf = (fi < claudeFrameCount) ? claudeFrames[fi] : {};
+                mergedFrames.push({
+                  frameNumber: cf.frameNumber || '',
+                  description: cf.description || '',
+                  dialog: cf.dialog || '',
+                  panelX: cf.panelX ?? null,
+                  panelY: cf.panelY ?? null
+                });
+                mergedImages.push(fi < pdfImageCount ? pdfImages[fi].image : null);
               }
+              existing.detected.count = mergedImages.length;
+              existing.detected.images = mergedImages;
+              existing.textData.frames = mergedFrames;
             }
           }
         }));
@@ -2241,8 +2318,19 @@ STEP 4 - FRAME NUMBERS:
 - Decimal numbers like 1.1, 1.2, 2.1, 3.1 are common in storyboards — preserve the decimal format exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
-STEP 5 - EXTRACT:
-For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).
+STEP 5 - STRUCTURE DETECTION (CRITICAL):
+For each DISTINCT FRAME, determine how many separate IMAGE PANELS compose it:
+- imageCount: 1 = single image (normal frame — one image, one description)
+- imageCount: 2 = diptych or two-image sequence (pan, tilt, track, push, pull)
+- imageCount: 3 = triptych or three-image sequence
+- imageCount: 4+ = longer sequence (rare)
+
+Multi-image sequences are frames where 2+ adjacent images share ONE description/caption and show continuous camera motion (pan left/right, tilt up/down, track in/out, dolly, crane, etc.). The images are side-by-side in the same row.
+
+If images have SEPARATE descriptions or captions, they are SEPARATE frames with imageCount: 1 each — even if they sit next to each other in the same row.
+
+STEP 6 - EXTRACT:
+For each frame, extract text and estimate the PRIMARY image's center position on the page as a percentage (0-100).
 
 Return a JSON array with one object per page:
 [
@@ -2252,21 +2340,25 @@ Return a JSON array with one object per page:
     "boardType": "hand_drawn" or "photo",
     "gridLayout": "2x3",
     "hasVisibleNumbers": true/false,
+    "totalImageCount": 6,
     "frames": [
-      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 }
+      { "frameNumber": "1", "imageCount": 1, "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 },
+      { "frameNumber": "2", "imageCount": 3, "description": "Pan across kitchen — camera tracks left to right", "dialog": "", "panelX": 50, "panelY": 65 }
     ]
   },
   { "pageNum": 2, ... }
 ]
 
-panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
+panelX/panelY = approximate CENTER of the PRIMARY IMAGE (first image for multi-image sequences) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- CRITICAL: Count ALL image panels on each page. The number of frames you return per page MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.
+- imageCount: MUST be present for every frame. Default is 1 (single image).
+- totalImageCount: sum of all imageCount values for the page. This MUST equal the total number of distinct image panels visible on the page.
+- CRITICAL: The sum of all imageCount values across frames MUST equal the total number of IMAGE PANELS on the page. For example: a 2x3 grid with 6 separate shots = 6 frames each with imageCount:1. A page with 4 separate shots and 1 three-image pan = 4 frames with imageCount:1 + 1 frame with imageCount:3 = totalImageCount:7.
 - Include frames even if they have no text (use empty strings for description/dialog)
 - Text may appear below, beside, or near its panel — pair each text block with its nearest image` });
   
