@@ -2217,9 +2217,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       const anyWithoutNumbers = frames.some(f => !f.hasVisibleNumber);
       
       // Check for duplicate frame numbers (same number on different pages = needs renumbering)
+      // BUT skip frames without real visible numbers (like title pages) — they shouldn't
+      // trigger renumbering of the entire set.
       const numberPageMap = {};
       let hasDuplicates = false;
       for (const f of frames) {
+        if (!f.hasVisibleNumber) continue; // Skip title pages, unnumbered frames
         const key = f.frameNumber;
         if (numberPageMap[key] && numberPageMap[key] !== f.pageNum) {
           hasDuplicates = true;
@@ -2230,12 +2233,37 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       
       // Renumber if needed — but ONLY when truly necessary
       // Preserve original numbering (including decimals like 1.1, 1.2, 3.1) when possible
+      // Log frame numbers before any renumbering for debugging
+      console.log(`[Storyboard] Spot "${name}": frame numbers before renumbering: [${frames.map(f => `${f.frameNumber}(p${f.pageNum})`).join(', ')}]`);
+
       if (hasDuplicates) {
-        // Duplicate numbers across pages = definitely needs renumbering
-        console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames (duplicate numbers across pages)`);
-        frames.forEach((f, idx) => {
-          f.frameNumber = String(idx + 1);
-        });
+        // Duplicate numbers across pages — BUT check if most numbered frames
+        // have unique numbers (e.g. only a few collide due to per-page numbering).
+        // If so, just renumber the conflicting ones instead of wiping everything.
+        const numberedFrames = frames.filter(f => f.hasVisibleNumber);
+        const uniqueNumbers = new Set(numberedFrames.map(f => f.frameNumber));
+
+        if (uniqueNumbers.size > numberedFrames.length * 0.5) {
+          // Most numbers are unique — keep them, just fix conflicts
+          console.log(`[Storyboard] Spot "${name}": mostly unique numbers (${uniqueNumbers.size}/${numberedFrames.length}), fixing conflicts only`);
+          const usedNumbers = new Set();
+          let nextFallback = frames.length + 1;
+          for (const f of frames) {
+            if (!f.hasVisibleNumber || !f.frameNumber) {
+              f.frameNumber = String(nextFallback++);
+            } else if (usedNumbers.has(f.frameNumber)) {
+              f.frameNumber = String(nextFallback++);
+            } else {
+              usedNumbers.add(f.frameNumber);
+            }
+          }
+        } else {
+          // Most numbers are duplicated (per-page sequential) — full renumber
+          console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames (duplicate numbers across pages)`);
+          frames.forEach((f, idx) => {
+            f.frameNumber = String(idx + 1);
+          });
+        }
       } else if (anyWithoutNumbers) {
         // Some frames lack visible numbers — only renumber if MOST frames lack numbers
         const framesWithNumbers = frames.filter(f => f.hasVisibleNumber);
