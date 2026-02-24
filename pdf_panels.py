@@ -56,8 +56,9 @@ def extract_caption(text_block):
     return "\n".join(lines)
 
 
-def find_caption_for_region(img_left, img_right, img_bottom, text_blocks, max_y_dist=60):
-    """Find the caption text block below an image region."""
+def find_caption_for_region(img_left, img_right, img_bottom, text_blocks, max_y_dist=80):
+    """Find the caption text block below an image region.
+    Also looks for frame number labels just above the image."""
     best = None
     best_dist = 999
     for tb in text_blocks:
@@ -68,6 +69,82 @@ def find_caption_for_region(img_left, img_right, img_bottom, text_blocks, max_y_
             best = tb
             best_dist = y_dist
     return best
+
+
+def find_all_captions_for_region(img_left, img_right, img_top, img_bottom, text_blocks, max_y_dist=80):
+    """Find ALL caption text blocks near an image region (below, above, or beside).
+    Returns list of (text_block, position, distance) tuples."""
+    results = []
+    for tb in text_blocks:
+        tb_bbox = tb["bbox"]
+        h_overlap = min(tb_bbox[2], img_right) - max(tb_bbox[0], img_left)
+
+        # Text below image (caption)
+        if h_overlap > 20:
+            y_dist_below = tb_bbox[1] - img_bottom
+            if -5 <= y_dist_below < max_y_dist:
+                results.append((tb, 'below', y_dist_below))
+
+        # Text above or at top of image (frame number labels)
+        # These can be small text blocks that don't overlap much horizontally
+        v_overlap = min(tb_bbox[3], img_top + 60) - max(tb_bbox[1], img_top - 60)
+        if v_overlap > 0 or (img_top - tb_bbox[3] >= -5 and img_top - tb_bbox[3] < 60):
+            # Check if this is a small text block (likely a frame number)
+            tb_text = "".join(s["text"] for line in tb["lines"] for s in line["spans"]).strip()
+            if len(tb_text) <= 10:
+                # Small text near top of image — likely a frame number
+                y_dist_above = abs(tb_bbox[1] - img_top)
+                # Must be horizontally near the image
+                if tb_bbox[0] < img_right + 20 and tb_bbox[2] > img_left - 20:
+                    results.append((tb, 'above', y_dist_above))
+
+    return results
+
+
+def extract_frame_numbers_for_row(row_panels, row_top, text_blocks):
+    """
+    Find frame number labels for a row of panels.
+    Handles cases like "1.2 | 1.3" in a single text block spanning multiple panels,
+    or individual "1.1" labels above each panel.
+
+    Uses span-level bounding boxes for precise X-position matching.
+    """
+    import re
+    frame_numbers = ['' for _ in row_panels]
+    number_pattern = re.compile(r'^\d+(?:\.\d+)?[A-Za-z]?$')
+
+    for tb in text_blocks:
+        tb_bbox = tb["bbox"]
+        # Look for text blocks near the top of this row (above or at start)
+        y_dist = row_top - tb_bbox[3]  # distance from bottom of text to top of row
+        if not (-10 <= y_dist < 60):
+            # Also check if text block is at the same Y as row start
+            if not (abs(tb_bbox[1] - row_top) < 60):
+                continue
+
+        # Process at span level for precise X-position matching
+        # Each span has its own bounding box, so "1.2" at x=12 and "1.3" at x=977
+        # will correctly match to different panels
+        for line in tb["lines"]:
+            for span in line["spans"]:
+                span_text = span["text"].strip()
+                if not span_text or not number_pattern.match(span_text):
+                    continue
+
+                # Match this number to the closest panel by X position
+                span_center_x = (span["bbox"][0] + span["bbox"][2]) / 2
+                best_idx = -1
+                best_dist = 999999
+                for i, bbox in enumerate(row_panels):
+                    panel_center_x = (bbox[0] + bbox[2]) / 2
+                    dist = abs(span_center_x - panel_center_x)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = i
+                if best_idx >= 0 and not frame_numbers[best_idx]:
+                    frame_numbers[best_idx] = span_text
+
+    return frame_numbers
 
 
 def count_captions_for_row(row_panels, row_bottom, text_blocks):
@@ -146,9 +223,13 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
     for row in rows:
         row_left = min(b[0] for b in row)
         row_right = max(b[2] for b in row)
+        row_top = min(b[1] for b in row)
         row_bottom = max(b[3] for b in row)
         row_span = row_right - row_left
-        
+
+        # Extract frame numbers for this row of panels
+        row_frame_numbers = extract_frame_numbers_for_row(row, row_top, text_blocks)
+
         if len(row) >= 3 and row_span > page_width * 0.85:
             # Could be a triptych — check caption count
             unique_captions = count_captions_for_row(row, row_bottom, text_blocks)
@@ -157,16 +238,20 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
                 # Triptych: one logical frame with multiple sub-images
                 sub_images = [render_panel(page, bbox, mat) for bbox in row]
                 caption_text = extract_caption(unique_captions[0]) if unique_captions else ""
-                
+
+                # Use the first frame number from the row (triptych = single logical frame)
+                triptych_frame_num = row_frame_numbers[0] if row_frame_numbers else ""
+
                 # Use first sub-image as primary, include all in images array
                 result_panels.append({
                     "x": round(row_left, 1),
-                    "y": round(min(b[1] for b in row), 1),
+                    "y": round(row_top, 1),
                     "width": round(row_span, 1),
-                    "height": round(row_bottom - min(b[1] for b in row), 1),
+                    "height": round(row_bottom - row_top, 1),
                     "image": sub_images[0],
                     "images": sub_images,
                     "caption": caption_text,
+                    "frameLabel": triptych_frame_num,
                     "triptych": True
                 })
                 print(f"[PDF] Page {page_num}: triptych at y={row[0][1]:.0f} ({len(row)} sub-images)",
@@ -174,11 +259,16 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
                 continue
         
         # Individual panels
-        for bbox in row:
+        for panel_idx, bbox in enumerate(row):
             b64 = render_panel(page, bbox, mat)
+
+            # Find caption below
             cap_block = find_caption_for_region(bbox[0], bbox[2], bbox[3], text_blocks)
             caption_text = extract_caption(cap_block) if cap_block else ""
-            
+
+            # Use the frame number extracted for this panel's position in the row
+            frame_label = row_frame_numbers[panel_idx] if panel_idx < len(row_frame_numbers) else ""
+
             result_panels.append({
                 "x": round(bbox[0], 1),
                 "y": round(bbox[1], 1),
@@ -186,7 +276,8 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
                 "height": round(bbox[3] - bbox[1], 1),
                 "image": b64,
                 "images": [b64],
-                "caption": caption_text
+                "caption": caption_text,
+                "frameLabel": frame_label
             })
     
     doc.close()

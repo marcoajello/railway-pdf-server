@@ -495,6 +495,121 @@ async function detectRectangles(imagePath) {
 }
 
 /**
+ * Extract panels directly from PDF structure using PyMuPDF (pdf_panels.py).
+ * This is the FIRST option — reads image placement coordinates from the PDF,
+ * giving pixel-perfect crops without needing to render and re-detect.
+ * Returns per-page results with images and captions, or null if extraction fails.
+ */
+async function extractPanelsFromPdfStructure(pdfBuffer, tempDir) {
+  const pdfPath = path.join(tempDir, 'input.pdf');
+  await fs.writeFile(pdfPath, pdfBuffer);
+
+  // Get page count first using a quick PyMuPDF call
+  const pageCount = await new Promise((resolve) => {
+    const script = path.join(__dirname, 'pdf_panels.py');
+    const tryPython = (cmd) => {
+      // Quick page-count probe: extract page 1 just to see if fitz works
+      const proc = spawn(cmd, [script, pdfPath, '1', '100', '50']);
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => stdout += d);
+      proc.stderr.on('data', d => stderr += d);
+      proc.on('close', code => {
+        if (code !== 0) {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(0);
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          // Use a separate call to get actual page count
+          resolve(result); // We'll get page count differently
+        } catch (e) { resolve(0); }
+      });
+      proc.on('error', () => {
+        if (cmd === 'python3') { tryPython('python'); return; }
+        resolve(0);
+      });
+    };
+    tryPython('python3');
+  });
+
+  // Get actual page count via PyMuPDF
+  const totalPages = await new Promise((resolve) => {
+    const tryPython = (cmd) => {
+      const proc = spawn(cmd, ['-c', `import fitz; doc = fitz.open("${pdfPath}"); print(len(doc)); doc.close()`]);
+      let stdout = '';
+      proc.stdout.on('data', d => stdout += d);
+      proc.on('close', code => {
+        if (code !== 0) {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(0);
+          return;
+        }
+        resolve(parseInt(stdout.trim()) || 0);
+      });
+      proc.on('error', () => {
+        if (cmd === 'python3') { tryPython('python'); return; }
+        resolve(0);
+      });
+    };
+    tryPython('python3');
+  });
+
+  if (totalPages < 1) {
+    console.log('[Storyboard] pdf_panels.py: could not open PDF');
+    return null;
+  }
+
+  console.log(`[Storyboard] pdf_panels.py: PDF has ${totalPages} pages`);
+
+  // Extract panels from each page
+  const results = [];
+  for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+    const pageResult = await new Promise((resolve) => {
+      const script = path.join(__dirname, 'pdf_panels.py');
+      const tryPython = (cmd) => {
+        const proc = spawn(cmd, [script, pdfPath, String(pageNum), '80', '40']);
+        let stdout = '';
+        let stderr = '';
+        proc.stdout.on('data', d => stdout += d);
+        proc.stderr.on('data', d => stderr += d);
+        proc.on('close', code => {
+          if (stderr) console.log(`[Storyboard] pdf_panels.py page ${pageNum}: ${stderr.trim()}`);
+          if (code !== 0) {
+            if (cmd === 'python3') { tryPython('python'); return; }
+            resolve(null);
+            return;
+          }
+          try {
+            resolve(JSON.parse(stdout));
+          } catch (e) {
+            resolve(null);
+          }
+        });
+        proc.on('error', () => {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(null);
+        });
+      };
+      tryPython('python3');
+    });
+
+    results.push({ pageNum, data: pageResult });
+  }
+
+  // Check if we got meaningful results (at least some pages with panels)
+  const pagesWithPanels = results.filter(r => r.data && r.data.count > 0);
+  if (pagesWithPanels.length === 0) {
+    console.log('[Storyboard] pdf_panels.py: no panels found on any page');
+    return null;
+  }
+
+  console.log(`[Storyboard] pdf_panels.py: found panels on ${pagesWithPanels.length}/${totalPages} pages`);
+  return { totalPages, pages: results, pdfPath };
+}
+
+/**
  * Convert PDF to page images with retry logic for CDN reliability
  */
 async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
@@ -679,7 +794,8 @@ STEP 3 - GRID LAYOUT:
 Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
 STEP 4 - FRAME NUMBERS:
-- If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
+- If frames have visible numbers (1, 2, 1A, 1B, 1.1, 1.2, 3.1, etc.), use those EXACTLY as written
+- Decimal numbers like 1.1, 1.2, 2.1, 3.1 are common in storyboards — preserve the decimal format exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
@@ -693,7 +809,7 @@ Return JSON:
   "hasVisibleNumbers": true/false,
   "frames": [
     {
-      "frameNumber": "1",
+      "frameNumber": "1.1",
       "description": "Action/direction text",
       "dialog": "CHARACTER: Spoken lines...",
       "panelX": 25,
@@ -1147,6 +1263,8 @@ function groupIntoShots(frames) {
       startNewShot = f.shotGroup !== frames[i-1].shotGroup;
     } else if (f.hasVisibleNumber) {
       // Fallback: group by base number (1A, 1B → same shot; 1, 2 → different)
+      // Extract base number for grouping: "1.2" → "1", "3A" → "3", "FR 5.1" → "5"
+      // Decimal frames (1.1, 1.2, 1.3) share the same base number and group together
       const prevNum = (frames[i-1].frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
       const currNum = (f.frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
       startNewShot = prevNum !== currNum;
@@ -1532,39 +1650,191 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
     console.log('[Storyboard] Processing:', req.file.originalname);
     const startTime = Date.now();
-    
+
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
-    
+
+    // === PHASE 0: Try PDF structure extraction first (pdf_panels.py) ===
+    // This reads image placement coordinates directly from the PDF,
+    // giving pixel-perfect crops with proper caption association.
+    let pdfStructureResults = null;
+    let pdfStructurePagesHandled = new Set(); // Pages fully handled by pdf_panels.py
+
+    if (req.file.mimetype === 'application/pdf') {
+      try {
+        pdfStructureResults = await extractPanelsFromPdfStructure(req.file.buffer, tempDir);
+
+        if (pdfStructureResults) {
+          for (const { pageNum, data } of pdfStructureResults.pages) {
+            if (data && data.count > 0) {
+              pdfStructurePagesHandled.add(pageNum);
+              console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels (${data.panels.filter(p => p.triptych).length} triptychs)`);
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[Storyboard] pdf_panels.py error:', e.message);
+      }
+    }
+
+    // === PHASE 1: Render pages for fallback pipeline ===
+    // Only render pages NOT handled by pdf_panels.py
     let pageImages = [];
     if (req.file.mimetype === 'application/pdf') {
-      pageImages = await pdfToImages(req.file.buffer, imageDir);
+      const totalPages = pdfStructureResults ? pdfStructureResults.totalPages : 0;
+      const needsRendering = [];
+
+      if (pdfStructurePagesHandled.size < totalPages || totalPages === 0) {
+        // Need to render at least some pages — render ALL for text extraction
+        pageImages = await pdfToImages(req.file.buffer, imageDir);
+      }
     } else {
       const imgPath = path.join(imageDir, 'page-1.png');
       await sharp(req.file.buffer).png().toFile(imgPath);
       pageImages = [imgPath];
     }
-    
-    console.log(`[Storyboard] ${pageImages.length} page(s) - starting processing`);
-    
-    // Process 1 page per API call — batching dilutes attention on dense storyboards
+
+    // Determine total page count
+    const totalPageCount = pdfStructureResults ? pdfStructureResults.totalPages : pageImages.length;
+
+    console.log(`[Storyboard] ${totalPageCount} page(s) - ${pdfStructurePagesHandled.size} handled by pdf_panels.py, ${totalPageCount - pdfStructurePagesHandled.size} need Vision/OpenCV`);
+
+    // === PHASE 2: Process pages that still need Vision/OpenCV pipeline ===
     const BATCH_SIZE = 1;
-    const batches = [];
-    for (let i = 0; i < pageImages.length; i += BATCH_SIZE) {
-      batches.push(pageImages.slice(i, i + BATCH_SIZE).map((p, j) => ({ path: p, pageNum: i + j + 1 })));
-    }
-    
-    // Process batches with controlled concurrency (2 concurrent batches max)
     const CONCURRENCY = 2;
     const allPageResults = [];
-    
+
+    // First, build results for pdf_panels.py pages (no API calls needed for panel detection)
+    if (pdfStructureResults) {
+      for (const { pageNum, data } of pdfStructureResults.pages) {
+        if (!data || data.count < 1) continue;
+
+        // Build images and captions from pdf_panels.py output
+        const images = [];
+        const captions = [];
+        const panelCentroids = [];
+
+        for (const panel of data.panels) {
+          // Use the first image (or triptych primary)
+          images.push(panel.image || null);
+          captions.push(panel.caption || '');
+
+          // Compute normalized centroids for matching
+          // pdf_panels.py returns coordinates in PDF points; we normalize to 0-1
+          const pageWidth = data.panels.reduce((max, p) => Math.max(max, p.x + p.width), 0);
+          const pageHeight = data.panels.reduce((max, p) => Math.max(max, p.y + p.height), 0);
+          if (pageWidth > 0 && pageHeight > 0) {
+            panelCentroids.push({
+              cx: (panel.x + panel.width / 2) / pageWidth,
+              cy: (panel.y + panel.height / 2) / pageHeight
+            });
+          }
+        }
+
+        allPageResults.push({
+          detected: {
+            count: images.length,
+            bordered: false,
+            mode: 'pdf_structure',
+            images,
+            panelCentroids,
+            triptychs: data.panels.filter(p => p.triptych).map((p, i) => ({
+              panelIndex: data.panels.indexOf(p),
+              subImages: p.images || [p.image]
+            }))
+          },
+          textData: {
+            frames: data.panels.map((panel, idx) => {
+              // Extract frame number from frameLabel if available
+              const label = (panel.frameLabel || '').replace(/<[^>]*>/g, '').trim();
+              const frameNum = label.match(/^[\d.]+[A-Za-z]?$/)?.[0] || '';
+              return {
+                frameNumber: frameNum,
+                description: panel.caption || '',
+                dialog: '',
+                panelX: panelCentroids[idx] ? Math.round(panelCentroids[idx].cx * 100) : null,
+                panelY: panelCentroids[idx] ? Math.round(panelCentroids[idx].cy * 100) : null
+              };
+            }),
+            boardType: 'photo',  // pdf_panels.py is mostly used for photo boards
+            spotName: null,
+            hasVisibleNumbers: data.panels.some(p => {
+              const label = (p.frameLabel || '').replace(/<[^>]*>/g, '').trim();
+              return !!label.match(/^[\d.]+[A-Za-z]?$/);
+            }),
+            pdfStructureCaptions: captions  // Keep raw captions for reference
+          },
+          pageNum,
+          fromPdfStructure: true
+        });
+      }
+    }
+
+    // Now process remaining pages via the Vision/OpenCV pipeline
+    const fallbackPages = [];
+    for (let i = 0; i < pageImages.length; i++) {
+      const pageNum = i + 1;
+      if (!pdfStructurePagesHandled.has(pageNum)) {
+        fallbackPages.push({ path: pageImages[i], pageNum });
+      }
+    }
+
+    // Also: for pdf_panels.py pages, we still need Claude text extraction
+    // to get frame numbers, descriptions, dialog, and spot names
+    const pdfStructurePagesThatNeedText = [];
+    for (let i = 0; i < pageImages.length; i++) {
+      const pageNum = i + 1;
+      if (pdfStructurePagesHandled.has(pageNum)) {
+        pdfStructurePagesThatNeedText.push({ path: pageImages[i], pageNum });
+      }
+    }
+
+    // Run text extraction for pdf_panels.py pages (we need frame numbers, spotName, etc.)
+    if (pdfStructurePagesThatNeedText.length > 0) {
+      const textBatches = [];
+      for (let i = 0; i < pdfStructurePagesThatNeedText.length; i += BATCH_SIZE) {
+        textBatches.push(pdfStructurePagesThatNeedText.slice(i, i + BATCH_SIZE));
+      }
+
+      for (let i = 0; i < textBatches.length; i += CONCURRENCY) {
+        const batchGroup = textBatches.slice(i, i + CONCURRENCY);
+        await Promise.all(batchGroup.map(async (batch) => {
+          const textResults = await extractTextBatched(batch);
+
+          for (const textData of textResults) {
+            // Find the matching pdf_panels.py result and merge text data
+            const existing = allPageResults.find(r => r.pageNum === textData.pageNum && r.fromPdfStructure);
+            if (existing) {
+              // Merge Claude's text extraction with pdf_panels.py's panel images
+              existing.textData.spotName = textData.spotName || existing.textData.spotName;
+              existing.textData.boardType = textData.boardType || existing.textData.boardType;
+              existing.textData.hasVisibleNumbers = textData.hasVisibleNumbers || false;
+              existing.textData.gridLayout = textData.gridLayout;
+
+              // Use Claude's frame data for numbering and descriptions
+              // but keep pdf_panels.py's image count as the source of truth
+              if (textData.frames && textData.frames.length > 0) {
+                existing.textData.frames = textData.frames;
+              }
+            }
+          }
+        }));
+      }
+    }
+
+    // Process fallback pages (not handled by pdf_panels.py)
+    const batches = [];
+    for (let i = 0; i < fallbackPages.length; i += BATCH_SIZE) {
+      batches.push(fallbackPages.slice(i, i + BATCH_SIZE));
+    }
+
     for (let i = 0; i < batches.length; i += CONCURRENCY) {
       const batchGroup = batches.slice(i, i + CONCURRENCY);
-      
+
       const batchResults = await Promise.all(batchGroup.map(async (batch) => {
         // Run batched text extraction (one API call for multiple pages)
         const textResults = await extractTextBatched(batch);
-        
+
         // Detection: hand-drawn boards → OpenCV grid (pixel-perfect), photo boards → Vision
         return Promise.all(batch.map(async ({ path: imgPath, pageNum }) => {
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
@@ -1794,12 +2064,37 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         numberPageMap[key] = f.pageNum;
       }
       
-      // Renumber if needed
-      if (anyWithoutNumbers || hasDuplicates) {
-        console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames (duplicates: ${hasDuplicates}, missing numbers: ${anyWithoutNumbers})`);
+      // Renumber if needed — but ONLY when truly necessary
+      // Preserve original numbering (including decimals like 1.1, 1.2, 3.1) when possible
+      if (hasDuplicates) {
+        // Duplicate numbers across pages = definitely needs renumbering
+        console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames (duplicate numbers across pages)`);
         frames.forEach((f, idx) => {
           f.frameNumber = String(idx + 1);
         });
+      } else if (anyWithoutNumbers) {
+        // Some frames lack visible numbers — only renumber if MOST frames lack numbers
+        const framesWithNumbers = frames.filter(f => f.hasVisibleNumber);
+        const framesWithoutNumbers = frames.filter(f => !f.hasVisibleNumber);
+
+        if (framesWithNumbers.length > framesWithoutNumbers.length) {
+          // Most frames have numbers — just fill in gaps for unnumbered ones
+          console.log(`[Storyboard] Spot "${name}": keeping visible numbers, filling ${framesWithoutNumbers.length} gaps`);
+          let nextNum = 1;
+          for (const f of frames) {
+            if (!f.hasVisibleNumber || !f.frameNumber || f.frameNumber === '') {
+              f.frameNumber = String(nextNum);
+            }
+            // Track the highest number we've seen for gap-filling
+            const num = parseFloat(f.frameNumber);
+            if (!isNaN(num)) nextNum = Math.floor(num) + 1;
+          }
+        } else {
+          console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames (missing numbers: ${anyWithoutNumbers})`);
+          frames.forEach((f, idx) => {
+            f.frameNumber = String(idx + 1);
+          });
+        }
       }
 
       // Always run Pass 2 AI grouping for visual shot analysis
@@ -1875,7 +2170,8 @@ STEP 3 - GRID LAYOUT:
 Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
 
 STEP 4 - FRAME NUMBERS:
-- If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
+- If frames have visible numbers (1, 2, 1A, 1B, 1.1, 1.2, 3.1, etc.), use those EXACTLY as written
+- Decimal numbers like 1.1, 1.2, 2.1, 3.1 are common in storyboards — preserve the decimal format exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
