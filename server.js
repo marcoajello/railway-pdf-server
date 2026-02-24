@@ -1679,24 +1679,13 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         if (pdfStructureResults) {
           for (const { pageNum, data } of pdfStructureResults.pages) {
             if (data && data.count > 0) {
-              // Only mark a page as "handled" if pdf_panels.py found images AND text
-              // for a MEANINGFUL proportion of panels. Hand-drawn storyboards may have
-              // images in the PDF structure but text baked into the artwork (e.g. a single
-              // stray text block like "YOUNG" while all real captions are hand-drawn).
-              // Those pages need the Vision/OpenCV pipeline to read captions from rendered images.
-              const panelsWithText = data.panels.filter(p => {
-                const caption = (p.caption || '').replace(/<[^>]*>/g, '').trim();
-                const label = (p.frameLabel || '').trim();
-                return caption.length > 0 || label.length > 0;
-              }).length;
-              const textRatio = panelsWithText / data.count;
-
-              if (textRatio >= 0.3) {
-                pdfStructurePagesHandled.add(pageNum);
-                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels, ${panelsWithText} with text (${data.panels.filter(p => p.triptych).length} triptychs) — handling`);
-              } else {
-                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py found ${data.count} images but only ${panelsWithText} with text (${Math.round(textRatio * 100)}%) — falling back to Vision/OpenCV for captions`);
-              }
+              // HYBRID APPROACH: pdf_panels.py handles images, Claude handles ALL text.
+              // Mark every page where pdf_panels.py found panel images as "handled".
+              // Text extraction quality doesn't matter — Claude Vision will read the
+              // rendered page image for frame numbers, descriptions, dialog, etc.
+              pdfStructurePagesHandled.add(pageNum);
+              const triptychCount = data.panels.filter(p => p.triptych).length;
+              console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels (${triptychCount} triptychs) — using pdf images + Claude text`);
             }
           }
         }
@@ -1705,17 +1694,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       }
     }
 
-    // === PHASE 1: Render pages for fallback pipeline ===
-    // Only render pages NOT handled by pdf_panels.py
+    // === PHASE 1: Render ALL pages ===
+    // Always render pages so Claude Vision can extract text from them.
+    // pdf_panels.py handles images; Claude handles ALL text extraction.
     let pageImages = [];
     if (req.file.mimetype === 'application/pdf') {
-      const totalPages = pdfStructureResults ? pdfStructureResults.totalPages : 0;
-      const needsRendering = [];
-
-      if (pdfStructurePagesHandled.size < totalPages || totalPages === 0) {
-        // Need to render at least some pages — render ALL for text extraction
-        pageImages = await pdfToImages(req.file.buffer, imageDir);
-      }
+      pageImages = await pdfToImages(req.file.buffer, imageDir);
     } else {
       const imgPath = path.join(imageDir, 'page-1.png');
       await sharp(req.file.buffer).png().toFile(imgPath);
@@ -1832,8 +1816,8 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       }
     }
 
-    // Also: for pdf_panels.py pages, we still need Claude text extraction
-    // to get frame numbers, descriptions, dialog, and spot names
+    // HYBRID: Send ALL pdf_panels.py pages to Claude for text extraction.
+    // Claude is the sole source of truth for frame numbers, descriptions, dialog, spotName.
     const pdfStructurePagesThatNeedText = [];
     for (let i = 0; i < pageImages.length; i++) {
       const pageNum = i + 1;
@@ -1864,61 +1848,31 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               existing.textData.hasVisibleNumbers = textData.hasVisibleNumbers || false;
               existing.textData.gridLayout = textData.gridLayout;
 
-              // Merge Claude's text with pdf_panels.py's structural data.
+              // HYBRID APPROACH: Always use Claude's text over pdf_panels.py's.
               // pdf_panels.py panel count is the source of truth for images.
-              // Only use Claude's frames if they match panel count OR if
-              // pdf_panels.py extracted no useful text data of its own.
+              // Claude Vision is the source of truth for ALL text (frame numbers,
+              // descriptions, dialog, scene headings).
               const pdfPanelCount = existing.detected.count;
               const claudeFrameCount = textData.frames?.length || 0;
-              const pdfHasOwnFrameNums = existing.textData.frames.some(f => f.frameNumber);
-              const pdfHasOwnCaptions = existing.textData.frames.some(f => f.description);
 
               if (claudeFrameCount > 0) {
-                if (claudeFrameCount === pdfPanelCount) {
-                  // Perfect match — Claude's frames align 1:1 with pdf_panels.py panels
-                  // Use Claude for frame numbers (if pdf didn't find its own) and richer descriptions
-                  for (let fi = 0; fi < pdfPanelCount; fi++) {
-                    const cf = textData.frames[fi] || {};
-                    const pf = existing.textData.frames[fi] || {};
-                    // Prefer pdf_panels.py's own frame number (from structure), fall back to Claude's
-                    if (!pf.frameNumber && cf.frameNumber) {
-                      existing.textData.frames[fi].frameNumber = cf.frameNumber;
-                    }
-                    // Use Claude's description if pdf_panels.py had none
-                    if (!pf.description && cf.description) {
-                      existing.textData.frames[fi].description = cf.description;
-                    }
-                    // Always take Claude's dialog (pdf_panels.py doesn't extract dialog)
-                    if (cf.dialog) {
-                      existing.textData.frames[fi].dialog = cf.dialog;
-                    }
-                  }
-                  console.log(`[Storyboard] Page ${textData.pageNum}: merged Claude text (${claudeFrameCount} frames) with pdf_panels.py (${pdfPanelCount} panels) — counts match`);
-                } else if (!pdfHasOwnFrameNums && !pdfHasOwnCaptions) {
-                  // pdf_panels.py got no text at all — use Claude's frames but pad/trim to match panel count
-                  const mergedFrames = [];
-                  for (let fi = 0; fi < pdfPanelCount; fi++) {
-                    if (fi < claudeFrameCount) {
-                      mergedFrames.push({
-                        ...existing.textData.frames[fi],
-                        frameNumber: textData.frames[fi]?.frameNumber || existing.textData.frames[fi]?.frameNumber || '',
-                        description: textData.frames[fi]?.description || '',
-                        dialog: textData.frames[fi]?.dialog || ''
-                      });
-                    } else {
-                      mergedFrames.push(existing.textData.frames[fi] || {
-                        frameNumber: '', description: '', dialog: '',
-                        panelX: null, panelY: null
-                      });
-                    }
-                  }
-                  existing.textData.frames = mergedFrames;
-                  console.log(`[Storyboard] Page ${textData.pageNum}: Claude ${claudeFrameCount} frames vs pdf_panels.py ${pdfPanelCount} panels — used Claude text (pdf had none), trimmed to panel count`);
-                } else {
-                  // Counts differ AND pdf_panels.py has its own data — keep pdf_panels.py's
-                  // because its frame-to-caption alignment is structural (not guessed)
-                  console.log(`[Storyboard] Page ${textData.pageNum}: Claude ${claudeFrameCount} frames vs pdf_panels.py ${pdfPanelCount} panels — keeping pdf_panels.py text (has own captions/numbers)`);
+                // Build merged frames: Claude's text, padded/trimmed to pdf panel count
+                const mergedFrames = [];
+                for (let fi = 0; fi < pdfPanelCount; fi++) {
+                  const cf = (fi < claudeFrameCount) ? textData.frames[fi] : {};
+                  const existingFrame = existing.textData.frames[fi] || {};
+                  mergedFrames.push({
+                    frameNumber: cf.frameNumber || '',
+                    description: cf.description || '',
+                    dialog: cf.dialog || '',
+                    panelX: existingFrame.panelX ?? null,
+                    panelY: existingFrame.panelY ?? null
+                  });
                 }
+                existing.textData.frames = mergedFrames;
+                console.log(`[Storyboard] Page ${textData.pageNum}: using Claude text (${claudeFrameCount} frames) with pdf_panels.py images (${pdfPanelCount} panels)`);
+              } else {
+                console.log(`[Storyboard] Page ${textData.pageNum}: Claude returned no frames — keeping pdf_panels.py text as fallback`);
               }
             }
           }
