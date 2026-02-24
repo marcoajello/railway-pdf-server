@@ -202,7 +202,42 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
     if not raw_panels:
         doc.close()
         return {"count": 0, "mode": "pdf_structure", "panels": []}
-    
+
+    # Merge overlapping images — some visual frames are composed of multiple
+    # PDF image objects (base photo + text overlay + product shot composited).
+    # If two images overlap significantly, keep only the larger one.
+    def images_overlap(a, b, threshold=0.3):
+        """Check if two bboxes overlap by more than threshold (IoU or containment)."""
+        x_overlap = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+        y_overlap = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+        intersection = x_overlap * y_overlap
+        if intersection == 0:
+            return False
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        smaller_area = min(area_a, area_b)
+        # If intersection covers >threshold of the smaller image, they overlap
+        return (intersection / smaller_area) > threshold if smaller_area > 0 else False
+
+    merged_panels = []
+    used = set()
+    # Sort by area descending so we keep larger images
+    raw_panels.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    for i, panel_a in enumerate(raw_panels):
+        if i in used:
+            continue
+        for j, panel_b in enumerate(raw_panels):
+            if j <= i or j in used:
+                continue
+            if images_overlap(panel_a, panel_b):
+                used.add(j)  # Drop the smaller overlapping image
+        merged_panels.append(panel_a)
+
+    if len(merged_panels) < len(raw_panels):
+        print(f"[PDF] Page {page_num}: merged {len(raw_panels)} overlapping images → {len(merged_panels)} panels",
+              file=sys.stderr, flush=True)
+    raw_panels = merged_panels
+
     # Sort and group by rows
     raw_panels.sort(key=lambda b: b[1])
     row_threshold = 30
