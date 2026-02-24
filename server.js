@@ -1342,12 +1342,10 @@ function groupIntoShots(frames) {
       startNewShot = true;
     } else if (f.hasVisibleNumber) {
       // PRIORITY: When frames have visible numbers, use them as ground truth.
-      // Group by base number (1A, 1B → same shot; 1, 2 → different)
-      // Extract base number for grouping: "1.2" → "1", "3A" → "3", "FR 5.1" → "5"
-      // Decimal frames (1.1, 1.2, 1.3) share the same base number and group together
-      const prevNum = (frames[i-1].frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
-      const currNum = (f.frameNumber || '').replace(/^(FR|FRAME|SHOT)[\s.]*/i, '').match(/^(\d+)/)?.[1];
-      startNewShot = prevNum !== currNum;
+      // Each numbered frame = its own shot.
+      // Multi-image sequences (pans/tilts) are already grouped within a single frame
+      // via subImages from Vision-first, so no shot-level grouping needed.
+      startNewShot = true;
     } else if (hasAIGrouping && f.shotGroup !== undefined && frames[i-1].shotGroup !== undefined) {
       // Fallback: AI visual grouping for boards without visible frame numbers
       startNewShot = f.shotGroup !== frames[i-1].shotGroup;
