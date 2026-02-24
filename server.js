@@ -1679,21 +1679,23 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         if (pdfStructureResults) {
           for (const { pageNum, data } of pdfStructureResults.pages) {
             if (data && data.count > 0) {
-              // Only mark a page as "handled" if pdf_panels.py found BOTH images AND text.
-              // Hand-drawn storyboards have images in the PDF structure but all text is
-              // baked into the artwork — those pages need the Vision/OpenCV pipeline to
-              // read captions from the rendered page images.
-              const hasText = data.panels.some(p => {
+              // Only mark a page as "handled" if pdf_panels.py found images AND text
+              // for a MEANINGFUL proportion of panels. Hand-drawn storyboards may have
+              // images in the PDF structure but text baked into the artwork (e.g. a single
+              // stray text block like "YOUNG" while all real captions are hand-drawn).
+              // Those pages need the Vision/OpenCV pipeline to read captions from rendered images.
+              const panelsWithText = data.panels.filter(p => {
                 const caption = (p.caption || '').replace(/<[^>]*>/g, '').trim();
                 const label = (p.frameLabel || '').trim();
                 return caption.length > 0 || label.length > 0;
-              });
+              }).length;
+              const textRatio = panelsWithText / data.count;
 
-              if (hasText) {
+              if (textRatio >= 0.3) {
                 pdfStructurePagesHandled.add(pageNum);
-                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels with text (${data.panels.filter(p => p.triptych).length} triptychs)`);
+                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels, ${panelsWithText} with text (${data.panels.filter(p => p.triptych).length} triptychs) — handling`);
               } else {
-                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py found ${data.count} images but NO text — falling back to Vision/OpenCV for captions`);
+                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py found ${data.count} images but only ${panelsWithText} with text (${Math.round(textRatio * 100)}%) — falling back to Vision/OpenCV for captions`);
               }
             }
           }
