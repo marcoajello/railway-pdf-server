@@ -978,8 +978,9 @@ async function extractPanelsFromPdfStructure(pdfPath, pageNum) {
           // Extract base64 images and captions in reading order
           const images = result.panels.map(p => p.image);
           const captions = result.panels.map(p => p.caption || '');
+          const subImages = result.panels.map(p => p.images || [p.image]);
           console.log(`[Storyboard] PDF structure: page ${pageNum} → ${images.length} panels`);
-          resolve({ images, captions });
+          resolve({ images, captions, subImages });
         } catch (e) {
           resolve(null);
         }
@@ -1320,6 +1321,7 @@ function groupIntoShots(frames) {
         shotNumber: String(shotNumber++),
         frames: [],
         images: [],
+        subImages: [],
         descriptions: [],
         dialogs: [],
         formattedCaptions: []
@@ -1328,6 +1330,7 @@ function groupIntoShots(frames) {
 
     currentShot.frames.push(f.frameNumber);
     if (f.image) currentShot.images.push(f.image);
+    if (f.images) currentShot.subImages.push(f.images);
     if (f.description) currentShot.descriptions.push(f.description);
     if (f.dialog) currentShot.dialogs.push(f.dialog);
     if (f.formattedCaption) currentShot.formattedCaptions.push(f.formattedCaption);
@@ -1340,6 +1343,7 @@ function groupIntoShots(frames) {
     shotNumber: g.shotNumber,
     frames: g.frames,
     images: g.images,
+    subImages: g.subImages.length > 0 ? g.subImages : undefined,  // Per-frame sub-image arrays (triptychs)
     descriptions: g.descriptions,  // Keep per-frame arrays for drag/drop
     dialogs: g.dialogs,            // Keep per-frame arrays for drag/drop
     formattedCaptions: g.formattedCaptions,  // Per-frame formatted text from PDF structure
@@ -1864,7 +1868,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               try {
                 const pdfResult = await extractPanelsFromPdfStructure(pdfPath, pageNum);
                 if (pdfResult && pdfResult.images && pdfResult.images.length >= Math.max(1, Math.ceil(textFrameCount * 0.8))) {
-                  detected = { count: pdfResult.images.length, bordered: false, mode: 'pdf_structure', images: pdfResult.images, captions: pdfResult.captions };
+                  detected = { count: pdfResult.images.length, bordered: false, mode: 'pdf_structure', images: pdfResult.images, captions: pdfResult.captions, subImages: pdfResult.subImages };
                   console.log(`[Storyboard] Page ${pageNum}: PDF structure → ${pdfResult.images.length} panels (expected ~${textFrameCount})`);
                 } else {
                   console.log(`[Storyboard] Page ${pageNum}: PDF structure found ${pdfResult ? pdfResult.images.length : 0} panels (expected ~${textFrameCount}) — falling back to Vision`);
@@ -1910,6 +1914,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       const textFrames = textData.frames || [];
       const images = detected.images || [];
       const captions = detected.captions || [];
+      const subImagesList = detected.subImages || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
       
       const maxLen = Math.max(textFrames.length, images.length);
@@ -1917,6 +1922,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         const tf = textFrames[j] || {};
         const img = images[j] || null;
         const formattedCaption = captions[j] || '';
+        const subs = subImagesList[j] || (img ? [img] : []);
         
         allFrames.push({
           frameNumber: tf.frameNumber || `${j + 1}`,
@@ -1925,6 +1931,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           dialog: tf.dialog || '',
           formattedCaption: formattedCaption || '',
           image: img,
+          images: subs.length > 1 ? subs : undefined,
           spotName: currentSpot,
           pageNum: pageNum
         });

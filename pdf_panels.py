@@ -14,14 +14,14 @@ Returns JSON:
     "count": 6,
     "mode": "pdf_structure",
     "panels": [
-      { "x": 15.4, "y": 153.7, "width": 249.6, "height": 107.4, "image": "<base64>", "caption": "..." },
+      { "x": 15.4, "y": 153.7, "width": 249.6, "height": 107.4,
+        "image": "<base64>", "images": ["<base64>"], "caption": "..." },
       ...
     ]
   }
 
-Panels are sorted in reading order (top-to-bottom, left-to-right).
-Small overlay images (icons, stat badges) are filtered by minimum size.
-Triptych/pan sequences (3 images sharing one caption) are merged into single panels.
+For triptych/pan sequences, "image" is the first sub-image and "images" contains
+all individual sub-images so the client can display them side by side.
 """
 import fitz
 import json
@@ -83,25 +83,26 @@ def count_captions_for_row(row_panels, row_bottom, text_blocks):
     return seen
 
 
+def render_panel(page, bbox, mat):
+    """Render a single panel region to base64 JPEG."""
+    rect = fitz.Rect(bbox)
+    pix = page.get_pixmap(matrix=mat, clip=rect)
+    img_bytes = pix.tobytes("jpeg")
+    return base64.b64encode(img_bytes).decode("ascii")
+
+
 def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
     """
     Extract panel images from a PDF page using its structural metadata.
-    
-    1. Read image bounding boxes from PDF structure (get_text dict)
-    2. Filter out small overlays by minimum size
-    3. Detect triptych/pan sequences (3 images sharing 1 caption) and merge
-    4. Render each panel region at high resolution
-    5. Return sorted panels with base64 JPEG data and formatted captions
     """
     doc = fitz.open(pdf_path)
     
     if page_num < 1 or page_num > len(doc):
         return {"count": 0, "mode": "pdf_structure", "panels": [], "error": f"Page {page_num} out of range"}
     
-    page = doc[page_num - 1]  # fitz uses 0-indexed
+    page = doc[page_num - 1]
     page_width = page.rect.width
     
-    # Get visible image blocks from page structure
     blocks = page.get_text("dict")["blocks"]
     img_blocks = [b for b in blocks if b["type"] == 1]
     text_blocks = [b for b in blocks if b["type"] == 0]
@@ -125,9 +126,9 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
         doc.close()
         return {"count": 0, "mode": "pdf_structure", "panels": []}
     
-    # Sort reading order and group by rows
+    # Sort and group by rows
     raw_panels.sort(key=lambda b: b[1])
-    row_threshold = 30  # points
+    row_threshold = 30
     rows = []
     current_row = [raw_panels[0]]
     for p in raw_panels[1:]:
@@ -138,9 +139,9 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
             current_row = [p]
     rows.append(sorted(current_row, key=lambda b: b[0]))
     
-    # Detect triptychs: a row of 3+ images spanning most of the page width
-    # with only 1 shared caption (vs individual captions per image)
-    final_panels = []  # list of (bbox, caption_text)
+    # Detect triptychs and build final panel list
+    mat = fitz.Matrix(zoom, zoom)
+    result_panels = []
     
     for row in rows:
         row_left = min(b[0] for b in row)
@@ -153,39 +154,40 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
             unique_captions = count_captions_for_row(row, row_bottom, text_blocks)
             
             if len(unique_captions) <= 1:
-                # One shared caption (or none) -> triptych, merge into single panel
-                merged_bbox = (row_left, min(b[1] for b in row), row_right, row_bottom)
+                # Triptych: one logical frame with multiple sub-images
+                sub_images = [render_panel(page, bbox, mat) for bbox in row]
                 caption_text = extract_caption(unique_captions[0]) if unique_captions else ""
-                final_panels.append((merged_bbox, caption_text))
-                print(f"[PDF] Page {page_num}: merged {len(row)} images into triptych at y={row[0][1]:.0f}",
+                
+                # Use first sub-image as primary, include all in images array
+                result_panels.append({
+                    "x": round(row_left, 1),
+                    "y": round(min(b[1] for b in row), 1),
+                    "width": round(row_span, 1),
+                    "height": round(row_bottom - min(b[1] for b in row), 1),
+                    "image": sub_images[0],
+                    "images": sub_images,
+                    "caption": caption_text,
+                    "triptych": True
+                })
+                print(f"[PDF] Page {page_num}: triptych at y={row[0][1]:.0f} ({len(row)} sub-images)",
                       file=sys.stderr, flush=True)
                 continue
         
-        # Individual panels — find caption for each
+        # Individual panels
         for bbox in row:
+            b64 = render_panel(page, bbox, mat)
             cap_block = find_caption_for_region(bbox[0], bbox[2], bbox[3], text_blocks)
             caption_text = extract_caption(cap_block) if cap_block else ""
-            final_panels.append((bbox, caption_text))
-    
-    # Render each panel
-    mat = fitz.Matrix(zoom, zoom)
-    result_panels = []
-    
-    for bbox, caption_text in final_panels:
-        rect = fitz.Rect(bbox)
-        pix = page.get_pixmap(matrix=mat, clip=rect)
-        
-        img_bytes = pix.tobytes("jpeg")
-        b64 = base64.b64encode(img_bytes).decode("ascii")
-        
-        result_panels.append({
-            "x": round(bbox[0], 1),
-            "y": round(bbox[1], 1),
-            "width": round(bbox[2] - bbox[0], 1),
-            "height": round(bbox[3] - bbox[1], 1),
-            "image": b64,
-            "caption": caption_text
-        })
+            
+            result_panels.append({
+                "x": round(bbox[0], 1),
+                "y": round(bbox[1], 1),
+                "width": round(bbox[2] - bbox[0], 1),
+                "height": round(bbox[3] - bbox[1], 1),
+                "image": b64,
+                "images": [b64],
+                "caption": caption_text
+            })
     
     doc.close()
     
