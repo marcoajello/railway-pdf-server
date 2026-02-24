@@ -1679,8 +1679,22 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         if (pdfStructureResults) {
           for (const { pageNum, data } of pdfStructureResults.pages) {
             if (data && data.count > 0) {
-              pdfStructurePagesHandled.add(pageNum);
-              console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels (${data.panels.filter(p => p.triptych).length} triptychs)`);
+              // Only mark a page as "handled" if pdf_panels.py found BOTH images AND text.
+              // Hand-drawn storyboards have images in the PDF structure but all text is
+              // baked into the artwork — those pages need the Vision/OpenCV pipeline to
+              // read captions from the rendered page images.
+              const hasText = data.panels.some(p => {
+                const caption = (p.caption || '').replace(/<[^>]*>/g, '').trim();
+                const label = (p.frameLabel || '').trim();
+                return caption.length > 0 || label.length > 0;
+              });
+
+              if (hasText) {
+                pdfStructurePagesHandled.add(pageNum);
+                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py extracted ${data.count} panels with text (${data.panels.filter(p => p.triptych).length} triptychs)`);
+              } else {
+                console.log(`[Storyboard] Page ${pageNum}: pdf_panels.py found ${data.count} images but NO text — falling back to Vision/OpenCV for captions`);
+              }
             }
           }
         }
@@ -1717,9 +1731,11 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const allPageResults = [];
 
     // First, build results for pdf_panels.py pages (no API calls needed for panel detection)
+    // Only process pages that were marked as "handled" (have both images AND text)
     if (pdfStructureResults) {
       for (const { pageNum, data } of pdfStructureResults.pages) {
         if (!data || data.count < 1) continue;
+        if (!pdfStructurePagesHandled.has(pageNum)) continue;  // Skip pages without text (hand-drawn)
 
         // Build images and captions from pdf_panels.py output
         const images = [];
