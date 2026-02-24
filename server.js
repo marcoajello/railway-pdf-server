@@ -64,10 +64,8 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp',
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-      'application/vnd.ms-powerpoint'];
-    cb(null, allowed.includes(file.mimetype) || file.originalname?.match(/\.pptx?$/i));
+    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+    cb(null, allowed.includes(file.mimetype));
   }
 });
 
@@ -513,7 +511,7 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(180000);
     page.setDefaultTimeout(180000);
-    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 2 });
+    await page.setViewport({ width: 1400, height: 1800, deviceScaleFactor: 2 });
     
     const base64Pdf = pdfBuffer.toString('base64');
     
@@ -555,7 +553,7 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
           const pdf = await pdfjsLib.getDocument({data: a}).promise;
           if (n > pdf.numPages) return null;
           const pg = await pdf.getPage(n);
-          const vp = pg.getViewport({scale: 2});
+          const vp = pg.getViewport({scale: 3});
           const c = document.getElementById('canvas');
           c.width = vp.width;
           c.height = vp.height;
@@ -608,11 +606,9 @@ async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
       
       await canvas.screenshot({ path: tempPath, type: 'png' });
       
-      // Save at full render resolution — no downscale.
-      // All downstream processing (Vision API, mask) does its own resize as needed.
-      // Crops come from this full-res image for maximum quality.
       await sharp(tempPath)
-        .jpeg({ quality: 92 })
+        .resize(2400, 2400, { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 90, progressive: true })
         .toFile(imgPath);
       
       await fs.unlink(tempPath);
@@ -687,6 +683,8 @@ STEP 4 - FRAME NUMBERS:
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
+For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).
+
 Return JSON:
 {
   "spotName": "EXACT TITLE FROM PAGE" or null,
@@ -697,17 +695,23 @@ Return JSON:
     {
       "frameNumber": "1",
       "description": "Action/direction text",
-      "dialog": "CHARACTER: Spoken lines..."
+      "dialog": "CHARACTER: Spoken lines...",
+      "panelX": 25,
+      "panelY": 35
     }
   ]
 }
+
+panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Skip empty frames` }
+- CRITICAL: Count ALL image panels on the page. The number of frames you return MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.
+- Include frames even if they have no text (use empty strings for description/dialog)
+- Text may appear below, beside, or near its panel — pair each text block with its nearest image` }
       ]
     }]
   });
@@ -726,7 +730,7 @@ RULES:
  * Detect panels from a pre-thresholded mask using OpenCV contour detection.
  * Returns array of base64 images cropped from the ORIGINAL full-res image, or null if detection fails.
  */
-async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount) {
+async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCount, boardType = 'photo') {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mask-'));
   const maskPath = path.join(tmpDir, 'mask.jpg');
 
@@ -787,47 +791,21 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
 
     console.log(`[Storyboard] Mask-OpenCV: found ${result.count} panels`);
 
-    // Row-height normalization (same logic as Vision path)
-    const rects = result.rectangles;
-    if (rects.length >= 2) {
-      const maskH = maskMeta.height;
-      const sorted = rects.slice().sort((a, b) => a.y - b.y);
-      const rowGap = maskH * 0.08;
-      const rows = [];
-      let currentRow = [sorted[0]];
-      for (let i = 1; i < sorted.length; i++) {
-        if (sorted[i].y - currentRow[0].y > rowGap) {
-          rows.push(currentRow);
-          currentRow = [sorted[i]];
-        } else {
-          currentRow.push(sorted[i]);
-        }
-      }
-      rows.push(currentRow);
-
-      for (const row of rows) {
-        if (row.length < 2) continue;
-        const minH = Math.min(...row.map(r => r.height));
-        const maxH = Math.max(...row.map(r => r.height));
-        if ((maxH - minH) / minH > 0.10) {
-          for (const r of row) {
-            if (r.height > minH) {
-              console.log(`[Storyboard] Row-norm (mask): panel at (${r.x},${r.y}) height ${r.height}→${minH}`);
-              r.height = minH;
-            }
-          }
-        }
-      }
-    }
-
     // Crop from full-resolution original with scaled coordinates
     const images = [];
+    const panelCentroids = []; // Normalized 0-1 centroids for proximity matching
     for (const rect of result.rectangles) {
       try {
         const x = Math.max(0, Math.round(rect.x * scaleX));
         const y = Math.max(0, Math.round(rect.y * scaleY));
         const w = Math.min(Math.round(rect.width * scaleX), origMeta.width - x);
         const h = Math.min(Math.round(rect.height * scaleY), origMeta.height - y);
+
+        // Store normalized centroid (0-1 relative to page)
+        panelCentroids.push({
+          cx: (rect.x + rect.width / 2) / maskMeta.width,
+          cy: (rect.y + rect.height / 2) / maskMeta.height
+        });
 
         if (w < 20 || h < 20) {
           images.push(null);
@@ -846,14 +824,21 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
           .jpeg({ quality: 85 })
           .toBuffer();
 
-        images.push(cropped.toString('base64'));
+        // Run per-panel text erasure (trim caption zone + OCR cleanup)
+        // Skip OCR for hand-drawn boards (Tesseract misreads artwork)
+        if (boardType === 'hand_drawn') {
+          images.push(cropped.toString('base64'));
+        } else {
+          const cleaned = await eraseTextFromCrop(cropped, images.length + 1);
+          images.push(cleaned || cropped.toString('base64'));
+        }
       } catch (e) {
         console.error('[Storyboard] Mask-OpenCV crop error:', e.message);
         images.push(null);
       }
     }
 
-    return images;
+    return { images, panelCentroids };
 
   } catch (e) {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -863,154 +848,20 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
 }
 
 /**
- * Get slide count from a PPTX file.
- */
-async function getPptxSlideCount(pptxPath) {
-  return new Promise((resolve) => {
-    const script = path.join(__dirname, 'pptx_panels.py');
-    const tryPython = (cmd) => {
-      const proc = spawn(cmd, [script, pptxPath]);
-      let stdout = '';
-      proc.stdout.on('data', d => stdout += d);
-      proc.on('close', code => {
-        if (code !== 0) {
-          if (cmd === 'python3') { tryPython('python'); return; }
-          resolve(0);
-          return;
-        }
-        try { resolve(JSON.parse(stdout).slideCount || 0); }
-        catch { resolve(0); }
-      });
-      proc.on('error', () => {
-        if (cmd === 'python3') { tryPython('python'); return; }
-        resolve(0);
-      });
-    };
-    tryPython('python3');
-  });
-}
-
-/**
- * Extract panel images and captions from a PPTX slide.
- * Returns { images: [base64...], captions: [string...] } or null.
- */
-async function extractPanelsFromPptxStructure(pptxPath, slideNum) {
-  return new Promise((resolve) => {
-    const script = path.join(__dirname, 'pptx_panels.py');
-    const args = [script, pptxPath, String(slideNum)];
-
-    const tryPython = (cmd) => {
-      const proc = spawn(cmd, args);
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout.on('data', d => stdout += d);
-      proc.stderr.on('data', d => stderr += d);
-
-      proc.on('close', code => {
-        if (stderr) console.log(`[Storyboard] PPTX structure: ${stderr.trim()}`);
-        if (code !== 0) {
-          if (cmd === 'python3') { tryPython('python'); return; }
-          resolve(null);
-          return;
-        }
-        try {
-          const result = JSON.parse(stdout);
-          if (result.error || !result.panels || result.count < 1) {
-            resolve(null);
-            return;
-          }
-          const images = result.panels.map(p => p.image);
-          const captions = result.panels.map(p => p.caption || '');
-          const title = result.title || null;
-          console.log(`[Storyboard] PPTX structure: slide ${slideNum} → ${images.length} panels`);
-          resolve({ images, captions, title });
-        } catch (e) {
-          resolve(null);
-        }
-      });
-
-      proc.on('error', () => {
-        if (cmd === 'python3') { tryPython('python'); return; }
-        resolve(null);
-      });
-    };
-
-    tryPython('python3');
-  });
-}
-
-/**
- * Extract panel images directly from PDF structure.
- * 
- * Instead of rendering the page and trying to find panels with computer vision,
- * this reads the image placement coordinates that the layout tool already wrote
- * into the PDF. No masks, no OCR, no Vision API calls needed.
- * 
- * Returns array of base64 JPEG strings, or null if extraction fails.
- */
-async function extractPanelsFromPdfStructure(pdfPath, pageNum) {
-  return new Promise((resolve) => {
-    const script = path.join(__dirname, 'pdf_panels.py');
-    const args = [script, pdfPath, String(pageNum)];
-
-    const tryPython = (cmd) => {
-      const proc = spawn(cmd, args);
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout.on('data', d => stdout += d);
-      proc.stderr.on('data', d => stderr += d);
-
-      proc.on('close', code => {
-        if (stderr) console.log(`[Storyboard] PDF structure: ${stderr.trim()}`);
-        if (code !== 0) {
-          if (cmd === 'python3') { tryPython('python'); return; }
-          resolve(null);
-          return;
-        }
-        try {
-          const result = JSON.parse(stdout);
-          if (result.error || !result.panels || result.count < 1) {
-            resolve(null);
-            return;
-          }
-          // Extract base64 images and captions in reading order
-          const images = result.panels.map(p => p.image);
-          const captions = result.panels.map(p => p.caption || '');
-          const subImages = result.panels.map(p => p.images || [p.image]);
-          console.log(`[Storyboard] PDF structure: page ${pageNum} → ${images.length} panels`);
-          resolve({ images, captions, subImages });
-        } catch (e) {
-          resolve(null);
-        }
-      });
-
-      proc.on('error', () => {
-        if (cmd === 'python3') { tryPython('python'); return; }
-        resolve(null);
-      });
-    };
-
-    tryPython('python3');
-  });
-}
-
-/**
  * Vision panel detection — hybrid approach.
  * 1. Generate binary mask from the image
  * 2. Try OpenCV contour detection on the mask (exact pixel edges)
  * 3. If that fails, fall back to Claude Vision with dual-image (approximate)
  */
-async function detectPanelsWithVision(imageBuffer, expectedCount) {
+async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'photo') {
   // Get original dimensions for cropping later
   const originalMeta = await sharp(imageBuffer).metadata();
   const origW = originalMeta.width;
   const origH = originalMeta.height;
 
-  // Resize original for processing
+  // Resize original for processing (2000px for better Vision bbox precision)
   const resized = await sharp(imageBuffer)
-    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
     .jpeg({ quality: 85 })
     .toBuffer();
 
@@ -1020,7 +871,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
 
   // Detect background color dynamically by sampling at multiple depths from edge
   const grayBuf = await sharp(imageBuffer)
-    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
     .grayscale()
     .raw()
     .toBuffer({ resolveWithObject: true });
@@ -1075,25 +926,27 @@ async function detectPanelsWithVision(imageBuffer, expectedCount) {
 
   // Generate binary mask
   const mask = await sharp(imageBuffer)
-    .resize(1400, 1400, { fit: 'inside', withoutEnlargement: true })
+    .resize(2000, 2000, { fit: 'inside', withoutEnlargement: true })
     .grayscale()
     .threshold(dynamicThreshold)
     .jpeg({ quality: 90 })
     .toBuffer();
 
   // === HYBRID STEP: Try OpenCV on mask first ===
-  const maskPanels = await detectPanelsFromMask(mask, imageBuffer, expectedCount);
+  const maskResult = await detectPanelsFromMask(mask, imageBuffer, expectedCount, boardType);
+  const maskPanels = maskResult ? maskResult.images : null;
+  const maskCentroids = maskResult ? maskResult.panelCentroids : null;
 
   if (maskPanels && maskPanels.length >= Math.max(1, Math.ceil(expectedCount * 0.7))) {
     console.log(`[Storyboard] Mask-OpenCV succeeded: ${maskPanels.length} panels (expected ~${expectedCount})`);
-    return maskPanels;
+    return { images: maskPanels, panelCentroids: maskCentroids };
   }
 
   console.log(`[Storyboard] Mask-OpenCV insufficient (found ${maskPanels ? maskPanels.length : 0}, expected ~${expectedCount}) — falling back to Vision`);
 
   // === FALLBACK: Claude Vision with dual-image ===
   const client = getAnthropicClient();
-  if (!client) return [];
+  if (!client) return { images: [], panelCentroids: [] };
 
   const scaleX = origW / imgW;
   const scaleY = origH / imgH;
@@ -1119,7 +972,12 @@ There are approximately ${expectedCount} panels arranged in rows.
 
 Find each individual DRAWING PANEL — the rectangular areas containing artwork, photos, or sketches. Each panel is a SEPARATE rectangle. Do NOT merge adjacent panels even if they touch.
 
-Skip headers, titles, text captions, and frame number labels — only return the drawing panels themselves.
+CRITICAL: Return TIGHT bounding boxes around the ILLUSTRATION/ARTWORK ONLY.
+- Do NOT include text captions, descriptions, or dialogue that appears BELOW, BESIDE, or ABOVE each panel.
+- Do NOT include frame number labels (e.g. "1", "2A", "FR 3").
+- The bounding box should END where the drawing/photo ends, NOT where the text below it ends.
+- Caption text is typically printed in a separate zone under each panel with a small gap — exclude that zone entirely.
+- If there is a visible border around the illustration, the bounding box should match the border edges.
 
 Return ONLY JSON:
 {
@@ -1149,60 +1007,38 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         panels = JSON.parse(objMatch[0]).panels || [];
       } catch (_) {
         console.error('[Storyboard] Vision: failed to parse response');
-        return [];
+        return { images: [], panelCentroids: [] };
       }
     } else {
-      return [];
+      return { images: [], panelCentroids: [] };
     }
   }
 
   console.log(`[Storyboard] Vision: found ${panels.length} panels (dual-image)`);
 
-  // Row-height normalization: storyboard panels in the same row are always the
-  // same height. Vision sometimes includes caption text below a panel, making
-  // that bbox taller than its neighbors. Group by row, use the minimum height.
-  if (panels.length >= 2) {
-    // Sort by y to cluster into rows
-    const sorted = panels.slice().sort((a, b) => a.y - b.y);
-    const rowGap = imgH * 0.08; // panels within 8% of page height are same row
-    const rows = [];
-    let currentRow = [sorted[0]];
-    for (let i = 1; i < sorted.length; i++) {
-      if (sorted[i].y - currentRow[0].y > rowGap) {
-        rows.push(currentRow);
-        currentRow = [sorted[i]];
-      } else {
-        currentRow.push(sorted[i]);
-      }
-    }
-    rows.push(currentRow);
+  // Compute normalized centroids from Vision-reported panel positions
+  const panelCentroids = panels.map(p => ({
+    cx: (p.x + p.w / 2) / imgW,
+    cy: (p.y + p.h / 2) / imgH
+  }));
 
-    for (const row of rows) {
-      if (row.length < 2) continue;
-      const minH = Math.min(...row.map(p => p.h));
-      const maxH = Math.max(...row.map(p => p.h));
-      // Only clamp if there's meaningful variance (>10% difference)
-      if ((maxH - minH) / minH > 0.10) {
-        const clampH = minH;
-        for (const p of row) {
-          if (p.h > clampH) {
-            console.log(`[Storyboard] Row-norm: panel at (${p.x},${p.y}) height ${p.h}→${clampH} (trimmed ${p.h - clampH}px caption)`);
-            p.h = clampH;
-          }
-        }
-      }
-    }
-  }
-
-  // Crop from original resolution image, then erase caption text from each crop
+  // Crop from original resolution image
   const images = [];
   for (let i = 0; i < panels.length; i++) {
     const p = panels[i];
     try {
-      const x = Math.max(0, Math.round(p.x * scaleX));
-      const y = Math.max(0, Math.round(p.y * scaleY));
-      const w = Math.min(Math.round(p.w * scaleX), origW - x);
-      const h = Math.min(Math.round(p.h * scaleY), origH - y);
+      // Apply 3% margin expansion to compensate for Vision coordinate imprecision
+      const marginX = Math.round(p.w * 0.03);
+      const marginY = Math.round(p.h * 0.03);
+      const ex = Math.max(0, p.x - marginX);
+      const ey = Math.max(0, p.y - marginY);
+      const ew = Math.min(p.w + marginX * 2, imgW - ex);
+      const eh = Math.min(p.h + marginY * 2, imgH - ey);
+
+      const x = Math.max(0, Math.round(ex * scaleX));
+      const y = Math.max(0, Math.round(ey * scaleY));
+      const w = Math.min(Math.round(ew * scaleX), origW - x);
+      const h = Math.min(Math.round(eh * scaleY), origH - y);
 
       if (w < 20 || h < 20) {
         images.push(null);
@@ -1214,17 +1050,21 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         .jpeg({ quality: 85 })
         .toBuffer();
 
-      // Run per-panel OCR text erasure: find text in the bottom 40% of this
-      // individual crop and paint it with the background color
-      const cleaned = await eraseTextFromCrop(cropped, i + 1);
-      images.push(cleaned || cropped.toString('base64'));
+      // Run per-panel text erasure — but skip OCR for hand-drawn boards
+      // (Tesseract misreads ink strokes as text, damaging artwork)
+      if (boardType === 'hand_drawn') {
+        images.push(cropped.toString('base64'));
+      } else {
+        const cleaned = await eraseTextFromCrop(cropped, i + 1);
+        images.push(cleaned || cropped.toString('base64'));
+      }
     } catch (e) {
       console.error(`[Storyboard] Vision: crop error for panel:`, e.message);
       images.push(null);
     }
   }
 
-  return images;
+  return { images, panelCentroids };
 }
 
 /**
@@ -1321,19 +1161,15 @@ function groupIntoShots(frames) {
         shotNumber: String(shotNumber++),
         frames: [],
         images: [],
-        subImages: [],
         descriptions: [],
-        dialogs: [],
-        formattedCaptions: []
+        dialogs: []
       };
     }
 
     currentShot.frames.push(f.frameNumber);
     if (f.image) currentShot.images.push(f.image);
-    if (f.images) currentShot.subImages.push(f.images);
     if (f.description) currentShot.descriptions.push(f.description);
     if (f.dialog) currentShot.dialogs.push(f.dialog);
-    if (f.formattedCaption) currentShot.formattedCaptions.push(f.formattedCaption);
   }
 
   // Don't forget the last shot
@@ -1343,14 +1179,11 @@ function groupIntoShots(frames) {
     shotNumber: g.shotNumber,
     frames: g.frames,
     images: g.images,
-    subImages: g.subImages.length > 0 ? g.subImages : undefined,  // Per-frame sub-image arrays (triptychs)
     descriptions: g.descriptions,  // Keep per-frame arrays for drag/drop
     dialogs: g.dialogs,            // Keep per-frame arrays for drag/drop
-    formattedCaptions: g.formattedCaptions,  // Per-frame formatted text from PDF structure
     description: g.descriptions.join('\n'),
     dialog: g.dialogs.join('\n'),
-    combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n'),
-    formattedCaption: g.formattedCaptions.join('\n')
+    combined: [...g.descriptions, '', ...g.dialogs].filter(Boolean).join('\n')
   }));
 }
 
@@ -1549,13 +1382,14 @@ Frame 3: B — same boots, slightly wider
     const pairText = pairRes.content[0]?.text || '';
     const subjectText = subjectRes.content[0]?.text || '';
 
-    // Flexible label parser — handles **Frame 1: A**, **Frame 1:** A, Frame 1: **A**, etc.
+    // Flexible label parser — extracts labels in order of appearance
+    // Handles: **Frame 1: A**, **Frame 1.1: A**, Frame 2 (1.2): B, etc.
     function parseLabels(text, count) {
+      // Find all "Frame <anything>: <LETTER>" patterns in order
+      const allMatches = [...text.matchAll(/Frame\s+[\d.]+(?:\s*\([^)]*\))?[^:\n]*?:\s*\**\s*([A-Z])\b/gi)];
       const labels = [];
       for (let i = 0; i < count; i++) {
-        const pattern = new RegExp(`Frame\\s+${i + 1}[^A-Za-z0-9]*([A-Z])(?:\\*|\\s|—|\\b)`, 'i');
-        const match = text.match(pattern);
-        labels.push(match ? match[1].toUpperCase() : null);
+        labels.push(allMatches[i] ? allMatches[i][1].toUpperCase() : null);
       }
       return labels;
     }
@@ -1574,10 +1408,10 @@ Frame 3: B — same boots, slightly wider
     // Parse Pass B: SAME/CUT decisions → cuts
     console.log(`[Storyboard] Pass B (pairwise) raw:`, pairText);
     const pairCuts = new Set();
-    for (let i = 0; i < thumbs.length - 1; i++) {
-      const pattern = new RegExp(`(?:^|\\D)${i + 1}\\s*[→>\\-]+\\s*${i + 2}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
-      const match = pairText.match(pattern);
-      if (match && match[1].toUpperCase() === 'CUT') {
+    // Extract all SAME/CUT pairs in order of appearance
+    const allPairs = [...pairText.matchAll(/[\d.]+\s*[→>:\-]+\s*[\d.]+\s*[:.]\s*(SAME|CUT)/gi)];
+    for (let i = 0; i < Math.min(allPairs.length, thumbs.length - 1); i++) {
+      if (allPairs[i][1].toUpperCase() === 'CUT') {
         pairCuts.add(i + 1);
       }
     }
@@ -1630,12 +1464,11 @@ Frame 3: B — same boots, slightly wider
 function applyPositionLabels(frames, thumbs, text) {
   console.log(`[Storyboard] Pass 2 raw:`, text);
 
-  // Parse "Frame N: X" lines
+  // Parse "Frame N: X" lines — extract labels in document order
+  const allMatches = [...text.matchAll(/Frame\s+[\d.]+(?:\s*\([^)]*\))?[^:\n]*?:\s*\**\s*([A-Z])\b/gi)];
   const labels = [];
   for (let i = 0; i < thumbs.length; i++) {
-    const pattern = new RegExp(`Frame\\s+${i + 1}\\s*:\\s*\\*{0,2}([A-Z])\\*{0,2}`, 'i');
-    const match = text.match(pattern);
-    labels.push(match ? match[1].toUpperCase() : null);
+    labels.push(allMatches[i] ? allMatches[i][1].toUpperCase() : null);
   }
 
   console.log(`[Storyboard] Pass 2 labels:`, labels.join(', '));
@@ -1670,10 +1503,10 @@ function applyPass2Decisions(frames, thumbs, text) {
   frames[thumbs[0].frameIdx].shotGroup = shotGroup;
   const decisions = [];
 
+  // Extract all SAME/CUT decisions in order of appearance
+  const allPairs = [...text.matchAll(/[\d.]+\s*[→>:\-]+\s*[\d.]+\s*[:.]\s*(SAME|CUT)/gi)];
   for (let i = 0; i < thumbs.length - 1; i++) {
-    const pattern = new RegExp(`(?:^|\\D)${i + 1}\\s*[→>\\-]+\\s*${i + 2}\\s*[:.]?\\s*(SAME|CUT)`, 'i');
-    const match = text.match(pattern);
-    const decision = match ? match[1].toUpperCase() : 'SAME';
+    const decision = allPairs[i] ? allPairs[i][1].toUpperCase() : 'SAME';
     decisions.push(decision);
     if (decision === 'CUT') shotGroup++;
     frames[thumbs[i + 1].frameIdx].shotGroup = shotGroup;
@@ -1703,111 +1536,8 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
     
-    const isPptx = req.file.mimetype?.includes('presentation') || 
-                   req.file.mimetype?.includes('powerpoint') ||
-                   req.file.originalname?.match(/\.pptx?$/i);
-    
-    // ─── PPTX path: extract everything from file structure ───
-    if (isPptx) {
-      const pptxPath = path.join(tempDir, 'input.pptx');
-      await fs.writeFile(pptxPath, req.file.buffer);
-      
-      const slideCount = await getPptxSlideCount(pptxPath);
-      if (slideCount < 1) {
-        return res.status(400).json({ error: 'Could not read PPTX slides' });
-      }
-      console.log(`[Storyboard] PPTX: ${slideCount} slides`);
-      
-      // Extract panels from each slide (2 concurrent)
-      const CONCURRENCY = 2;
-      const allFrames = [];
-      let currentSpot = null;
-      
-      for (let i = 0; i < slideCount; i += CONCURRENCY) {
-        const batch = [];
-        for (let j = i; j < Math.min(i + CONCURRENCY, slideCount); j++) {
-          batch.push(j + 1);
-        }
-        
-        const results = await Promise.all(batch.map(async (slideNum) => {
-          const pptxResult = await extractPanelsFromPptxStructure(pptxPath, slideNum);
-          return { slideNum, pptxResult };
-        }));
-        
-        // Sort by slide number to maintain order
-        results.sort((a, b) => a.slideNum - b.slideNum);
-        
-        for (const { slideNum, pptxResult } of results) {
-          if (!pptxResult || !pptxResult.images || pptxResult.images.length < 1) {
-            console.log(`[Storyboard] PPTX slide ${slideNum}: no panels found, skipping`);
-            continue;
-          }
-          
-          if (pptxResult.title) currentSpot = pptxResult.title;
-          
-          for (let j = 0; j < pptxResult.images.length; j++) {
-            const caption = pptxResult.captions[j] || '';
-            // Split caption: bold text → description, non-bold → dialog
-            const descParts = [];
-            const dialogParts = [];
-            for (const line of caption.split('\n')) {
-              if (line.startsWith('<b>') || line.match(/^<b>/)) {
-                descParts.push(line);
-              } else if (line.trim()) {
-                dialogParts.push(line);
-              }
-            }
-            
-            allFrames.push({
-              frameNumber: String(allFrames.length + 1),
-              hasVisibleNumber: false,
-              description: descParts.join('\n').replace(/<\/?[bi]>/g, ''),
-              dialog: dialogParts.join('\n').replace(/<\/?[bi]>/g, ''),
-              formattedCaption: caption,
-              image: pptxResult.images[j],
-              spotName: currentSpot,
-              pageNum: slideNum
-            });
-          }
-        }
-      }
-      
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images (${elapsed}s)`);
-      
-      // Group frames by spot, renumber, run shot grouping
-      const spotGroups = {};
-      for (const f of allFrames) {
-        const spot = f.spotName || 'Untitled';
-        if (!spotGroups[spot]) spotGroups[spot] = [];
-        spotGroups[spot].push(f);
-      }
-      
-      const spots = [];
-      for (const [name, frames] of Object.entries(spotGroups)) {
-        // Renumber sequentially within each spot
-        console.log(`[Storyboard] Spot "${name}": renumbering ${frames.length} frames`);
-        frames.forEach((f, idx) => { f.frameNumber = String(idx + 1); });
-        
-        // Run shot grouping
-        await analyzeGroupings(frames);
-        
-        spots.push({
-          name,
-          shots: groupIntoShots(frames)
-        });
-      }
-      
-      return res.json({ spots });
-    }
-    
-    // ─── PDF / Image path ───
     let pageImages = [];
-    let pdfTempPath = null;
     if (req.file.mimetype === 'application/pdf') {
-      // Save PDF for structure extraction (PyMuPDF needs a file path)
-      pdfTempPath = path.join(tempDir, 'input.pdf');
-      await fs.writeFile(pdfTempPath, req.file.buffer);
       pageImages = await pdfToImages(req.file.buffer, imageDir);
     } else {
       const imgPath = path.join(imageDir, 'page-1.png');
@@ -1821,7 +1551,7 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const BATCH_SIZE = 1;
     const batches = [];
     for (let i = 0; i < pageImages.length; i += BATCH_SIZE) {
-      batches.push(pageImages.slice(i, i + BATCH_SIZE).map((p, j) => ({ path: p, pageNum: i + j + 1, pdfPath: pdfTempPath })));
+      batches.push(pageImages.slice(i, i + BATCH_SIZE).map((p, j) => ({ path: p, pageNum: i + j + 1 })));
     }
     
     // Process batches with controlled concurrency (2 concurrent batches max)
@@ -1836,12 +1566,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         const textResults = await extractTextBatched(batch);
         
         // Detection: hand-drawn boards → OpenCV grid (pixel-perfect), photo boards → Vision
-        return Promise.all(batch.map(async ({ path: imgPath, pageNum, pdfPath }) => {
+        return Promise.all(batch.map(async ({ path: imgPath, pageNum }) => {
           const textData = textResults.find(r => r.pageNum === pageNum) || { frames: [] };
           const textFrameCount = textData.frames?.length || 0;
           const boardType = textData.boardType || 'photo';
 
-          let detected = { count: 0, bordered: false, mode: 'none', images: [] };
+          let detected = { count: 0, bordered: false, mode: 'none', images: [], panelCentroids: [] };
           
           if (textFrameCount >= 1) {
             // Hand-drawn boards: try OpenCV grid first (pixel-perfect for ink/pencil borders)
@@ -1851,7 +1581,13 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
                 if (cvResult.mode === 'grid') {
                   const expectedMin = Math.max(1, Math.ceil(textFrameCount * 0.9));
                   if (cvResult.count >= expectedMin && cvResult.images && cvResult.images.length >= 1) {
-                    detected = cvResult;
+                    // Compute normalized centroids from grid rectangles
+                    const imgMeta = await sharp(await fs.readFile(imgPath)).metadata();
+                    const gridCentroids = (cvResult.rectangles || []).map(r => ({
+                      cx: (r.x + r.width / 2) / imgMeta.width,
+                      cy: (r.y + r.height / 2) / imgMeta.height
+                    }));
+                    detected = { ...cvResult, panelCentroids: gridCentroids };
                     console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found ${cvResult.count} panels (expected ~${textFrameCount})`);
                   } else {
                     console.log(`[Storyboard] Page ${pageNum}: hand-drawn → OpenCV grid found only ${cvResult.count}/${textFrameCount} panels — falling back to Vision`);
@@ -1862,31 +1598,19 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               } catch (e) {
                 console.error(`[Storyboard] Page ${pageNum}: OpenCV error:`, e.message);
               }
-            } else if (pdfPath) {
-              // Photo boards: extract panels directly from PDF structure
-              // The layout tool already knows where every image is placed.
-              try {
-                const pdfResult = await extractPanelsFromPdfStructure(pdfPath, pageNum);
-                if (pdfResult && pdfResult.images && pdfResult.images.length >= Math.max(1, Math.ceil(textFrameCount * 0.8))) {
-                  detected = { count: pdfResult.images.length, bordered: false, mode: 'pdf_structure', images: pdfResult.images, captions: pdfResult.captions, subImages: pdfResult.subImages };
-                  console.log(`[Storyboard] Page ${pageNum}: PDF structure → ${pdfResult.images.length} panels (expected ~${textFrameCount})`);
-                } else {
-                  console.log(`[Storyboard] Page ${pageNum}: PDF structure found ${pdfResult ? pdfResult.images.length : 0} panels (expected ~${textFrameCount}) — falling back to Vision`);
-                }
-              } catch (e) {
-                console.error(`[Storyboard] Page ${pageNum}: PDF structure error:`, e.message);
-              }
             } else {
-              console.log(`[Storyboard] Page ${pageNum}: photo board, no PDF path → using Vision`);
+              console.log(`[Storyboard] Page ${pageNum}: photo board → using Vision`);
             }
             
             // Vision fallback (or primary for photo boards)
             if (detected.count < 1) {
               try {
                 const imageBuffer = await fs.readFile(imgPath);
-                const visionImages = await detectPanelsWithVision(imageBuffer, textFrameCount);
+                const visionResult = await detectPanelsWithVision(imageBuffer, textFrameCount, boardType);
+                const visionImages = visionResult.images || [];
+                const visionCentroids = visionResult.panelCentroids || [];
                 if (visionImages.length >= 1) {
-                  detected = { count: visionImages.length, bordered: false, mode: 'vision', images: visionImages };
+                  detected = { count: visionImages.length, bordered: false, mode: 'vision', images: visionImages, panelCentroids: visionCentroids };
                   console.log(`[Storyboard] Page ${pageNum}: Vision found ${visionImages.length} panels`);
                 }
               } catch (e) {
@@ -1902,6 +1626,26 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       allPageResults.push(...batchResults.flat());
     }
     
+    // Post-processing: run text erasure on grid-path images
+    // (Vision and Mask paths already do this during detection)
+    // Skip for hand-drawn boards — Tesseract misreads ink strokes as text
+    for (const result of allPageResults) {
+      const boardType = result.textData?.boardType || 'photo';
+      if (result.detected.mode === 'grid' && result.detected.images && boardType !== 'hand_drawn') {
+        const cleaned = await Promise.all(result.detected.images.map(async (img, i) => {
+          if (!img) return null;
+          try {
+            const buf = Buffer.from(img, 'base64');
+            const cleanedB64 = await eraseTextFromCrop(buf, i + 1);
+            return cleanedB64 || img;
+          } catch (e) {
+            return img;
+          }
+        }));
+        result.detected.images = cleaned;
+      }
+    }
+    
     // Sort by page number to maintain order
     allPageResults.sort((a, b) => a.pageNum - b.pageNum);
     
@@ -1913,28 +1657,111 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       
       const textFrames = textData.frames || [];
       const images = detected.images || [];
-      const captions = detected.captions || [];
-      const subImagesList = detected.subImages || [];
+      const panelCentroids = detected.panelCentroids || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
       
-      const maxLen = Math.max(textFrames.length, images.length);
-      for (let j = 0; j < maxLen; j++) {
-        const tf = textFrames[j] || {};
-        const img = images[j] || null;
-        const formattedCaption = captions[j] || '';
-        const subs = subImagesList[j] || (img ? [img] : []);
+      // === PROXIMITY MATCHING ===
+      // Match text frames to detected panels by spatial position instead of blind index
+      // ONLY use proximity when counts differ — when equal, both sides are in reading order
+      const hasPanelPositions = panelCentroids.length === images.length && panelCentroids.length > 0;
+      const hasTextPositions = textFrames.some(tf => tf.panelX != null && tf.panelY != null);
+      const countsDiffer = textFrames.length !== images.length;
+      
+      if (countsDiffer && hasPanelPositions && hasTextPositions && textFrames.length > 0 && images.length > 0) {
+        // Proximity matching: pair each panel with its nearest text frame
+        const usedTextIndices = new Set();
+        const panelToText = new Array(images.length).fill(null);
         
-        allFrames.push({
-          frameNumber: tf.frameNumber || `${j + 1}`,
-          hasVisibleNumber: hasVisibleNumbers,
-          description: tf.description || '',
-          dialog: tf.dialog || '',
-          formattedCaption: formattedCaption || '',
-          image: img,
-          images: subs.length > 1 ? subs : undefined,
-          spotName: currentSpot,
-          pageNum: pageNum
+        // For each panel, find closest unmatched text frame
+        // Sort panels by Y then X (reading order) for deterministic matching
+        const panelOrder = panelCentroids.map((c, i) => ({ idx: i, cx: c.cx, cy: c.cy }));
+        panelOrder.sort((a, b) => {
+          const rowDiff = Math.abs(a.cy - b.cy);
+          if (rowDiff < 0.08) return a.cx - b.cx; // Same row: sort by X
+          return a.cy - b.cy; // Different rows: sort by Y
         });
+        
+        for (const panel of panelOrder) {
+          let bestDist = Infinity;
+          let bestIdx = -1;
+          
+          for (let t = 0; t < textFrames.length; t++) {
+            if (usedTextIndices.has(t)) continue;
+            const tf = textFrames[t];
+            if (tf.panelX == null || tf.panelY == null) continue;
+            
+            // Distance between panel centroid and text-reported panel position
+            const dx = panel.cx - (tf.panelX / 100);
+            const dy = panel.cy - (tf.panelY / 100);
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            
+            if (dist < bestDist) {
+              bestDist = dist;
+              bestIdx = t;
+            }
+          }
+          
+          if (bestIdx >= 0 && bestDist < 0.4) { // Max 40% of page distance
+            panelToText[panel.idx] = bestIdx;
+            usedTextIndices.add(bestIdx);
+          }
+        }
+        
+        // Also handle text frames without panelX/panelY — match by remaining index order
+        const unmatchedPanels = [];
+        for (let i = 0; i < images.length; i++) {
+          if (panelToText[i] === null) unmatchedPanels.push(i);
+        }
+        const unmatchedTexts = [];
+        for (let t = 0; t < textFrames.length; t++) {
+          if (!usedTextIndices.has(t)) unmatchedTexts.push(t);
+        }
+        // Match remaining by order
+        for (let k = 0; k < Math.min(unmatchedPanels.length, unmatchedTexts.length); k++) {
+          panelToText[unmatchedPanels[k]] = unmatchedTexts[k];
+        }
+        
+        // Build frames from matched pairs
+        for (let i = 0; i < images.length; i++) {
+          const tIdx = panelToText[i];
+          const tf = tIdx !== null ? textFrames[tIdx] : {};
+          allFrames.push({
+            frameNumber: tf.frameNumber || `${i + 1}`,
+            hasVisibleNumber: hasVisibleNumbers,
+            description: tf.description || '',
+            dialog: tf.dialog || '',
+            image: images[i],
+            spotName: currentSpot,
+            pageNum: pageNum
+          });
+        }
+        
+        const matched = panelToText.filter(t => t !== null).length;
+        console.log(`[Storyboard] Page ${pageNum}: PROXIMITY matched ${matched}/${images.length} panels to ${textFrames.length} text frames`);
+        
+      } else {
+        // Index-based matching: counts match (reading order) or positions unavailable
+        if (textFrames.length !== images.length && textFrames.length > 0 && images.length > 0) {
+          console.log(`[Storyboard] Page ${pageNum}: COUNT MISMATCH — text ${textFrames.length}, panels ${images.length} (index fallback)`);
+        } else if (textFrames.length === images.length && textFrames.length > 0) {
+          console.log(`[Storyboard] Page ${pageNum}: INDEX matched ${images.length} panels to ${textFrames.length} text frames (counts equal)`);
+        }
+        
+        const maxLen = Math.max(textFrames.length, images.length);
+        for (let j = 0; j < maxLen; j++) {
+          const tf = textFrames[j] || {};
+          const img = images[j] || null;
+          
+          allFrames.push({
+            frameNumber: tf.frameNumber || `${j + 1}`,
+            hasVisibleNumber: hasVisibleNumbers,
+            description: tf.description || '',
+            dialog: tf.dialog || '',
+            image: img,
+            spotName: currentSpot,
+            pageNum: pageNum
+          });
+        }
       }
     }
     
@@ -2052,6 +1879,8 @@ STEP 4 - FRAME NUMBERS:
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
 STEP 5 - EXTRACT:
+For each frame, identify which IMAGE/PANEL it belongs to and estimate that panel's center position on the page as a percentage (0-100).
+
 Return a JSON array with one object per page:
 [
   {
@@ -2061,18 +1890,22 @@ Return a JSON array with one object per page:
     "gridLayout": "2x3",
     "hasVisibleNumbers": true/false,
     "frames": [
-      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines..." }
+      { "frameNumber": "1", "description": "Action/direction text", "dialog": "CHARACTER: Spoken lines...", "panelX": 25, "panelY": 35 }
     ]
   },
   { "pageNum": 2, ... }
 ]
+
+panelX/panelY = approximate CENTER of the IMAGE/PANEL (not the text) as percentage of page width/height (0=left/top, 100=right/bottom).
 
 RULES:
 - spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
 - boardType: classify based on the DRAWING PANELS content, not the page layout
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
-- Skip empty frames` });
+- CRITICAL: Count ALL image panels on each page. The number of frames you return per page MUST match the total number of IMAGE PANELS in the grid layout (e.g. 2x3 = 6 frames, 4+5+4 = 13 frames). Do NOT skip any panels.
+- Include frames even if they have no text (use empty strings for description/dialog)
+- Text may appear below, beside, or near its panel — pair each text block with its nearest image` });
   
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
