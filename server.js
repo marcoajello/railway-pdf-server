@@ -1284,14 +1284,19 @@ function groupIntoShots(frames) {
       };
     }
 
-    currentShot.frames.push(f.frameNumber);
-    // For triptychs, push ALL sub-images into the shot's images array
+    // For multi-image frames (diptych/triptych/etc.), push ALL sub-images
+    // and repeat the frame number for each so frames[] and images[] stay aligned.
+    // The client uses shot.frames[i] as the badge for shot.images[i].
     if (f.subImages && f.subImages.length > 1) {
       for (const subImg of f.subImages) {
-        if (subImg) currentShot.images.push(subImg);
+        if (subImg) {
+          currentShot.frames.push(f.frameNumber);
+          currentShot.images.push(subImg);
+        }
       }
-    } else if (f.image) {
-      currentShot.images.push(f.image);
+    } else {
+      currentShot.frames.push(f.frameNumber);
+      if (f.image) currentShot.images.push(f.image);
     }
     if (f.description) currentShot.descriptions.push(f.description);
     if (f.dialog) currentShot.dialogs.push(f.dialog);
