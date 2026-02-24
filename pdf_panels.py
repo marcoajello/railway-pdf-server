@@ -57,8 +57,8 @@ def extract_caption(text_block):
 
 
 def find_caption_for_region(img_left, img_right, img_bottom, text_blocks, max_y_dist=80):
-    """Find the caption text block below an image region.
-    Also looks for frame number labels just above the image."""
+    """Find the closest caption text block below an image region.
+    Used for triptych detection (unique caption counting)."""
     best = None
     best_dist = 999
     for tb in text_blocks:
@@ -69,6 +69,23 @@ def find_caption_for_region(img_left, img_right, img_bottom, text_blocks, max_y_
             best = tb
             best_dist = y_dist
     return best
+
+
+def find_all_captions_below(img_left, img_right, img_bottom, text_blocks, max_y_dist=200, next_row_top=None):
+    """Find ALL caption text blocks below an image, sorted by Y position.
+    Collects scene headings AND description text that may be in separate blocks.
+    Stops at next_row_top if provided (to avoid grabbing text from the row below)."""
+    matches = []
+    cutoff_y = next_row_top if next_row_top is not None else (img_bottom + max_y_dist)
+    for tb in text_blocks:
+        tb_bbox = tb["bbox"]
+        y_dist = tb_bbox[1] - img_bottom
+        h_overlap = min(tb_bbox[2], img_right) - max(tb_bbox[0], img_left)
+        if -5 <= y_dist and tb_bbox[1] < cutoff_y and h_overlap > 20:
+            matches.append((y_dist, tb))
+    # Sort by Y position (top to bottom)
+    matches.sort(key=lambda m: m[0])
+    return [tb for _, tb in matches]
 
 
 def find_all_captions_for_region(img_left, img_right, img_top, img_bottom, text_blocks, max_y_dist=80):
@@ -255,12 +272,20 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
     mat = fitz.Matrix(zoom, zoom)
     result_panels = []
     
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         row_left = min(b[0] for b in row)
         row_right = max(b[2] for b in row)
         row_top = min(b[1] for b in row)
         row_bottom = max(b[3] for b in row)
         row_span = row_right - row_left
+
+        # Find the midpoint between this row and the next to limit caption search.
+        # Text closer to the next row (like frame labels) belongs to it, not us.
+        if row_idx + 1 < len(rows):
+            next_row_top_y = min(b[1] for b in rows[row_idx + 1])
+            caption_cutoff = row_bottom + (next_row_top_y - row_bottom) * 0.65
+        else:
+            caption_cutoff = None  # No next row — use max_y_dist default
 
         # Extract frame numbers for this row of panels
         row_frame_numbers = extract_frame_numbers_for_row(row, row_top, text_blocks)
@@ -274,7 +299,10 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
             if len(unique_captions) <= 1 and len(unique_captions) < len(row):
                 # Multi-image frame: one logical frame with multiple sub-images
                 sub_images = [render_panel(page, bbox, mat) for bbox in row]
-                caption_text = extract_caption(unique_captions[0]) if unique_captions else ""
+                # Collect all text blocks below the row (scene heading + description)
+                all_cap_blocks = find_all_captions_below(row_left, row_right, row_bottom, text_blocks,
+                                                          next_row_top=caption_cutoff)
+                caption_text = "\n".join(extract_caption(cb) for cb in all_cap_blocks).strip() if all_cap_blocks else ""
 
                 # Use the first frame number from the row (triptych = single logical frame)
                 triptych_frame_num = row_frame_numbers[0] if row_frame_numbers else ""
@@ -299,9 +327,11 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
         for panel_idx, bbox in enumerate(row):
             b64 = render_panel(page, bbox, mat)
 
-            # Find caption below
-            cap_block = find_caption_for_region(bbox[0], bbox[2], bbox[3], text_blocks)
-            caption_text = extract_caption(cap_block) if cap_block else ""
+            # Find ALL caption text blocks below this panel
+            # (scene heading + description may be in separate text blocks)
+            cap_blocks = find_all_captions_below(bbox[0], bbox[2], bbox[3], text_blocks,
+                                                  next_row_top=caption_cutoff)
+            caption_text = "\n".join(extract_caption(cb) for cb in cap_blocks).strip() if cap_blocks else ""
 
             # Use the frame number extracted for this panel's position in the row
             frame_label = row_frame_numbers[panel_idx] if panel_idx < len(row_frame_numbers) else ""
