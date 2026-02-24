@@ -1285,7 +1285,14 @@ function groupIntoShots(frames) {
     }
 
     currentShot.frames.push(f.frameNumber);
-    if (f.image) currentShot.images.push(f.image);
+    // For triptychs, push ALL sub-images into the shot's images array
+    if (f.subImages && f.subImages.length > 1) {
+      for (const subImg of f.subImages) {
+        if (subImg) currentShot.images.push(subImg);
+      }
+    } else if (f.image) {
+      currentShot.images.push(f.image);
+    }
     if (f.description) currentShot.descriptions.push(f.description);
     if (f.dialog) currentShot.dialogs.push(f.dialog);
   }
@@ -1715,8 +1722,14 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         const panelCentroids = [];
 
         for (const panel of data.panels) {
-          // Use the first image (or triptych primary)
-          images.push(panel.image || null);
+          // For triptychs, use ALL sub-images; for regular panels, single image
+          // The images array holds arrays: [[img1,img2,img3], [img4], ...]
+          // so each panel slot can carry multiple images
+          if (panel.triptych && panel.images && panel.images.length > 1) {
+            images.push(panel.images);  // Array of sub-images
+          } else {
+            images.push(panel.image || null);  // Single image string
+          }
           captions.push(panel.caption || '');
 
           // Compute normalized centroids for matching
@@ -1995,12 +2008,17 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         for (let i = 0; i < images.length; i++) {
           const tIdx = panelToText[i];
           const tf = tIdx !== null ? textFrames[tIdx] : {};
+          const imgData = images[i];
+          // Handle triptych: imgData can be an array of sub-images or a single string
+          const primaryImage = Array.isArray(imgData) ? imgData[0] : imgData;
+          const subImages = Array.isArray(imgData) ? imgData : null;
           allFrames.push({
             frameNumber: tf.frameNumber || `${i + 1}`,
             hasVisibleNumber: hasVisibleNumbers,
             description: tf.description || '',
             dialog: tf.dialog || '',
-            image: images[i],
+            image: primaryImage,
+            subImages: subImages,
             spotName: currentSpot,
             pageNum: pageNum
           });
@@ -2020,14 +2038,18 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         const maxLen = Math.max(textFrames.length, images.length);
         for (let j = 0; j < maxLen; j++) {
           const tf = textFrames[j] || {};
-          const img = images[j] || null;
-          
+          const imgData = images[j] || null;
+          // Handle triptych: imgData can be an array of sub-images or a single string
+          const primaryImage = Array.isArray(imgData) ? imgData[0] : imgData;
+          const subImages = Array.isArray(imgData) ? imgData : null;
+
           allFrames.push({
             frameNumber: tf.frameNumber || `${j + 1}`,
             hasVisibleNumber: hasVisibleNumbers,
             description: tf.description || '',
             dialog: tf.dialog || '',
-            image: img,
+            image: primaryImage,
+            subImages: subImages,
             spotName: currentSpot,
             pageNum: pageNum
           });

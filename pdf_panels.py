@@ -230,12 +230,13 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
         # Extract frame numbers for this row of panels
         row_frame_numbers = extract_frame_numbers_for_row(row, row_top, text_blocks)
 
-        if len(row) >= 3 and row_span > page_width * 0.85:
-            # Could be a triptych — check caption count
+        if len(row) >= 2 and row_span > page_width * 0.60:
+            # Could be a multi-image frame (diptych, triptych, or more)
+            # Key signal: multiple images share ONE caption below them
             unique_captions = count_captions_for_row(row, row_bottom, text_blocks)
-            
-            if len(unique_captions) <= 1:
-                # Triptych: one logical frame with multiple sub-images
+
+            if len(unique_captions) <= 1 and len(unique_captions) < len(row):
+                # Multi-image frame: one logical frame with multiple sub-images
                 sub_images = [render_panel(page, bbox, mat) for bbox in row]
                 caption_text = extract_caption(unique_captions[0]) if unique_captions else ""
 
