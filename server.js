@@ -1790,6 +1790,25 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       } catch (e) {
         console.error('[Storyboard] pdf_panels.py error:', e.message);
       }
+
+      // Free memory: release base64 image data from pages NOT handled by pdf_panels.py.
+      // Scanned PDFs have full-page images at zoom=3 that can be 1-3MB each in base64.
+      // Holding these while Puppeteer launches causes OOM on memory-constrained containers.
+      if (pdfStructureResults) {
+        if (pdfStructurePagesHandled.size === 0) {
+          // No pages handled — release everything
+          console.log('[Storyboard] No pages handled by pdf_panels.py — releasing scan image memory');
+          pdfStructureResults = null;
+        } else {
+          // Release image data from unhandled pages only
+          for (const { pageNum, data } of pdfStructureResults.pages) {
+            if (!pdfStructurePagesHandled.has(pageNum) && data && data.images) {
+              data.images = []; // Free base64 strings
+              data.count = 0;
+            }
+          }
+        }
+      }
     }
 
     // === PHASE 1: Render ALL pages ===
