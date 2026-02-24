@@ -2098,7 +2098,44 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
     // Sort by page number to maintain order
     allPageResults.sort((a, b) => a.pageNum - b.pageNum);
-    
+
+    // === SPOT RECONCILIATION ===
+    // Each page was analyzed independently, so Claude may have returned scene headers
+    // ("EXT. ALLEYWAY - NIGHT") or continuation text as spotNames when they're not
+    // actually new commercials/spots. Do a lightweight text-only pass to reconcile.
+    const pageSpotNames = allPageResults.map(r => ({
+      pageNum: r.pageNum,
+      spotName: r.textData?.spotName || null,
+      frameCount: r.textData?.frames?.length || 0,
+      boardType: r.textData?.boardType || 'photo'
+    }));
+    const rawSpotNames = pageSpotNames.filter(p => p.spotName);
+
+    if (rawSpotNames.length > 1) {
+      // Multiple pages returned spotNames — reconcile them
+      try {
+        const reconciledSpots = await reconcileSpotNames(pageSpotNames, totalPageCount);
+        if (reconciledSpots) {
+          // Apply reconciled spot names back to allPageResults
+          for (const r of allPageResults) {
+            const reconciled = reconciledSpots.find(s => s.pageNum === r.pageNum);
+            if (reconciled && reconciled.spotName) {
+              r.textData.spotName = reconciled.spotName;
+            } else if (reconciled && reconciled.spotName === null) {
+              r.textData.spotName = null; // Explicitly cleared — not a real spot boundary
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[Storyboard] Spot reconciliation error:', e.message);
+        // Continue with original per-page spotNames
+      }
+    } else if (rawSpotNames.length === 1) {
+      // Only one page has a spotName — apply it to all pages (single-spot document)
+      const singleSpot = rawSpotNames[0].spotName;
+      console.log(`[Storyboard] Single spot detected: "${singleSpot}"`);
+    }
+
     const allFrames = [];
     let currentSpot = null;
     
@@ -2338,6 +2375,64 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     try { await fs.rm(tempDir, { recursive: true, force: true }); } catch (e) {}
   }
 });
+
+/**
+ * Reconcile spot names across pages.
+ * Individual pages may return scene headers, location slugs, or continuation text
+ * as spotNames. This text-only pass gives Claude document-level context to determine
+ * which are actual spot/commercial boundaries.
+ */
+async function reconcileSpotNames(pageSpotNames, totalPageCount) {
+  const client = getAnthropicClient();
+  if (!client) return null;
+
+  const pageList = pageSpotNames.map(p =>
+    `Page ${p.pageNum}: "${p.spotName || '(no title)'}" — ${p.frameCount} frames, ${p.boardType}`
+  ).join('\n');
+
+  console.log(`[Storyboard] Reconciling spot names across ${totalPageCount} pages`);
+
+  const response = await apiCallWithRetry(() => client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 2048,
+    messages: [{ role: 'user', content: `You are analyzing a storyboard PDF with ${totalPageCount} pages. Each page was analyzed independently and returned a title/header. Your job is to determine which titles represent DIFFERENT COMMERCIALS/SPOTS vs. which are just scene headers, location slugs, or page continuations within the SAME commercial.
+
+Here are the per-page titles extracted:
+${pageList}
+
+RULES:
+- A "spot" or "commercial" is a distinct advertisement or creative piece. A multi-page storyboard PDF often contains boards for just ONE commercial, but sometimes contains 2-4 different commercials.
+- Scene headers like "EXT. ALLEYWAY - NIGHT", "INT. KITCHEN - DAY", "SCENE 2", "SC. 3" are NOT spot names — they describe locations/scenes WITHIN a commercial.
+- If all pages appear to be from the SAME commercial (just different scenes), return ONE spot name for all pages.
+- If pages clearly belong to DIFFERENT commercials (different product names, campaign names, or completely unrelated titles), split them into separate spots.
+- Page numbers, frame counts, and "continued" headers don't indicate new spots.
+- If a title appears only on page 1 and subsequent pages have scene headers, all pages likely belong to the page-1 spot.
+- When in doubt, keep pages in the SAME spot — false splits are worse than false merges.
+
+Return JSON (no extra text):
+[
+  { "pageNum": 1, "spotName": "COMMERCIAL NAME" },
+  { "pageNum": 2, "spotName": "COMMERCIAL NAME" },
+  ...
+]
+
+Every page must appear exactly once. Pages belonging to the same commercial get the SAME spotName string.` }]
+  }));
+
+  const text = response.content[0].text;
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || text.match(/\[[\s\S]*\]/);
+
+  try {
+    const parsed = JSON.parse(jsonMatch ? (jsonMatch[1] || jsonMatch[0]).trim() : text.trim());
+    const results = Array.isArray(parsed) ? parsed : [parsed];
+    const spotNames = [...new Set(results.map(r => r.spotName))];
+    console.log(`[Storyboard] Spot reconciliation: ${spotNames.length} spot(s) — ${spotNames.map(s => `"${s}"`).join(', ')}`);
+    return results;
+  } catch (e) {
+    console.error('[Storyboard] Spot reconciliation parse error:', e.message);
+    return null;
+  }
+}
 
 /**
  * Extract text from multiple pages in a single API call
