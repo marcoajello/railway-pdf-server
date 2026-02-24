@@ -1763,12 +1763,26 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           },
           textData: {
             frames: data.panels.map((panel, idx) => {
-              // Extract frame number from frameLabel if available
+              // Extract frame number from frameLabel (standalone label above image)
               const label = (panel.frameLabel || '').replace(/<[^>]*>/g, '').trim();
-              const frameNum = label.match(/^[\d.]+[A-Za-z]?$/)?.[0] || '';
+              let frameNum = label.match(/^[\d.]+[A-Za-z]?$/)?.[0] || '';
+
+              // If no standalone label, try parsing number from start of caption
+              // e.g., "01: Wide, camera moves..." → "01"
+              // e.g., "Frame 3 - Description" → "3"
+              let description = (panel.caption || '').replace(/<[^>]*>/g, '').trim();
+              if (!frameNum && description) {
+                const captionNumMatch = description.match(/^(?:(?:FR|FRAME|SHOT)\s*)?(\d+(?:\.\d+)?[A-Za-z]?)\s*[:.\-–—]\s*/i);
+                if (captionNumMatch) {
+                  frameNum = captionNumMatch[1];
+                  // Remove the number prefix from description so it doesn't repeat
+                  description = description.slice(captionNumMatch[0].length).trim();
+                }
+              }
+
               return {
                 frameNumber: frameNum,
-                description: panel.caption || '',
+                description: description,
                 dialog: '',
                 panelX: panelCentroids[idx] ? Math.round(panelCentroids[idx].cx * 100) : null,
                 panelY: panelCentroids[idx] ? Math.round(panelCentroids[idx].cy * 100) : null
@@ -1778,7 +1792,10 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
             spotName: null,
             hasVisibleNumbers: data.panels.some(p => {
               const label = (p.frameLabel || '').replace(/<[^>]*>/g, '').trim();
-              return !!label.match(/^[\d.]+[A-Za-z]?$/);
+              if (label.match(/^[\d.]+[A-Za-z]?$/)) return true;
+              // Also check for numbers at start of caption
+              const cap = (p.caption || '').replace(/<[^>]*>/g, '').trim();
+              return !!cap.match(/^(?:(?:FR|FRAME|SHOT)\s*)?\d+(?:\.\d+)?[A-Za-z]?\s*[:.\-–—]/i);
             }),
             pdfStructureCaptions: captions  // Keep raw captions for reference
           },
@@ -1829,10 +1846,61 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               existing.textData.hasVisibleNumbers = textData.hasVisibleNumbers || false;
               existing.textData.gridLayout = textData.gridLayout;
 
-              // Use Claude's frame data for numbering and descriptions
-              // but keep pdf_panels.py's image count as the source of truth
-              if (textData.frames && textData.frames.length > 0) {
-                existing.textData.frames = textData.frames;
+              // Merge Claude's text with pdf_panels.py's structural data.
+              // pdf_panels.py panel count is the source of truth for images.
+              // Only use Claude's frames if they match panel count OR if
+              // pdf_panels.py extracted no useful text data of its own.
+              const pdfPanelCount = existing.detected.count;
+              const claudeFrameCount = textData.frames?.length || 0;
+              const pdfHasOwnFrameNums = existing.textData.frames.some(f => f.frameNumber);
+              const pdfHasOwnCaptions = existing.textData.frames.some(f => f.description);
+
+              if (claudeFrameCount > 0) {
+                if (claudeFrameCount === pdfPanelCount) {
+                  // Perfect match — Claude's frames align 1:1 with pdf_panels.py panels
+                  // Use Claude for frame numbers (if pdf didn't find its own) and richer descriptions
+                  for (let fi = 0; fi < pdfPanelCount; fi++) {
+                    const cf = textData.frames[fi] || {};
+                    const pf = existing.textData.frames[fi] || {};
+                    // Prefer pdf_panels.py's own frame number (from structure), fall back to Claude's
+                    if (!pf.frameNumber && cf.frameNumber) {
+                      existing.textData.frames[fi].frameNumber = cf.frameNumber;
+                    }
+                    // Use Claude's description if pdf_panels.py had none
+                    if (!pf.description && cf.description) {
+                      existing.textData.frames[fi].description = cf.description;
+                    }
+                    // Always take Claude's dialog (pdf_panels.py doesn't extract dialog)
+                    if (cf.dialog) {
+                      existing.textData.frames[fi].dialog = cf.dialog;
+                    }
+                  }
+                  console.log(`[Storyboard] Page ${textData.pageNum}: merged Claude text (${claudeFrameCount} frames) with pdf_panels.py (${pdfPanelCount} panels) — counts match`);
+                } else if (!pdfHasOwnFrameNums && !pdfHasOwnCaptions) {
+                  // pdf_panels.py got no text at all — use Claude's frames but pad/trim to match panel count
+                  const mergedFrames = [];
+                  for (let fi = 0; fi < pdfPanelCount; fi++) {
+                    if (fi < claudeFrameCount) {
+                      mergedFrames.push({
+                        ...existing.textData.frames[fi],
+                        frameNumber: textData.frames[fi]?.frameNumber || existing.textData.frames[fi]?.frameNumber || '',
+                        description: textData.frames[fi]?.description || '',
+                        dialog: textData.frames[fi]?.dialog || ''
+                      });
+                    } else {
+                      mergedFrames.push(existing.textData.frames[fi] || {
+                        frameNumber: '', description: '', dialog: '',
+                        panelX: null, panelY: null
+                      });
+                    }
+                  }
+                  existing.textData.frames = mergedFrames;
+                  console.log(`[Storyboard] Page ${textData.pageNum}: Claude ${claudeFrameCount} frames vs pdf_panels.py ${pdfPanelCount} panels — used Claude text (pdf had none), trimmed to panel count`);
+                } else {
+                  // Counts differ AND pdf_panels.py has its own data — keep pdf_panels.py's
+                  // because its frame-to-caption alignment is structural (not guessed)
+                  console.log(`[Storyboard] Page ${textData.pageNum}: Claude ${claudeFrameCount} frames vs pdf_panels.py ${pdfPanelCount} panels — keeping pdf_panels.py text (has own captions/numbers)`);
+                }
               }
             }
           }
