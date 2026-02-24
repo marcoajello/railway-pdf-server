@@ -1884,6 +1884,9 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
 
     // VISION-FIRST: Send ALL pdf_panels.py pages to Claude for structure + text.
     // Claude determines which images are separate frames vs multi-image sequences.
+    // Pages where Claude sees significantly more frames than pdf_panels.py found
+    // will be re-routed to the Vision/OpenCV fallback pipeline.
+    const reroutedPages = [];
     const pdfStructurePagesForClaude = [];
     for (let i = 0; i < pageImages.length; i++) {
       const pageNum = i + 1;
@@ -1949,8 +1952,24 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
               const multiImageFrames = matched.filter(f => f.subImages);
               console.log(`[Storyboard] Page ${textData.pageNum}: Vision-first matched ${claudeFrameCount} frames to ${pdfImageCount} images` +
                 (multiImageFrames.length > 0 ? ` (${multiImageFrames.length} multi-image sequences)` : ''));
+            } else if (totalImageCount > pdfImageCount * 1.5) {
+              // Claude sees significantly more frames than pdf_panels.py found.
+              // The PDF structure doesn't match the visual layout (e.g. hand-drawn
+              // frames composited into a few large image blocks). Re-route this
+              // page to Vision/OpenCV which can detect panels visually.
+              console.log(`[Storyboard] Page ${textData.pageNum}: Claude sees ${totalImageCount} images but pdf_panels.py found ${pdfImageCount} — re-routing to Vision/OpenCV`);
+
+              // Remove this page from allPageResults so it goes through fallback
+              const existingIdx = allPageResults.indexOf(existing);
+              if (existingIdx >= 0) allPageResults.splice(existingIdx, 1);
+
+              // Add to fallback pages (rendered image already available from Phase 1)
+              const pageImg = pageImages[textData.pageNum - 1];
+              if (pageImg) {
+                reroutedPages.push({ path: pageImg, pageNum: textData.pageNum });
+              }
             } else {
-              // Count mismatch — fall back to index matching
+              // Minor count mismatch — fall back to index matching
               console.log(`[Storyboard] Page ${textData.pageNum}: imageCount mismatch (Claude total: ${totalImageCount}, pdf images: ${pdfImageCount}) — falling back to index matching`);
               const maxLen = Math.max(claudeFrameCount, pdfImageCount);
               const mergedFrames = [];
@@ -1973,6 +1992,14 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
           }
         }));
       }
+    }
+
+    // Add re-routed pages (where pdf_panels.py undercounted) to fallback pipeline
+    if (reroutedPages.length > 0) {
+      console.log(`[Storyboard] Re-routing ${reroutedPages.length} page(s) to Vision/OpenCV (pdf_panels.py undercounted)`);
+      fallbackPages.push(...reroutedPages);
+      // Sort by page number to maintain order
+      fallbackPages.sort((a, b) => a.pageNum - b.pageNum);
     }
 
     // Process fallback pages (not handled by pdf_panels.py)
