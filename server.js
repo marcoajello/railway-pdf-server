@@ -64,8 +64,19 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
-    cb(null, allowed.includes(file.mimetype));
+    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp',
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation', // .pptx
+      'application/vnd.ms-powerpoint', // .ppt
+      'application/x-iwork-keynote-sffkey', // .key (newer)
+      'application/vnd.apple.keynote', // .key (older)
+    ];
+    // Allow octet-stream only for presentation file extensions (.key, .pptx)
+    if (file.mimetype === 'application/octet-stream') {
+      const ext = (file.originalname || '').toLowerCase();
+      cb(null, ext.endsWith('.key') || ext.endsWith('.pptx') || ext.endsWith('.ppt'));
+    } else {
+      cb(null, allowed.includes(file.mimetype));
+    }
   }
 });
 
@@ -607,6 +618,130 @@ async function extractPanelsFromPdfStructure(pdfBuffer, tempDir) {
 
   console.log(`[Storyboard] pdf_panels.py: found panels on ${pagesWithPanels.length}/${totalPages} pages`);
   return { totalPages, pages: results, pdfPath };
+}
+
+/**
+ * Check if a file is a PPTX/KEY presentation format
+ */
+function isPresentationFile(mimetype, originalname) {
+  const presentationMimes = [
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.ms-powerpoint',
+    'application/x-iwork-keynote-sffkey',
+    'application/vnd.apple.keynote',
+  ];
+  if (presentationMimes.includes(mimetype)) return true;
+  // Fallback: check extension for octet-stream uploads
+  const ext = path.extname(originalname || '').toLowerCase();
+  return ['.pptx', '.ppt', '.key'].includes(ext);
+}
+
+/**
+ * Convert PPTX/KEY to PDF using LibreOffice, then process as PDF
+ * Returns { pdfBuffer, slideCount }
+ */
+async function convertPresentationToPdf(fileBuffer, originalname, tempDir) {
+  const ext = path.extname(originalname || '.pptx').toLowerCase();
+  const inputPath = path.join(tempDir, `presentation${ext}`);
+  await fs.writeFile(inputPath, fileBuffer);
+
+  console.log(`[Storyboard] Converting ${ext} to PDF via LibreOffice...`);
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn('libreoffice', [
+      '--headless', '--convert-to', 'pdf',
+      '--outdir', tempDir,
+      inputPath
+    ], { timeout: 120000 });
+
+    let stderr = '';
+    proc.stderr.on('data', d => stderr += d.toString());
+
+    proc.on('close', async (code) => {
+      if (code !== 0) {
+        return reject(new Error(`LibreOffice conversion failed (code ${code}): ${stderr}`));
+      }
+
+      const pdfPath = path.join(tempDir, `presentation.pdf`);
+      try {
+        const pdfBuffer = await fs.readFile(pdfPath);
+        console.log(`[Storyboard] LibreOffice conversion complete: ${(pdfBuffer.length / 1024 / 1024).toFixed(1)}MB PDF`);
+        resolve({ pdfBuffer });
+      } catch (e) {
+        reject(new Error(`LibreOffice produced no PDF output: ${e.message}`));
+      }
+    });
+
+    proc.on('error', reject);
+  });
+}
+
+/**
+ * Extract panel images from PPTX using pptx_panels.py (like pdf_panels.py for PDFs)
+ */
+async function extractPanelsFromPptxStructure(fileBuffer, tempDir) {
+  const pptxPath = path.join(tempDir, 'source.pptx');
+  await fs.writeFile(pptxPath, fileBuffer);
+
+  // Get slide count
+  const slideCountResult = await new Promise((resolve, reject) => {
+    const proc = spawn('python3', [path.join(__dirname, 'pptx_panels.py'), pptxPath]);
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => stdout += d.toString());
+    proc.stderr.on('data', d => { stderr += d.toString(); console.log(d.toString().trim()); });
+    proc.on('close', (code) => {
+      try { resolve(JSON.parse(stdout)); }
+      catch { reject(new Error(`pptx_panels.py slide count failed: ${stderr}`)); }
+    });
+    proc.on('error', reject);
+  });
+
+  if (!slideCountResult.slideCount) {
+    console.log('[Storyboard] pptx_panels.py could not read slide count');
+    return null;
+  }
+
+  const totalPages = slideCountResult.slideCount;
+  console.log(`[Storyboard] PPTX has ${totalPages} slides`);
+
+  // Extract panels from each slide
+  const pages = [];
+  for (let i = 1; i <= totalPages; i++) {
+    const result = await new Promise((resolve, reject) => {
+      const proc = spawn('python3', [path.join(__dirname, 'pptx_panels.py'), pptxPath, String(i)]);
+      let stdout = '', stderr = '';
+      proc.stdout.on('data', d => stdout += d.toString());
+      proc.stderr.on('data', d => { stderr += d.toString(); console.log(d.toString().trim()); });
+      proc.on('close', (code) => {
+        try { resolve(JSON.parse(stdout)); }
+        catch { resolve({ count: 0, panels: [] }); }
+      });
+      proc.on('error', () => resolve({ count: 0, panels: [] }));
+    });
+
+    // Convert pptx_panels.py format to match pdf_panels.py format expected by server
+    const images = (result.panels || []).map(p => ({
+      x: p.x, y: p.y, width: p.width, height: p.height,
+      image: p.image,
+      caption: p.caption || ''
+    }));
+
+    pages.push({
+      pageNum: i,
+      data: {
+        count: images.length,
+        images,
+        pageWidth: 960,  // Standard PPTX width in points (10in * 96)
+        pageHeight: 540,  // Standard PPTX height
+        title: result.title || null,
+        mode: 'pptx_structure'
+      }
+    });
+  }
+
+  const pagesWithPanels = pages.filter(p => p.data.count > 0);
+  console.log(`[Storyboard] pptx_panels.py: found panels on ${pagesWithPanels.length}/${totalPages} slides`);
+  return { totalPages, pages, pptxPath };
 }
 
 /**
@@ -1747,15 +1882,48 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     const imageDir = path.join(tempDir, 'images');
     await fs.mkdir(imageDir, { recursive: true });
 
+    // === PRE-PHASE: Convert presentations (PPTX/KEY) to PDF ===
+    // LibreOffice converts to PDF, then we run the normal PDF pipeline.
+    // This avoids a separate code path for presentations.
+    let fileBuffer = req.file.buffer;
+    let effectiveMimetype = req.file.mimetype;
+
+    const isPresentation = isPresentationFile(req.file.mimetype, req.file.originalname);
+    const isPptx = isPresentation && (req.file.originalname || '').toLowerCase().endsWith('.pptx');
+    let pptxPanelResults = null;  // Direct PPTX image extraction (better quality than PDF re-encoding)
+
+    if (isPresentation) {
+      // For .pptx files: extract images directly using pptx_panels.py (original quality)
+      if (isPptx) {
+        try {
+          pptxPanelResults = await extractPanelsFromPptxStructure(req.file.buffer, tempDir);
+        } catch (e) {
+          console.error('[Storyboard] pptx_panels.py error:', e.message);
+        }
+      }
+
+      // Convert to PDF via LibreOffice (for page rendering + Claude Vision)
+      try {
+        console.log('[Storyboard] Converting presentation to PDF via LibreOffice...');
+        const conversion = await convertPresentationToPdf(req.file.buffer, req.file.originalname, tempDir);
+        fileBuffer = conversion.pdfBuffer;
+        effectiveMimetype = 'application/pdf';
+        console.log('[Storyboard] Presentation converted to PDF successfully');
+      } catch (e) {
+        console.error('[Storyboard] Presentation conversion failed:', e.message);
+        return res.status(400).json({ error: `Failed to convert presentation: ${e.message}` });
+      }
+    }
+
     // === PHASE 0: Try PDF structure extraction first (pdf_panels.py) ===
     // This reads image placement coordinates directly from the PDF,
     // giving pixel-perfect crops with proper caption association.
     let pdfStructureResults = null;
     let pdfStructurePagesHandled = new Set(); // Pages fully handled by pdf_panels.py
 
-    if (req.file.mimetype === 'application/pdf') {
+    if (effectiveMimetype === 'application/pdf') {
       try {
-        pdfStructureResults = await extractPanelsFromPdfStructure(req.file.buffer, tempDir);
+        pdfStructureResults = await extractPanelsFromPdfStructure(fileBuffer, tempDir);
 
         if (pdfStructureResults) {
           for (const { pageNum, data } of pdfStructureResults.pages) {
@@ -1810,12 +1978,26 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       }
     }
 
+    // For PPTX files: prefer pptx_panels.py results over pdf_panels.py
+    // pptx_panels.py extracts original-quality images directly from the PPTX,
+    // while pdf_panels.py would extract from the LibreOffice-converted PDF (lossy).
+    if (pptxPanelResults && pptxPanelResults.pages.some(p => p.data.count > 0)) {
+      console.log('[Storyboard] Using pptx_panels.py images (original quality) over pdf_panels.py');
+      pdfStructureResults = pptxPanelResults;
+      pdfStructurePagesHandled = new Set();
+      for (const { pageNum, data } of pptxPanelResults.pages) {
+        if (data && data.count > 0) {
+          pdfStructurePagesHandled.add(pageNum);
+        }
+      }
+    }
+
     // === PHASE 1: Render ALL pages ===
     // Always render pages so Claude Vision can extract text from them.
     // pdf_panels.py handles images; Claude handles ALL text extraction.
     let pageImages = [];
-    if (req.file.mimetype === 'application/pdf') {
-      pageImages = await pdfToImages(req.file.buffer, imageDir);
+    if (effectiveMimetype === 'application/pdf') {
+      pageImages = await pdfToImages(fileBuffer, imageDir);
     } else {
       const imgPath = path.join(imageDir, 'page-1.png');
       await sharp(req.file.buffer).png().toFile(imgPath);

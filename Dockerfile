@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     chromium \
     tesseract-ocr \
+    libreoffice-impress \
+    libreoffice-common \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PyMuPDF for PDF structure extraction, python-pptx for PPTX, Pillow for image conversion
