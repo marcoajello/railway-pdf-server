@@ -28,13 +28,27 @@ import fitz
 import json
 import sys
 import base64
+import io
 
 
-def render_panel(page, bbox, mat):
-    """Render a single panel region to base64 JPEG."""
+def render_panel(page, bbox, mat, rotation=0):
+    """Render a single panel region to base64 JPEG, applying original page rotation."""
     rect = fitz.Rect(bbox)
     pix = page.get_pixmap(matrix=mat, clip=rect)
     img_bytes = pix.tobytes("jpeg")
+
+    # If the page was originally rotated, rotate the crop to match display orientation
+    if rotation != 0:
+        from PIL import Image
+        img = Image.open(io.BytesIO(img_bytes))
+        # PIL rotation is counter-clockwise, PDF rotation is clockwise
+        # So rotation=90 means we need to rotate -90 (or 270) in PIL
+        pil_angle = 360 - rotation
+        img = img.rotate(pil_angle, expand=True)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=90)
+        img_bytes = buf.getvalue()
+
     return base64.b64encode(img_bytes).decode("ascii")
 
 
@@ -67,8 +81,9 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
     # Normalize rotation: get_text("dict") returns bboxes in the rotated
     # display space, but get_pixmap clips in the unrotated mediabox space.
     # Derotating the page makes both coordinate systems match.
-    if page.rotation != 0:
-        print(f"[PDF] Page {page_num}: derotating from {page.rotation}°",
+    original_rotation = page.rotation
+    if original_rotation != 0:
+        print(f"[PDF] Page {page_num}: derotating from {original_rotation}°",
               file=sys.stderr, flush=True)
         page.set_rotation(0)
 
@@ -140,7 +155,7 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
 
     for row in rows:
         for bbox in row:
-            b64 = render_panel(page, bbox, mat)
+            b64 = render_panel(page, bbox, mat, original_rotation)
             result_images.append({
                 "x": round(bbox[0], 1),
                 "y": round(bbox[1], 1),
