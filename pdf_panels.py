@@ -63,6 +63,15 @@ def extract_panels(pdf_path, page_num, min_w=100, min_h=50, zoom=3):
                 "error": f"Page {page_num} out of range"}
 
     page = doc[page_num - 1]
+
+    # Normalize rotation: get_text("dict") returns bboxes in the rotated
+    # display space, but get_pixmap clips in the unrotated mediabox space.
+    # Derotating the page makes both coordinate systems match.
+    if page.rotation != 0:
+        print(f"[PDF] Page {page_num}: derotating from {page.rotation}°",
+              file=sys.stderr, flush=True)
+        page.set_rotation(0)
+
     page_width = page.rect.width
     page_height = page.rect.height
 
