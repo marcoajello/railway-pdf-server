@@ -83,10 +83,14 @@ const upload = multer({
 // Default model for storyboard pipeline (can be overridden per-request via ?model=haiku)
 const SONNET_DEFAULT = 'claude-sonnet-4-20250514';
 const HAIKU_DEFAULT = 'claude-haiku-4-5-20251001';
-let activeStoryboardModel = SONNET_DEFAULT;
+let activeStoryboardModel = HAIKU_DEFAULT;
 
 // Max pages to process per document (cost/memory protection)
 const MAX_STORYBOARD_PAGES = 20;
+
+// Text erasure from crops (OCR-based). Disabled — was causing rectangles over frame content.
+// Re-enable with ?eraseText=1 query param if needed.
+const ERASE_TEXT_DEFAULT = false;
 
 let anthropic = null;
 function getAnthropicClient() {
@@ -1083,13 +1087,12 @@ async function detectPanelsFromMask(maskBuffer, originalImageBuffer, expectedCou
           .jpeg({ quality: 85 })
           .toBuffer();
 
-        // Run per-panel text erasure (trim caption zone + OCR cleanup)
-        // Skip OCR for hand-drawn boards (Tesseract misreads artwork)
-        if (boardType === 'hand_drawn') {
-          images.push(cropped.toString('base64'));
-        } else {
+        // Text erasure: disabled by default (was causing rectangles over frame content)
+        if (ERASE_TEXT_DEFAULT && boardType !== 'hand_drawn') {
           const cleaned = await eraseTextFromCrop(cropped, images.length + 1);
           images.push(cleaned || cropped.toString('base64'));
+        } else {
+          images.push(cropped.toString('base64'));
         }
       } catch (e) {
         console.error('[Storyboard] Mask-OpenCV crop error:', e.message);
@@ -1309,13 +1312,12 @@ Read LEFT-TO-RIGHT, then TOP-TO-BOTTOM.` }
         .jpeg({ quality: 85 })
         .toBuffer();
 
-      // Run per-panel text erasure — but skip OCR for hand-drawn boards
-      // (Tesseract misreads ink strokes as text, damaging artwork)
-      if (boardType === 'hand_drawn') {
-        images.push(cropped.toString('base64'));
-      } else {
+      // Text erasure: disabled by default (was causing rectangles over frame content)
+      if (ERASE_TEXT_DEFAULT && boardType !== 'hand_drawn') {
         const cleaned = await eraseTextFromCrop(cropped, i + 1);
         images.push(cleaned || cropped.toString('base64'));
+      } else {
+        images.push(cropped.toString('base64'));
       }
     } catch (e) {
       console.error(`[Storyboard] Vision: crop error for panel:`, e.message);
@@ -1884,9 +1886,12 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
     
-    // Model selection: ?model=haiku or ?model=sonnet (default)
+    // Model selection: ?model=sonnet to override, default is haiku
     const modelParam = (req.query.model || '').toLowerCase();
-    activeStoryboardModel = modelParam === 'haiku' ? HAIKU_DEFAULT : SONNET_DEFAULT;
+    activeStoryboardModel = modelParam === 'sonnet' ? SONNET_DEFAULT : HAIKU_DEFAULT;
+
+    // Text erasure: disabled by default, enable with ?eraseText=1
+    const eraseTextEnabled = req.query.eraseText === '1' || ERASE_TEXT_DEFAULT;
 
     console.log(`[Storyboard] Processing: ${req.file.originalname} (model: ${modelParam === 'haiku' ? 'haiku' : 'sonnet'})`);
     const startTime = Date.now();
@@ -2282,23 +2287,23 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       allPageResults.push(...batchResults.flat());
     }
     
-    // Post-processing: run text erasure on grid-path images
-    // (Vision and Mask paths already do this during detection)
-    // Skip for hand-drawn boards — Tesseract misreads ink strokes as text
-    for (const result of allPageResults) {
-      const boardType = result.textData?.boardType || 'photo';
-      if (result.detected.mode === 'grid' && result.detected.images && boardType !== 'hand_drawn') {
-        const cleaned = await Promise.all(result.detected.images.map(async (img, i) => {
-          if (!img) return null;
-          try {
-            const buf = Buffer.from(img, 'base64');
-            const cleanedB64 = await eraseTextFromCrop(buf, i + 1);
-            return cleanedB64 || img;
-          } catch (e) {
-            return img;
-          }
-        }));
-        result.detected.images = cleaned;
+    // Post-processing: text erasure on grid-path images (disabled by default)
+    if (eraseTextEnabled) {
+      for (const result of allPageResults) {
+        const boardType = result.textData?.boardType || 'photo';
+        if (result.detected.mode === 'grid' && result.detected.images && boardType !== 'hand_drawn') {
+          const cleaned = await Promise.all(result.detected.images.map(async (img, i) => {
+            if (!img) return null;
+            try {
+              const buf = Buffer.from(img, 'base64');
+              const cleanedB64 = await eraseTextFromCrop(buf, i + 1);
+              return cleanedB64 || img;
+            } catch (e) {
+              return img;
+            }
+          }));
+          result.detected.images = cleaned;
+        }
       }
     }
     
