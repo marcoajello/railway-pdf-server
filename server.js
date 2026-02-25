@@ -80,6 +80,14 @@ const upload = multer({
   }
 });
 
+// Default model for storyboard pipeline (can be overridden per-request via ?model=haiku)
+const SONNET_DEFAULT = 'claude-sonnet-4-20250514';
+const HAIKU_DEFAULT = 'claude-haiku-4-5-20251001';
+let activeStoryboardModel = SONNET_DEFAULT;
+
+// Max pages to process per document (cost/memory protection)
+const MAX_STORYBOARD_PAGES = 20;
+
 let anthropic = null;
 function getAnthropicClient() {
   if (!anthropic && process.env.ANTHROPIC_API_KEY) {
@@ -349,7 +357,7 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
     ]).flat();
     
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: activeStoryboardModel,
       max_tokens: 1000,
       messages: [{
         role: 'user',
@@ -906,7 +914,7 @@ async function extractText(imageBuffer) {
     .toBuffer();
   
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: activeStoryboardModel,
     max_tokens: 4096,
     messages: [{
       role: 'user',
@@ -1205,7 +1213,7 @@ async function detectPanelsWithVision(imageBuffer, expectedCount, boardType = 'p
   console.log(`[Storyboard] Vision: sending ${imgW}x${imgH} original + mask (expecting ~${expectedCount} panels)`);
 
   const response = await apiCallWithRetry(() => client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: activeStoryboardModel,
     max_tokens: 2048,
     temperature: 0,
     messages: [{
@@ -1593,7 +1601,7 @@ Answer ONLY with the format: 1→2: SAME, 2→3: CUT, etc.` });
 
   try {
     const response = await apiCallWithRetry(() => client.messages.create({
-      model: 'claude-sonnet-4-5-20250929',
+      model: activeStoryboardModel,
       max_tokens: 2048,
       messages: [{ role: 'user', content }]
     }));
@@ -1708,17 +1716,17 @@ Frame 3: B — same boots, slightly wider
   try {
     const [positionRes, pairRes, subjectRes] = await Promise.all([
       apiCallWithRetry(() => client.messages.create({
-        model: 'claude-sonnet-4-5-20250929',
+        model: activeStoryboardModel,
         max_tokens: 2048,
         messages: [{ role: 'user', content: positionContent }]
       })),
       apiCallWithRetry(() => client.messages.create({
-        model: 'claude-sonnet-4-5-20250929',
+        model: activeStoryboardModel,
         max_tokens: 2048,
         messages: [{ role: 'user', content: pairContent }]
       })),
       apiCallWithRetry(() => client.messages.create({
-        model: 'claude-sonnet-4-5-20250929',
+        model: activeStoryboardModel,
         max_tokens: 2048,
         messages: [{ role: 'user', content: subjectContent }]
       }))
@@ -1876,7 +1884,11 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
     
-    console.log('[Storyboard] Processing:', req.file.originalname);
+    // Model selection: ?model=haiku or ?model=sonnet (default)
+    const modelParam = (req.query.model || '').toLowerCase();
+    activeStoryboardModel = modelParam === 'haiku' ? HAIKU_DEFAULT : SONNET_DEFAULT;
+
+    console.log(`[Storyboard] Processing: ${req.file.originalname} (model: ${modelParam === 'haiku' ? 'haiku' : 'sonnet'})`);
     const startTime = Date.now();
 
     const imageDir = path.join(tempDir, 'images');
@@ -2004,10 +2016,22 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       pageImages = [imgPath];
     }
 
-    // Determine total page count
-    const totalPageCount = pdfStructureResults ? pdfStructureResults.totalPages : pageImages.length;
+    // Determine total page count + enforce cap
+    let totalPageCount = pdfStructureResults ? pdfStructureResults.totalPages : pageImages.length;
+    let truncated = false;
 
-    console.log(`[Storyboard] ${totalPageCount} page(s) - ${pdfStructurePagesHandled.size} handled by pdf_panels.py, ${totalPageCount - pdfStructurePagesHandled.size} need Vision/OpenCV`);
+    if (totalPageCount > MAX_STORYBOARD_PAGES) {
+      console.log(`[Storyboard] ${totalPageCount} pages exceeds cap of ${MAX_STORYBOARD_PAGES} — truncating`);
+      truncated = true;
+      totalPageCount = MAX_STORYBOARD_PAGES;
+      pageImages = pageImages.slice(0, MAX_STORYBOARD_PAGES);
+      if (pdfStructureResults) {
+        pdfStructureResults.pages = pdfStructureResults.pages.filter(p => p.pageNum <= MAX_STORYBOARD_PAGES);
+        pdfStructureResults.totalPages = MAX_STORYBOARD_PAGES;
+      }
+    }
+
+    console.log(`[Storyboard] ${totalPageCount} page(s)${truncated ? ' (truncated)' : ''} - ${pdfStructurePagesHandled.size} handled by pdf_panels.py, ${totalPageCount - pdfStructurePagesHandled.size} need Vision/OpenCV`);
 
     // === PHASE 2: Process pages that still need Vision/OpenCV pipeline ===
     const BATCH_SIZE = 1;
@@ -2575,7 +2599,7 @@ async function reconcileSpotNames(pageSpotNames, totalPageCount) {
   console.log(`[Storyboard] Reconciling spot names across ${totalPageCount} pages`);
 
   const response = await apiCallWithRetry(() => client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: activeStoryboardModel,
     max_tokens: 2048,
     messages: [{ role: 'user', content: `You are analyzing a storyboard PDF with ${totalPageCount} pages. Each page was analyzed independently and returned a title/header. Your job is to determine which titles represent DIFFERENT COMMERCIALS/SPOTS vs. which are just scene headers, location slugs, or page continuations within the SAME commercial.
 
@@ -2729,7 +2753,7 @@ RULES:
   console.log(`[Storyboard] Batched API call for ${pages.length} pages`);
   
   const response = await apiCallWithRetry(() => client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: activeStoryboardModel,
     max_tokens: 8192,
     messages: [{ role: 'user', content }]
   }));
@@ -2791,7 +2815,7 @@ app.post('/api/extract-shotlist', upload.single('pdf'), async (req, res) => {
         .toBuffer();
       
       const response = await client.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: activeStoryboardModel,
         max_tokens: 4096,
         messages: [{
           role: 'user',
@@ -3153,7 +3177,7 @@ async function cropToFace(base64Image) {
     
     try {
       const response = await client.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: activeStoryboardModel,
         max_tokens: 200,
         messages: [{
           role: 'user',
@@ -3288,7 +3312,7 @@ async function extractCastWithFaceMatching(imageBuffer, faceCount) {
     : '';
   
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: activeStoryboardModel,
     max_tokens: 4096,
     messages: [{
       role: 'user',
@@ -3363,7 +3387,7 @@ async function extractCastText(imageBuffer) {
     .toBuffer();
   
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: activeStoryboardModel,
     max_tokens: 4096,
     messages: [{
       role: 'user',
@@ -3443,7 +3467,7 @@ app.post('/api/auto-tag-vision', async (req, res) => {
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: activeStoryboardModel,
       max_tokens: 500,
       messages: [{
         role: 'user',
@@ -3646,7 +3670,7 @@ VALIDATION:
     });
     
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: activeStoryboardModel,
       max_tokens: 8000,
       messages: [{
         role: 'user',
@@ -3730,7 +3754,7 @@ app.post('/api/detect-face', async (req, res) => {
       try {
         console.log('[FaceDetect] Falling back to Claude...');
         const response = await client.messages.create({
-          model: 'claude-sonnet-4-20250514',
+          model: activeStoryboardModel,
           max_tokens: 200,
           messages: [{
             role: 'user',
@@ -3911,7 +3935,7 @@ Documents to analyze:
 ${text.substring(0, 50000)}`;
 
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: activeStoryboardModel,
       max_tokens: 4096,
       messages: [{ role: 'user', content: prompt }]
     });
