@@ -222,7 +222,20 @@ app.post('/generate-pdf', async (req, res) => {
     });
     
     const page = await browser.newPage();
+    // First pass: render at a wide viewport to measure the actual table width
+    await page.setViewport({ width: 2400, height: 1200 });
     await page.setContent(html, { waitUntil: ['load', 'networkidle0'] });
+
+    // Measure the rendered table width and set viewport to match
+    const tableWidth = await page.evaluate(() => {
+      const table = document.querySelector('table.schedule');
+      return table ? Math.ceil(table.getBoundingClientRect().width) + 40 : 0; // +40 for body padding
+    });
+    if (tableWidth > 0) {
+      await page.setViewport({ width: tableWidth, height: 1200 });
+      // Re-render at the correct width so layout is accurate
+      await page.setContent(html, { waitUntil: ['load', 'networkidle0'] });
+    }
     
     const pdfBuffer = await page.pdf({
       format: 'Letter',
