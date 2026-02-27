@@ -476,6 +476,81 @@ async function detectRectangles(imagePath) {
 }
 
 /**
+ * Grid-guided panel detection: uses Claude's gridLayout to tell OpenCV
+ * exactly how many rows/cols to find. Generates a threshold mask, erases
+ * text via OCR, then uses projection profiles to find panels.
+ * Falls back to the full-res image for cropping.
+ */
+async function detectGridGuided(imagePath, gridLayout) {
+  // Parse gridLayout like "2x3", "1x2", "2x1"
+  const match = (gridLayout || '').match(/(\d+)\s*x\s*(\d+)/i);
+  if (!match) return null;
+  const numRows = parseInt(match[1]);
+  const numCols = parseInt(match[2]);
+  if (numRows < 1 || numCols < 1) return null;
+
+  // Generate a threshold mask for the frame detector
+  const maskPath = imagePath.replace(/\.\w+$/, '_mask.png');
+  try {
+    await sharp(imagePath)
+      .greyscale()
+      .threshold(200)
+      .toFile(maskPath);
+  } catch (e) {
+    console.error('[Storyboard] Grid mask generation failed:', e.message);
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    const script = path.join(__dirname, 'frame_detector.py');
+    const tryPython = (cmd) => {
+      const proc = spawn(cmd, [script, maskPath, 'grid', String(numRows), String(numCols)]);
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', d => stdout += d);
+      proc.stderr.on('data', d => stderr += d);
+      proc.on('close', async (code) => {
+        if (stderr) console.log(`[Storyboard] Grid stderr: ${stderr.substring(0, 500)}`);
+        if (code !== 0) {
+          if (cmd === 'python3') { tryPython('python'); return; }
+          resolve(null);
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          if (!result.rectangles || result.rectangles.length === 0) {
+            resolve(null);
+            return;
+          }
+          // Crop from the ORIGINAL full-res image (not the mask)
+          const images = [];
+          for (const rect of result.rectangles) {
+            try {
+              const cropped = await sharp(imagePath)
+                .extract({ left: rect.x, top: rect.y, width: rect.width, height: rect.height })
+                .jpeg({ quality: 85 })
+                .toBuffer();
+              images.push(cropped.toString('base64'));
+            } catch (e) {
+              images.push(null);
+            }
+          }
+          console.log(`[Storyboard] Grid-guided: ${images.filter(Boolean).length}/${result.rectangles.length} panels cropped`);
+          resolve({ count: result.rectangles.length, rectangles: result.rectangles, images });
+        } catch (e) {
+          resolve(null);
+        }
+      });
+      proc.on('error', () => {
+        if (cmd === 'python3') { tryPython('python'); return; }
+        resolve(null);
+      });
+    };
+    tryPython('python3');
+  });
+}
+
+/**
  * Convert PDF to page images with retry logic for CDN reliability
  */
 async function pdfToImages(pdfBuffer, outputDir, retryCount = 0) {
@@ -888,8 +963,24 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       ]);
       
       console.log(`[Storyboard] Page ${pageNum}: ${detected.count} rectangles, ${textData.frames?.length || 0} text frames`);
-      
-      return { detected, textData, pageNum };
+
+      // If blind detection found fewer images than Claude found frames,
+      // retry with grid-guided mode using the gridLayout Claude told us
+      const textFrameCount = textData.frames?.length || 0;
+      let finalDetected = detected;
+      if (textFrameCount >= 1 && (detected.images || []).filter(Boolean).length < textFrameCount) {
+        const gridLayout = textData.gridLayout;
+        if (gridLayout) {
+          console.log(`[Storyboard] Page ${pageNum}: blind detection found ${(detected.images || []).filter(Boolean).length}/${textFrameCount} — retrying with grid-guided (${gridLayout})`);
+          const gridResult = await detectGridGuided(imagePath, gridLayout);
+          if (gridResult && (gridResult.images || []).filter(Boolean).length > (detected.images || []).filter(Boolean).length) {
+            console.log(`[Storyboard] Page ${pageNum}: grid-guided found ${gridResult.images.filter(Boolean).length} panels — using grid result`);
+            finalDetected = gridResult;
+          }
+        }
+      }
+
+      return { detected: finalDetected, textData, pageNum };
     }));
     
     const allFrames = [];
