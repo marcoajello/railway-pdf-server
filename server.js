@@ -646,10 +646,12 @@ async function extractText(imageBuffer) {
         { type: 'text', text: `Extract storyboard data from this page.
 
 STEP 1 - SPOT/SCRIPT NAME (CRITICAL):
-Look for a BOLD TITLE near the top of the page - this is the commercial/spot name.
-These titles indicate DIFFERENT COMMERCIALS/SPOTS in the same PDF.
-Always extract the title exactly as written - even if it's just a number.
-This is NOT scene descriptions like "INT. KITCHEN" - those are scene headers within a commercial.
+Look for a DOCUMENT-LEVEL title or header — typically bold text at the very top of the page,
+OUTSIDE and ABOVE any storyboard frames/panels. This identifies which commercial/spot this page belongs to.
+- It is often on a title/cover page, or repeated as a consistent header across multiple pages.
+- It is NOT text visible INSIDE artwork, photos, drawings, or phone/device screens within frames.
+- It is NOT scene descriptions like "INT. KITCHEN" — those are scene headers within a spot.
+- If the page has NO clear document-level header/title above the frames, return null.
 
 STEP 2 - GRID LAYOUT:
 Identify the grid structure. Read frames LEFT-TO-RIGHT, then TOP-TO-BOTTOM.
@@ -658,12 +660,16 @@ STEP 3 - FRAME NUMBERS:
 - If frames have visible numbers (1, 2, 1A, 1B, etc.), use those exactly
 - If NO visible numbers, number sequentially: 1, 2, 3, 4...
 
-STEP 4 - EXTRACT:
+STEP 4 - MEDIA TYPE:
+Are the frames PHOTOGRAPHS (real photos/film stills) or DRAWINGS (sketches/illustrations/artwork)?
+
+STEP 5 - EXTRACT:
 Return JSON:
 {
   "spotName": "EXACT TITLE FROM PAGE" or null,
   "gridLayout": "2x3",
   "hasVisibleNumbers": true/false,
+  "isPhotographic": true/false,
   "frames": [
     {
       "frameNumber": "1",
@@ -674,7 +680,8 @@ Return JSON:
 }
 
 RULES:
-- spotName: ALWAYS extract the bold title at top of page - this identifies which commercial/spot
+- spotName: Extract ONLY document-level headers/titles OUTSIDE the frames — NOT text inside artwork, photos, or screens. Return null if no header.
+- isPhotographic: true if frames contain real photographs or film stills, false if hand-drawn or illustrated
 - description: action/camera direction text
 - dialog: spoken lines with character prefix
 - Skip empty frames` }
@@ -894,15 +901,17 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
       const textFrames = textData.frames || [];
       const images = detected.images || [];
       const hasVisibleNumbers = textData.hasVisibleNumbers === true;
-      
+      const isPhotographic = textData.isPhotographic === true;
+
       const maxLen = Math.max(textFrames.length, images.length);
       for (let j = 0; j < maxLen; j++) {
         const tf = textFrames[j] || {};
         const img = images[j] || null;
-        
+
         allFrames.push({
           frameNumber: tf.frameNumber || `${j + 1}`,
           hasVisibleNumber: hasVisibleNumbers,
+          isPhotographic,
           description: tf.description || '',
           dialog: tf.dialog || '',
           image: img,
@@ -914,7 +923,24 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
     
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log(`[Storyboard] Total: ${allFrames.length} frames, ${allFrames.filter(f => f.image).length} with images (${elapsed}s)`);
-    
+
+    // Spot name consistency check: merge rare/hallucinated spot names into dominant
+    const spotCounts = {};
+    for (const f of allFrames) {
+      const s = f.spotName || 'Untitled';
+      spotCounts[s] = (spotCounts[s] || 0) + 1;
+    }
+    const totalFrameCount = allFrames.length;
+    const dominantSpot = Object.entries(spotCounts).sort((a, b) => b[1] - a[1])[0]?.[0];
+    if (dominantSpot && Object.keys(spotCounts).length > 1) {
+      for (const [name, count] of Object.entries(spotCounts)) {
+        if (name !== dominantSpot && count / totalFrameCount < 0.15) {
+          console.log(`[Storyboard] Merging minor spot "${name}" (${count} frames) into "${dominantSpot}"`);
+          allFrames.forEach(f => { if ((f.spotName || 'Untitled') === name) f.spotName = dominantSpot; });
+        }
+      }
+    }
+
     // Group frames by spot
     const spotGroups = {};
     for (const f of allFrames) {
@@ -947,9 +973,19 @@ app.post('/api/extract-storyboard', upload.single('pdf'), async (req, res) => {
         frames.forEach((f, idx) => {
           f.frameNumber = String(idx + 1);
         });
-        
-        // Pass 2: AI grouping analysis (only for unnumbered storyboards)
-        await analyzeGroupings(frames);
+
+        // Check if majority of frames are photographic (real photos, not drawings)
+        const photoCount = frames.filter(f => f.isPhotographic).length;
+        const isPhotoboard = photoCount > frames.length * 0.5;
+
+        if (isPhotoboard) {
+          // Photoboards: each frame is its own shot — Pass 2 camera-setup
+          // analysis doesn't work for photos (it's designed for drawn panels)
+          console.log(`[Storyboard] Spot "${name}": photoboard detected (${photoCount}/${frames.length} photographic) — each frame = own shot`);
+        } else {
+          // Drawn storyboards: use Pass 2 AI grouping to identify camera setups
+          await analyzeGroupings(frames);
+        }
       }
       
       spots.push({
