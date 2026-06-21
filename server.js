@@ -319,7 +319,7 @@ app.post('/api/analyze-pdf-pages', async (req, res) => {
     ]).flat();
     
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1000,
       messages: [{
         role: 'user',
@@ -712,7 +712,7 @@ async function extractText(imageBuffer) {
     .toBuffer();
   
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: 4096,
     messages: [{
       role: 'user',
@@ -872,7 +872,7 @@ async function analyzeGroupings(frames) {
     console.log(`[Storyboard] Pass 2: Analyzing ${imageContents.length} frames for shot grouping`);
     
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1024,
       messages: [{
         role: 'user',
@@ -1216,7 +1216,7 @@ async function cropToFace(base64Image) {
     
     try {
       const response = await client.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 200,
         messages: [{
           role: 'user',
@@ -1303,7 +1303,7 @@ async function extractCastText(imageBuffer) {
     .toBuffer();
   
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: 4096,
     messages: [{
       role: 'user',
@@ -1371,7 +1371,7 @@ app.post('/api/auto-tag-vision', async (req, res) => {
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
     
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 500,
       messages: [{
         role: 'user',
@@ -1564,7 +1564,7 @@ VALIDATION:
     });
     
     const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 8000,
       messages: [{
         role: 'user',
@@ -1648,7 +1648,7 @@ app.post('/api/detect-face', async (req, res) => {
       try {
         console.log('[FaceDetect] Falling back to Claude...');
         const response = await client.messages.create({
-          model: 'claude-sonnet-4-20250514',
+          model: 'claude-sonnet-4-6',
           max_tokens: 200,
           messages: [{
             role: 'user',
