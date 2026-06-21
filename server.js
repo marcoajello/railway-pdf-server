@@ -164,7 +164,7 @@ app.get('/auth/callback', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '3.0.0', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
+  res.json({ status: 'ok', version: '3.0.1', features: ['pdf-generation', 'html-generation', 'storyboard-extraction', 'ai-border-fix'] });
 });
 
 // PDF generation endpoint
